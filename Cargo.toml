@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/plexify", "crates/mockplex"]
-default-members = ["crates/plexify", "crates/mockplex"]
+members = ["crates/plexdio", "crates/mockplex"]
+default-members = ["crates/plexdio", "crates/mockplex"]
 
 [workspace.package]
 version = "0.1.0"

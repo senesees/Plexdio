@@ -1,4 +1,4 @@
-# Plexify
+# PlexDio
 
 A small, native Windows 10/11 x64 music player for Plex — a lean alternative to Plexamp.
 One self-contained exe (9.4 MB), no installer, no runtime, no Electron.
@@ -66,7 +66,7 @@ Requirements: Rust stable with the `x86_64-pc-windows-gnu` target and a MinGW-w6
 SQLite is compiled in; there is nothing else to install.
 
 ```sh
-./build.sh          # release build -> dist/plexify.exe (+ dist/plexify.ico)
+./build.sh          # release build -> dist/plexdio.exe (+ dist/plexdio.ico)
 ./build.sh test     # or: cargo test --workspace
 make dist           # same as ./build.sh
 ```
@@ -75,7 +75,7 @@ make dist           # same as ./build.sh
 (`KERNEL32`, `USER32`, `GDI32`, `ole32`, `combase`, `ws2_32`, `bcryptprimitives`, …) and no
 `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` / `msvcp*.dll`.
 
-The app also builds and runs natively on Linux for development (`cargo run -p plexify`);
+The app also builds and runs natively on Linux for development (`cargo run -p plexdio`);
 every Windows-specific module has a no-op stub.
 
 Release profile: `opt-level="z"`, fat LTO, one codegen unit, `panic="abort"`, stripped,
@@ -86,10 +86,10 @@ static C runtime.
 ```sh
 cargo run -p mockplex -- --port 32500           # fixture library: 5 artists, 7 albums, 25 tracks
 cargo run -p mockplex -- --port 32500 --synthetic 100000   # large-library stress test
-./dist/plexify.exe --plex-tv-url http://127.0.0.1:32500
+./dist/plexdio.exe --plex-tv-url http://127.0.0.1:32500
 ```
 
-The endpoint can also be set with `PLEXIFY_PLEX_TV_URL`. The mock auto-approves the PIN after
+The endpoint can also be set with `PLEXDIO_PLEX_TV_URL`. The mock auto-approves the PIN after
 a couple of polls and serves a JSON Plex API on both the plex.tv and the PMS paths. Other
 switches: `--manual-approve`, `--no-sonic` (exercise the radio fallback), `--quiet`.
 
@@ -99,9 +99,9 @@ x86_64-pc-windows-gnu`) so the player can be tested on a Windows machine without
 ## Architecture
 
 ```
-crates/plexify
+crates/plexdio
   main.rs            single instance, logging, config, launch
-  config.rs          %APPDATA%\Plexify\config.json
+  config.rs          %APPDATA%\PlexDio\config.json
   secure_store.rs    Credential Manager -> DPAPI file fallback
   logging.rs         rotating file log (1 MB x 3)
   plex/              HTTP client, PIN auth, resource/connection racing, models, endpoints
@@ -126,9 +126,9 @@ Notable choices:
   threads and talk to the UI over channels; this keeps RAM and binary size down.
 - **No XML.** Every request asks for `application/json`.
 
-Data locations: `%APPDATA%\Plexify\config.json` (settings, resume queue),
-`%LOCALAPPDATA%\Plexify\db\*.sqlite` (library cache), `…\images` (artwork, LRU),
-`…\audio` (audio cache, LRU), `…\logs\plexify.log`.
+Data locations: `%APPDATA%\PlexDio\config.json` (settings, resume queue),
+`%LOCALAPPDATA%\PlexDio\db\*.sqlite` (library cache), `…\images` (artwork, LRU),
+`…\audio` (audio cache, LRU), `…\logs\plexdio.log`.
 
 ## Footprint
 
@@ -195,7 +195,7 @@ reads, the queue and shuffle rules, radio with and without sonic data, and the a
 
 ### Manual checklist for a real Plex account
 
-1. Start `plexify.exe` on Windows 10/11; click **Sign in with Plex**, complete the browser
+1. Start `plexdio.exe` on Windows 10/11; click **Sign in with Plex**, complete the browser
    flow, and confirm the server list appears with your own and shared servers.
 2. Open a music library; let the first sync finish (progress shows in the sidebar). Restart
    the app and confirm it opens on the library without asking again.

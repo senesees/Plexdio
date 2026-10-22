@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Helpers for driving plexify.exe under Wine during development.
-#   tools/wine-app.sh pid            -> print the PID of the running plexify.exe
+# Helpers for driving plexdio.exe under Wine during development.
+#   tools/wine-app.sh pid            -> print the PID of the running plexdio.exe
 #   tools/wine-app.sh stats [secs]   -> RSS (MB) and CPU% averaged over [secs] (default 30)
 #   tools/wine-app.sh kill           -> terminate it
 set -euo pipefail
