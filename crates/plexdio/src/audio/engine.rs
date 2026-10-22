@@ -5,6 +5,7 @@
 //! inserted silence, and crossfades overlap exactly `crossfade_ms` of equal-power mix.
 
 use super::decode::TrackDecoder;
+use super::eq::{Equalizer, BAND_COUNT};
 use super::gain::{limit, track_gain};
 use super::sink::{open_default, NullSink, Sink};
 use super::source::{AudioCache, SourceSpec};
@@ -130,11 +131,14 @@ pub struct EngineConfig {
     pub muted: bool,
     pub crossfade_ms: u32,
     pub normalization: bool,
+    pub eq_enabled: bool,
+    /// Gain per equaliser band in dB (see [`super::eq::BANDS`]).
+    pub eq_gains: [f32; BAND_COUNT],
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { volume: 1.0, muted: false, crossfade_ms: 0, normalization: true }
+        Self { volume: 1.0, muted: false, crossfade_ms: 0, normalization: true, eq_enabled: false, eq_gains: [0.0; BAND_COUNT] }
     }
 }
 
@@ -162,6 +166,8 @@ pub enum Command {
     SetMuted(bool),
     SetCrossfade(u32),
     SetNormalization(bool),
+    /// Equaliser on/off and band gains in dB.
+    SetEq(bool, [f32; BAND_COUNT]),
     /// Replace the queue and load the given queue slot at `position_ms`, paused (session resume).
     Restore(Vec<TrackSpec>, usize, u64),
     Stop,
@@ -245,6 +251,7 @@ pub struct PlayerCore {
     frames_played: u64,
     sink_name: String,
     sink_real: bool,
+    eq: Equalizer,
 }
 
 impl PlayerCore {
@@ -279,7 +286,9 @@ impl PlayerCore {
             frames_played: 0,
             sink_name,
             sink_real,
+            eq: Equalizer::new(rate),
         };
+        core.eq.set(cfg.eq_enabled, cfg.eq_gains);
         core.apply_volume();
         core
     }
@@ -358,6 +367,7 @@ impl PlayerCore {
                     a.gain = track_gain(a.spec.gain_db, a.spec.album_gain_db, on);
                 }
             }
+            Command::SetEq(on, gains) => self.eq.set(on, gains),
             Command::Stop => {
                 self.sink.flush();
                 self.current = None;
@@ -848,7 +858,7 @@ impl PlayerCore {
         let mut guard = 0;
         while self.sink.buffered_frames() < TARGET_BUFFER && guard < 12 {
             guard += 1;
-            let block = match self.produce(BLOCK_FRAMES) {
+            let mut block = match self.produce(BLOCK_FRAMES) {
                 Ok(b) => b,
                 Err(e) => {
                     self.fail(e);
@@ -858,6 +868,7 @@ impl PlayerCore {
             if block.is_empty() {
                 break;
             }
+            self.eq.process(&mut block);
             let frames = block.len() / 2;
             let accepted = self.sink.push(&block);
             self.frames_played += accepted as u64;
@@ -1121,6 +1132,10 @@ impl Engine {
 
     pub fn set_normalization(&self, on: bool) {
         self.send(Command::SetNormalization(on));
+    }
+
+    pub fn set_eq(&self, on: bool, gains: [f32; BAND_COUNT]) {
+        self.send(Command::SetEq(on, gains));
     }
 
     pub fn stop(&self) {

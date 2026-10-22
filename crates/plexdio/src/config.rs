@@ -55,6 +55,9 @@ pub struct Config {
     pub start_with_windows: bool,
     /// Show the playing track on Discord (Rich Presence). Off by default: it shares activity.
     pub discord_presence: bool,
+    /// Equaliser on/off and gain per band in dB (see `audio::eq::BANDS`).
+    pub eq_enabled: bool,
+    pub eq_gains: [f32; crate::audio::eq::BAND_COUNT],
     pub window_size: Option<[f32; 2]>,
 }
 
@@ -81,6 +84,8 @@ impl Default for Config {
             close_to_tray: false,
             start_with_windows: false,
             discord_presence: false,
+            eq_enabled: false,
+            eq_gains: [0.0; crate::audio::eq::BAND_COUNT],
             window_size: None,
         }
     }
@@ -121,6 +126,7 @@ impl Config {
         self.crossfade_secs = self.crossfade_secs.clamp(0.0, 12.0);
         self.image_cache_mb = self.image_cache_mb.clamp(10, 10_000);
         self.audio_cache_mb = self.audio_cache_mb.clamp(50, 50_000);
+        crate::audio::eq::sanitize(&mut self.eq_gains);
     }
 
     /// Atomically write the config (write temp file, then rename).

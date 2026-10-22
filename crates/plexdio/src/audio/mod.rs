@@ -2,6 +2,7 @@
 
 pub mod decode;
 pub mod engine;
+pub mod eq;
 pub mod gain;
 pub mod sink;
 pub mod source;

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod art;
+pub mod eq_editor;
 pub mod fonts;
 pub mod icons;
 pub mod jobs;

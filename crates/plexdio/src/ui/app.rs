@@ -1452,6 +1452,8 @@ impl PlexDioApp {
                 muted: self.config.muted,
                 crossfade_ms: (self.config.crossfade_secs.clamp(0.0, 12.0) * 1000.0).round() as u32,
                 normalization: self.config.normalization,
+                eq_enabled: self.config.eq_enabled,
+                eq_gains: self.config.eq_gains,
             };
             log::info!("starting playback engine (crossfade {} ms, normalization {})", cfg.crossfade_ms, cfg.normalization);
             let eng = Engine::start(cache, self.http.clone(), cfg);
@@ -2234,6 +2236,7 @@ impl PlexDioApp {
             if ui.available_width() >= 960.0 {
                 ui.columns(2, |cols| {
                     settings_card(&mut cols[0], "Playback", |ui| self.settings_playback(ui, &mut changed));
+                    settings_card(&mut cols[0], "Equalizer", |ui| self.settings_equalizer(ui, &mut changed));
                     settings_card(&mut cols[0], "Window", |ui| self.settings_window(ui, &mut changed));
                     settings_card(&mut cols[0], "Discord", |ui| self.settings_discord(ui, &mut changed));
                     settings_card(&mut cols[1], "Storage", |ui| self.settings_storage(ui, &mut changed));
@@ -2242,6 +2245,7 @@ impl PlexDioApp {
             } else {
                 ui.set_max_width(720.0);
                 settings_card(ui, "Playback", |ui| self.settings_playback(ui, &mut changed));
+                settings_card(ui, "Equalizer", |ui| self.settings_equalizer(ui, &mut changed));
                 settings_card(ui, "Window", |ui| self.settings_window(ui, &mut changed));
                 settings_card(ui, "Discord", |ui| self.settings_discord(ui, &mut changed));
                 settings_card(ui, "Storage", |ui| self.settings_storage(ui, &mut changed));
@@ -2302,6 +2306,51 @@ impl PlexDioApp {
                 *changed = true;
             }
         });
+    }
+
+    /// Equaliser: on/off, presets, and the curve editor. Slider drags update the engine live and
+    /// save when released.
+    fn settings_equalizer(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        use crate::audio::eq::{preset_name, PRESETS};
+        let mut send = false;
+        setting_row(ui, "Equalizer", Some("Shape the sound with 10 bands"), |ui| {
+            let mut on = self.config.eq_enabled;
+            if theme::toggle(ui, &mut on).changed() {
+                self.config.eq_enabled = on;
+                send = true;
+                *changed = true;
+            }
+        });
+        let enabled = self.config.eq_enabled;
+        ui.add_enabled_ui(enabled, |ui| {
+            setting_row(ui, "Preset", None, |ui| {
+                if theme::secondary_button(ui, "Reset").on_hover_text("Set every band to 0 dB").clicked() {
+                    self.config.eq_gains = PRESETS[0].1;
+                    send = true;
+                    *changed = true;
+                }
+                let current = preset_name(&self.config.eq_gains).unwrap_or("Custom");
+                egui::ComboBox::from_id_salt("eq-preset").selected_text(current).width(140.0).show_ui(ui, |ui| {
+                    for (name, gains) in PRESETS {
+                        if ui.selectable_label(current == *name, *name).clicked() {
+                            self.config.eq_gains = *gains;
+                            send = true;
+                            *changed = true;
+                        }
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            let edit = super::eq_editor::show(ui, &mut self.config.eq_gains);
+            send |= edit.changed;
+            // Saving on every drag step would rewrite the config file each frame.
+            *changed |= edit.committed;
+        });
+        if send {
+            if let Some(e) = &self.engine {
+                e.set_eq(self.config.eq_enabled, self.config.eq_gains);
+            }
+        }
     }
 
     fn settings_window(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
