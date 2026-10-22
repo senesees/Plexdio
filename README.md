@@ -189,6 +189,9 @@ reads, the queue and shuffle rules, radio with and without sonic data, and the a
   `xdotool` under Wine; an actual keyboard's media keys were not pressed.
 - **Long-running behaviour** (hours of playback, cache eviction under real use, sleep/resume)
   is not covered.
+- **Queue restore while the server is unreachable.** A normal start resumes the saved queue, track
+  and position. If the app starts offline it opens the cached library without restoring the queue
+  (playback needs the server); the queue comes back on the next start once the server is reachable.
 
 ### Manual checklist for a real Plex account
 
