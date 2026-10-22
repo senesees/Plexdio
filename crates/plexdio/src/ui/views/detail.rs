@@ -70,39 +70,39 @@ pub fn artist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
     let albums: Vec<usize> = lib.artist_albums.get(&id).cloned().unwrap_or_default();
     let ids = lib.artist_track_ids(id);
     let sub = format!("{}{} albums · {} tracks", a.genre.as_deref().map(|g| format!("{g} · ")).unwrap_or_default(), albums.len(), ids.len());
-    hero(ui, ctx, Hero { thumb: a.thumb.as_deref(), seed: &a.title, round: true, kind: "ARTIST", title: &a.title, sub: &sub });
-    play_buttons(ui, ctx, &ids, Some(RadioSeed::Artist(id)));
-    ui.add_space(10.0);
-    // Popular: most played tracks of the artist.
-    let mut top: Vec<Id> = ids.clone();
-    top.sort_by_key(|t| std::cmp::Reverse(lib.track(*t).map(|t| t.view_count).unwrap_or(0)));
-    top.truncate(5);
-    ui.label(RichText::new("Popular").size(18.0).strong());
-    let h = (top.len() as f32 * ROW_H).max(ROW_H);
-    ui.allocate_ui(egui::vec2(ui.available_width(), h + 6.0), |ui| {
-        track_table(ui, ctx, &top, TableOpts { album: true, artist: false, track_numbers: false, art: true }, "artist-top");
-    });
-    ui.add_space(10.0);
-    ui.label(RichText::new("Discography").size(18.0).strong());
-    ui.add_space(6.0);
     let mut open = None;
-    let subs: Vec<String> = albums.iter().map(|&i| if lib.albums[i].year > 0 { lib.albums[i].year.to_string() } else { "Album".into() }).collect();
-    card_grid(
-        ui,
-        ctx.art,
-        albums.len(),
-        false,
-        "artist-albums",
-        |i| {
-            let al = &lib.albums[albums[i]];
-            CardItem { thumb: al.thumb.as_deref(), title: &al.title, subtitle: &subs[i], seed: &al.title }
-        },
-        |i, r| {
-            if r.clicked() {
-                open = Some(lib.albums[albums[i]].id);
-            }
-        },
-    );
+    // One scroll area for the whole page (like Spotify), so Discography is reachable in small
+    // windows instead of being squeezed into whatever height is left.
+    egui::ScrollArea::vertical().id_salt(("artist-page", id)).auto_shrink([false, false]).show(ui, |ui| {
+        hero(ui, ctx, Hero { thumb: a.thumb.as_deref(), seed: &a.title, round: true, kind: "ARTIST", title: &a.title, sub: &sub });
+        play_buttons(ui, ctx, &ids, Some(RadioSeed::Artist(id)));
+        ui.add_space(10.0);
+        // Popular: most played tracks of the artist.
+        let mut top: Vec<Id> = ids.clone();
+        top.sort_by_key(|t| std::cmp::Reverse(lib.track(*t).map(|t| t.view_count).unwrap_or(0)));
+        top.truncate(5);
+        ui.label(RichText::new("Popular").size(18.0).strong());
+        track_list(ui, ctx, &top, TableOpts { album: true, artist: false, track_numbers: false, art: true }, top.len());
+        ui.add_space(10.0);
+        ui.label(RichText::new("Discography").size(18.0).strong());
+        ui.add_space(6.0);
+        let subs: Vec<String> = albums.iter().map(|&i| if lib.albums[i].year > 0 { lib.albums[i].year.to_string() } else { "Album".into() }).collect();
+        card_grid_inline(
+            ui,
+            ctx.art,
+            albums.len(),
+            false,
+            |i| {
+                let al = &lib.albums[albums[i]];
+                CardItem { thumb: al.thumb.as_deref(), title: &al.title, subtitle: &subs[i], seed: &al.title }
+            },
+            |i, r| {
+                if r.clicked() {
+                    open = Some(lib.albums[albums[i]].id);
+                }
+            },
+        );
+    });
     if let Some(id) = open {
         ctx.actions.push(UiAction::Navigate(Route::Album(id)));
     }

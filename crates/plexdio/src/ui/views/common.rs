@@ -348,28 +348,67 @@ pub fn card_grid<'a>(
         ui.label(RichText::new("Nothing here").color(theme::TEXT_DIM));
         return;
     }
-    let gap = 14.0;
-    let avail = ui.available_width();
-    let cols = ((avail + gap) / (CARD_W + gap)).floor().max(1.0) as usize;
-    let w = ((avail + gap) / cols as f32 - gap).max(120.0);
-    let row_h = w + 54.0 + gap;
+    let (cols, w, row_h) = grid_metrics(ui.available_width());
     let rows = n.div_ceil(cols);
     egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show_rows(ui, row_h, rows, |ui, range| {
         for r in range {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                for c in 0..cols {
-                    let i = r * cols + c;
-                    if i >= n {
-                        break;
-                    }
-                    let resp = card(ui, art, item(i), round, w);
-                    on_click(i, &resp);
-                }
-            });
-            ui.add_space(gap - ui.spacing().item_spacing.y);
+            grid_row(ui, art, n, round, cols, w, r, &item, &mut on_click);
         }
     });
+}
+
+const GRID_GAP: f32 = 14.0;
+
+/// Columns, card width and row height for a card grid `avail` points wide.
+fn grid_metrics(avail: f32) -> (usize, f32, f32) {
+    let cols = ((avail + GRID_GAP) / (CARD_W + GRID_GAP)).floor().max(1.0) as usize;
+    let w = ((avail + GRID_GAP) / cols as f32 - GRID_GAP).max(120.0);
+    (cols, w, w + 54.0 + GRID_GAP)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grid_row<'a>(
+    ui: &mut egui::Ui,
+    art: &mut ArtCache,
+    n: usize,
+    round: bool,
+    cols: usize,
+    w: f32,
+    r: usize,
+    item: &impl Fn(usize) -> CardItem<'a>,
+    on_click: &mut impl FnMut(usize, &egui::Response),
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = GRID_GAP;
+        for c in 0..cols {
+            let i = r * cols + c;
+            if i >= n {
+                break;
+            }
+            let resp = card(ui, art, item(i), round, w);
+            on_click(i, &resp);
+        }
+    });
+    ui.add_space(GRID_GAP - ui.spacing().item_spacing.y);
+}
+
+/// Card grid without its own scroll area, for pages that already scroll (all rows are drawn).
+pub fn card_grid_inline<'a>(
+    ui: &mut egui::Ui,
+    art: &mut ArtCache,
+    n: usize,
+    round: bool,
+    item: impl Fn(usize) -> CardItem<'a>,
+    mut on_click: impl FnMut(usize, &egui::Response),
+) {
+    if n == 0 {
+        ui.label(RichText::new("Nothing here").color(theme::TEXT_DIM));
+        return;
+    }
+    let (cols, w, _) = grid_metrics(ui.available_width());
+    for r in 0..n.div_ceil(cols) {
+        grid_row(ui, art, n, round, cols, w, r, &item, &mut on_click);
+    }
 }
 
 /// Horizontal strip of cards (Home rows), not virtualised (short).
