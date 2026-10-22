@@ -1564,6 +1564,7 @@ dependencies = [
  "egui",
  "egui-winit",
  "hdrshot-egui-backend",
+ "image",
  "log",
  "mockplex",
  "raw-window-handle",

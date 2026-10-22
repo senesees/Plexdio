@@ -16,7 +16,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::art::ArtCache;
 use super::icons::{self, Icon};
+use super::views::common::{LibTab, Route, UiAction, ViewCtx};
+use super::views::library::BrowseState;
 use super::jobs::Jobs;
 use super::runner::UiApp;
 use super::theme;
@@ -49,15 +52,6 @@ impl LaunchOptions {
         }
         o
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Nav {
-    Home,
-    Search,
-    Library,
-    Playlists,
-    Settings,
 }
 
 /// Results delivered from worker threads.
@@ -117,7 +111,12 @@ pub struct ServerEntry {
 pub struct PlexifyApp {
     pub config: Config,
     pub opts: LaunchOptions,
-    pub nav: Nav,
+    pub route: Route,
+    pub history: Vec<Route>,
+    pub browse: BrowseState,
+    pub art: ArtCache,
+    /// Bumped whenever `library` is replaced (invalidates memoised lists).
+    pub library_ver: u64,
     pub screen: Screen,
     pub jobs: Jobs<Msg>,
     pub http: Http,
@@ -151,10 +150,22 @@ impl PlexifyApp {
         theme::apply(ctx);
         let http = Http::new(ClientInfo::new(config.client_id.clone()));
         let tv = PlexTv::new(http.clone(), opts.plex_tv_url.as_deref());
+        let config_image_mb = config.image_cache_mb;
         let mut app = Self {
             config,
             opts,
-            nav: Nav::Home,
+            route: Route::Home,
+            history: Vec::new(),
+            browse: BrowseState::default(),
+            art: {
+                let c = ctx.clone();
+                ArtCache::new(crate::cache::images::ImageService::new(
+                    crate::paths::image_cache_dir(),
+                    config_image_mb,
+                    move || c.request_repaint(),
+                ))
+            },
+            library_ver: 0,
             screen: Screen::Login,
             jobs: Jobs::new(ctx.clone()),
             http,
@@ -296,7 +307,10 @@ impl PlexifyApp {
         let same = self.db_path.as_ref() == Some(&cachedb::db_path(server_id, section.key.as_deref().unwrap_or("")));
         self.section = Some(section.clone());
         self.screen = Screen::Main;
-        self.nav = Nav::Home;
+        self.route = Route::Home;
+        self.history.clear();
+        self.art.set_offline(false);
+        self.art.svc.set_server(Some((server_id.to_string(), PmsClient::new(self.http.clone(), conn.clone()))));
         if !same || self.library.is_none() {
             // Sync starts once the cache is loaded (see Msg::LibraryLoaded).
             self.load_cached_library(server_id, &section, &server_name);
@@ -311,6 +325,8 @@ impl PlexifyApp {
         let path = cachedb::db_path(server_id, &key);
         self.library_gen += 1;
         self.library = None;
+        self.library_ver += 1;
+        self.art.reset();
         self.sync = SyncState::default();
         self.db_path = Some(path.clone());
         let gen = self.library_gen;
@@ -379,6 +395,10 @@ impl PlexifyApp {
         self.offline = true;
         self.server_label = server_name.clone().unwrap_or_default();
         self.pms = None;
+        self.art.set_offline(true);
+        self.art.svc.set_server(None);
+        // Disk-cached art is keyed by server id, so it still shows offline.
+        self.art.svc.set_server_id_only(&server_id);
         self.section = Some(section.clone());
         self.screen = Screen::Main;
         self.banner = Some((format!("Offline — showing your cached library. {reason}"), true));
@@ -551,7 +571,10 @@ impl PlexifyApp {
             Msg::LibraryLoaded(gen, res) if gen == self.library_gen => {
                 let first_load = self.library.is_none();
                 match res {
-                    Ok(m) => self.library = Some(*m),
+                    Ok(m) => {
+                        self.library = Some(*m);
+                        self.library_ver += 1;
+                    }
                     Err(e) => {
                         log::error!("cannot load cache: {e}");
                         self.banner = Some((format!("Could not read the library cache: {e}"), true));
@@ -638,21 +661,92 @@ impl PlexifyApp {
             ui.label(RichText::new(text).size(11.5).color(color));
         });
         ui.add_space(8.0);
-        for (nav, icon, label) in [
-            (Nav::Home, Icon::Home, "Home"),
-            (Nav::Search, Icon::Search, "Search"),
-            (Nav::Library, Icon::Library, "Library"),
-            (Nav::Playlists, Icon::Playlist, "Playlists"),
+        let cat = route_category(&self.route);
+        let mut go = None;
+        for (target, icon, label) in [
+            (Route::Home, Icon::Home, "Home"),
+            (Route::Search, Icon::Search, "Search"),
+            (Route::Library(LibTab::Albums), Icon::Library, "Library"),
+            (Route::Playlists, Icon::Playlist, "Playlists"),
         ] {
-            nav_button(ui, &mut self.nav, nav, icon, label);
+            if nav_button(ui, route_category(&target) == cat, icon, label) {
+                go = Some(target);
+            }
         }
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             ui.add_space(10.0);
-            nav_button(ui, &mut self.nav, Nav::Settings, Icon::Settings, "Settings");
+            if nav_button(ui, cat == 4, Icon::Settings, "Settings") {
+                go = Some(Route::Settings);
+            }
             if let Some(u) = &self.user {
                 ui.label(RichText::new(u.display_name()).small().color(theme::TEXT_DIM));
             }
         });
+        if let Some(r) = go {
+            // Sidebar navigation starts a fresh history (keeps the library tab if already there).
+            let r = match (&r, &self.route) {
+                (Route::Library(_), Route::Library(t)) => Route::Library(*t),
+                _ => r,
+            };
+            self.history.clear();
+            self.route = r;
+        }
+    }
+
+    pub fn navigate(&mut self, r: Route) {
+        if r != self.route {
+            let prev = std::mem::replace(&mut self.route, r);
+            // Switching library tabs replaces instead of stacking.
+            if !matches!((&prev, &self.route), (Route::Library(_), Route::Library(_))) {
+                self.history.push(prev);
+                if self.history.len() > 50 {
+                    self.history.remove(0);
+                }
+            }
+        }
+    }
+
+    pub fn back(&mut self) {
+        if let Some(r) = self.history.pop() {
+            self.route = r;
+        }
+    }
+
+    fn apply_action(&mut self, a: UiAction) {
+        match a {
+            UiAction::Navigate(r) => self.navigate(r),
+            UiAction::Rate(id, rating) => self.rate_track(id, rating),
+            UiAction::Play(..) | UiAction::PlayShuffled(..) | UiAction::PlayNext(..) | UiAction::AddToQueue(..) | UiAction::Radio(..) => {
+                self.playback_action(a)
+            }
+        }
+    }
+
+    /// Placeholder until the playback engine lands.
+    fn playback_action(&mut self, a: UiAction) {
+        log::info!("playback action: {a:?}");
+        self.banner = Some(("Playback is not wired up yet.".into(), false));
+    }
+
+    /// Rate a track locally (cache + model) and on the server.
+    pub fn rate_track(&mut self, id: crate::library_model::Id, rating: u8) {
+        let value = (rating > 0).then_some(rating as f64);
+        if let Some(l) = &mut self.library {
+            l.apply_rating(id, rating as f32);
+            self.library_ver += 1;
+        }
+        if let Some(path) = self.db_path.clone() {
+            if let Ok(db) = LibraryDb::open(&path) {
+                let _ = db.set_track_rating(id, value);
+            }
+        }
+        if let Some(pms) = self.pms.clone() {
+            std::thread::spawn(move || {
+                if let Err(e) = pms.rate(&id.to_string(), (rating > 0).then_some(rating)) {
+                    log::warn!("rating failed: {e}");
+                }
+            });
+        }
     }
 
     /// One-line sync/connection status for the sidebar.
@@ -678,40 +772,6 @@ impl PlexifyApp {
         }
     }
 
-    fn home_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Home");
-        ui.add_space(8.0);
-        let Some(lib) = &self.library else {
-            ui.horizontal(|ui| {
-                theme::spinner(ui, 16.0);
-                ui.label(RichText::new("Loading your library…").color(theme::TEXT_DIM));
-            });
-            return;
-        };
-        if lib.is_empty() {
-            let msg = if self.sync.running { "Fetching your library for the first time…" } else { "This library is empty." };
-            ui.label(RichText::new(msg).color(theme::TEXT_DIM));
-            return;
-        }
-        ui.label(
-            RichText::new(format!(
-                "{} artists · {} albums · {} tracks · {} playlists",
-                lib.artists.len(),
-                lib.albums.len(),
-                lib.tracks.len(),
-                lib.playlists.len()
-            ))
-            .color(theme::TEXT_DIM),
-        );
-        ui.add_space(14.0);
-        ui.label(RichText::new("Recently added").size(18.0).strong());
-        ui.add_space(6.0);
-        for i in lib.recently_added_albums(8) {
-            let a = &lib.albums[i];
-            ui.label(format!("{} — {} ({})", a.title, a.artist, a.year));
-        }
-    }
-
     fn now_playing_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal_centered(|ui| {
@@ -733,19 +793,61 @@ impl PlexifyApp {
             });
             ui.add_space(6.0);
         }
-        match self.nav {
-            Nav::Settings => self.settings_view(ui),
-            Nav::Home => self.home_view(ui),
-            nav => {
-                let title = match nav {
-                    Nav::Home => unreachable!(),
-                    Nav::Search => "Search",
-                    Nav::Library => "Library",
-                    Nav::Playlists => "Playlists",
-                    Nav::Settings => unreachable!(),
-                };
-                ui.heading(title);
+        if self.route == Route::Settings {
+            if !self.history.is_empty() && super::views::common::page_header(ui, "", true) {
+                self.back();
             }
+            self.settings_view(ui);
+            return;
+        }
+        if !self.history.is_empty() && matches!(self.route, Route::Artist(_) | Route::Album(_) | Route::Playlist(_) | Route::Genre(_)) {
+            if icons::button(ui, Icon::Back, 26.0, false).on_hover_text("Back").clicked() {
+                self.back();
+                return;
+            }
+        }
+        let Some(lib) = self.library.as_ref() else {
+            ui.horizontal(|ui| {
+                theme::spinner(ui, 16.0);
+                ui.label(RichText::new("Loading your library…").color(theme::TEXT_DIM));
+            });
+            return;
+        };
+        if lib.is_empty() && !matches!(self.route, Route::Search) {
+            ui.heading("Your library");
+            ui.add_space(8.0);
+            let msg = if self.sync.running {
+                "Fetching your library for the first time…"
+            } else if self.offline {
+                "Nothing cached for this library yet. Connect to your server to load it."
+            } else {
+                "This library is empty. Add music to it in Plex and it will show up here."
+            };
+            ui.label(RichText::new(msg).color(theme::TEXT_DIM));
+            return;
+        }
+        let mut actions = Vec::new();
+        let route = self.route.clone();
+        let greeting = greeting();
+        {
+            let mut vc = ViewCtx { lib, art: &mut self.art, actions: &mut actions, now_playing: None };
+            use super::views::{detail, library};
+            match &route {
+                Route::Home => detail::home_view(ui, &mut vc, &greeting),
+                Route::Library(tab) => library::library_view(ui, &mut vc, &mut self.browse, *tab, self.library_ver),
+                Route::Playlists => library::playlists_view(ui, &mut vc),
+                Route::Album(id) => detail::album_view(ui, &mut vc, *id),
+                Route::Artist(id) => detail::artist_view(ui, &mut vc, *id),
+                Route::Playlist(id) => detail::playlist_view(ui, &mut vc, *id),
+                Route::Genre(g) => detail::genre_view(ui, &mut vc, g),
+                Route::Search => {
+                    ui.heading("Search");
+                }
+                Route::Settings => {}
+            }
+        }
+        for a in actions {
+            self.apply_action(a);
         }
     }
 
@@ -795,8 +897,23 @@ pub fn human_bytes(n: u64) -> String {
     }
 }
 
-fn nav_button(ui: &mut egui::Ui, current: &mut Nav, target: Nav, icon: Icon, label: &str) {
-    let selected = *current == target;
+fn greeting() -> String {
+    // Local hour isn't available without a tz crate; keep it neutral.
+    "Welcome back".into()
+}
+
+/// Sidebar group a route belongs to (0 home, 1 search, 2 library, 3 playlists, 4 settings).
+fn route_category(r: &Route) -> u8 {
+    match r {
+        Route::Home => 0,
+        Route::Search => 1,
+        Route::Library(_) | Route::Artist(_) | Route::Album(_) | Route::Genre(_) => 2,
+        Route::Playlists | Route::Playlist(_) => 3,
+        Route::Settings => 4,
+    }
+}
+
+fn nav_button(ui: &mut egui::Ui, selected: bool, icon: Icon, label: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
     if selected || resp.hovered() {
         let fill = if selected { egui::Color32::from_rgb(36, 36, 36) } else { egui::Color32::from_rgb(24, 24, 24) };
@@ -812,9 +929,7 @@ fn nav_button(ui: &mut egui::Ui, current: &mut Nav, target: Nav, icon: Icon, lab
         egui::FontId::proportional(15.0),
         color,
     );
-    if resp.clicked() {
-        *current = target;
-    }
+    resp.clicked()
 }
 
 impl UiApp for PlexifyApp {
@@ -828,6 +943,10 @@ impl UiApp for PlexifyApp {
     fn ui(&mut self, ui: &mut egui::Ui) {
         for msg in self.jobs.drain() {
             self.handle(msg);
+        }
+        self.art.begin_frame(ui.ctx());
+        if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1)) {
+            self.back();
         }
         match self.screen.clone() {
             Screen::Busy(text) => super::views::login::busy_screen(ui, &text),
