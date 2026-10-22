@@ -155,12 +155,6 @@ pub fn genre_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, genre: &Arc<str>) {
     }
 }
 
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(14.0);
-    ui.label(RichText::new(title).size(20.0).strong());
-    ui.add_space(6.0);
-}
-
 pub fn home_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, greeting: &str) {
     let lib = ctx.lib;
     egui::ScrollArea::vertical().id_salt("home").auto_shrink([false, false]).show(ui, |ui| {

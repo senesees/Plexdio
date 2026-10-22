@@ -345,6 +345,29 @@ fn route(state: &Arc<Mutex<State>>, method: &Method, path: &str, q: &HashMap<Str
             let (page, total) = section_items(lib, sec, q, start, size);
             json_resp(200, &json!({ "MediaContainer": { "size": page.len(), "totalSize": total, "offset": start, "Metadata": page } }))
         }
+        // Test hook: add a track to the (first) album without touching anything else, so a
+        // client with an already-synced cache sees it only through search.
+        (Method::Post, ["__mock", "add-track"]) => {
+            let title = q.get("title").cloned().unwrap_or_else(|| "Brand New Track".into());
+            let Some(album) = st.library.albums.first().cloned() else { return status(404) };
+            let id = st.library.tracks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+            let index = st.library.tracks.iter().filter(|t| t.album_id == album.id).count() as i64 + 1;
+            let now = st.library.tick();
+            st.library.tracks.push(library::Track {
+                id,
+                album_id: album.id,
+                title,
+                index,
+                audio: 0,
+                view_count: 0,
+                last_viewed_at: None,
+                user_rating: None,
+                added_at: now,
+                updated_at: now,
+            });
+            st.library.reindex();
+            json_resp(200, &json!({ "id": id }))
+        }
         (Method::Get, ["library", "sections", sec, "genre"]) => {
             let mut genres: Vec<String> = if *sec == MUSIC_SECTION { lib.albums.iter().map(|a| a.genre.clone()).collect() } else { vec![] };
             genres.sort();

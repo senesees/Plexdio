@@ -6,7 +6,7 @@ use crate::cache::sync::{sync_library, SyncProgress, SyncReport};
 use crate::config::Config;
 use crate::library_model::LibraryModel;
 use crate::plex::auth::PlexTv;
-use crate::plex::models::{Directory, Pin, PlexUser, Resource};
+use crate::plex::models::{Directory, Hub, Pin, PlexUser, Resource};
 use crate::plex::resources::{pick_best, ServerConnection};
 use crate::plex::server::PmsClient;
 use crate::plex::{ClientInfo, Http, PlexError};
@@ -20,6 +20,7 @@ use super::art::ArtCache;
 use super::icons::{self, Icon};
 use super::views::common::{LibTab, Route, UiAction, ViewCtx};
 use super::views::library::BrowseState;
+use super::views::search::SearchState;
 use super::jobs::Jobs;
 use super::runner::UiApp;
 use super::theme;
@@ -62,6 +63,8 @@ pub enum Msg {
     Servers(Result<Vec<Resource>, PlexError>),
     Probed(String, Result<ServerConnection, PlexError>),
     Sections(String, Result<Vec<Directory>, PlexError>),
+    /// Library generation, query and hubs from `/hubs/search`.
+    SearchHubs(u64, u64, String, Result<Vec<Hub>, PlexError>),
     LibraryLoaded(u64, Result<Box<LibraryModel>, String>),
     SyncProgress(u64, SyncProgress),
     SyncDone(u64, Result<SyncReport, String>),
@@ -114,6 +117,7 @@ pub struct PlexifyApp {
     pub route: Route,
     pub history: Vec<Route>,
     pub browse: BrowseState,
+    pub search: SearchState,
     pub art: ArtCache,
     /// Bumped whenever `library` is replaced (invalidates memoised lists).
     pub library_ver: u64,
@@ -157,6 +161,7 @@ impl PlexifyApp {
             route: Route::Home,
             history: Vec::new(),
             browse: BrowseState::default(),
+            search: SearchState::default(),
             art: {
                 let c = ctx.clone();
                 ArtCache::new(crate::cache::images::ImageService::new(
@@ -244,6 +249,7 @@ impl PlexifyApp {
         self.library = None;
         self.db_path = None;
         self.library_gen += 1;
+        self.search = SearchState::default();
         self.offline = false;
         self.selected_server = None;
         self.config.last_server_id = None;
@@ -289,6 +295,7 @@ impl PlexifyApp {
 
     pub fn open_library(&mut self, server_id: &str, section: Directory) {
         let Some(entry) = self.servers.iter().find(|s| s.res.client_identifier == server_id) else { return };
+        self.search = SearchState::default();
         let ProbeStatus::Ok(conn) = &entry.status else { return };
         log::info!(
             "opening library '{}' on '{}' via {}",
@@ -448,6 +455,40 @@ impl PlexifyApp {
         }
     }
 
+    /// Kick off the debounced server search when the query has settled and local results
+    /// already came from the current snapshot. Called once per frame in the main shell.
+    fn maybe_search_server(&mut self, now: f64) {
+        if self.route != Route::Search {
+            return;
+        }
+        let q = self.search.query.trim().to_lowercase();
+        if q != self.search.last_seen {
+            self.search.last_seen = q.clone();
+            self.search.changed_at = now;
+            self.search.server_for = None;
+            self.search.server_hubs.clear();
+            self.search.server_running = false;
+        }
+        if q.is_empty() || self.search.server_for.as_deref() == Some(q.as_str()) || self.search.server_running {
+            return;
+        }
+        if now - self.search.changed_at < 0.4 || self.offline {
+            return;
+        }
+        let (Some(pms), Some(section)) = (self.pms.clone(), self.section.clone()) else { return };
+        let Some(section_key) = section.key.clone() else { return };
+        self.search.server_running = true;
+        self.search.server_seq += 1;
+        let seq = self.search.server_seq;
+        let gen = self.library_gen;
+        let query = self.search.query.trim().to_string();
+        log::debug!("server search for {query:?}");
+        self.jobs.spawn("search-hubs", move || {
+            let res = pms.search(&section_key, &query, 10);
+            Msg::SearchHubs(seq, gen, query.to_lowercase(), res)
+        });
+    }
+
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::PinCreated(attempt, res) if attempt == self.login.attempt => match res {
@@ -585,6 +626,25 @@ impl PlexifyApp {
                     self.start_sync(false);
                 }
             }
+            Msg::SearchHubs(seq, gen, query, res) => {
+                if seq != self.search.server_seq {
+                    return;
+                }
+                self.search.server_running = false;
+                if gen == self.library_gen && query == self.search.query.trim().to_lowercase() {
+                    self.search.server_for = Some(query);
+                    match res {
+                        Ok(hubs) => {
+                            log::debug!("server search: {} hubs", hubs.len());
+                            self.search.server_hubs = hubs;
+                        }
+                        Err(e) => {
+                            log::debug!("server search failed: {e}");
+                            self.search.server_hubs.clear();
+                        }
+                    }
+                }
+            }
             Msg::SyncProgress(gen, p) if gen == self.library_gen => self.sync.progress = Some(p),
             Msg::SyncDone(gen, res) if gen == self.library_gen => {
                 self.sync.running = false;
@@ -690,6 +750,9 @@ impl PlexifyApp {
             };
             self.history.clear();
             self.route = r;
+            if self.route == Route::Search {
+                self.search.focus = true;
+            }
         }
     }
 
@@ -832,7 +895,7 @@ impl PlexifyApp {
         let greeting = greeting();
         {
             let mut vc = ViewCtx { lib, art: &mut self.art, actions: &mut actions, now_playing: None };
-            use super::views::{detail, library};
+            use super::views::{detail, library, search};
             match &route {
                 Route::Home => detail::home_view(ui, &mut vc, &greeting),
                 Route::Library(tab) => library::library_view(ui, &mut vc, &mut self.browse, *tab, self.library_ver),
@@ -841,9 +904,7 @@ impl PlexifyApp {
                 Route::Artist(id) => detail::artist_view(ui, &mut vc, *id),
                 Route::Playlist(id) => detail::playlist_view(ui, &mut vc, *id),
                 Route::Genre(g) => detail::genre_view(ui, &mut vc, g),
-                Route::Search => {
-                    ui.heading("Search");
-                }
+                Route::Search => search::search_view(ui, &mut vc, &mut self.search, self.library_ver),
                 Route::Settings => {}
             }
         }
@@ -946,6 +1007,10 @@ impl UiApp for PlexifyApp {
             self.handle(msg);
         }
         self.art.begin_frame(ui.ctx());
+        if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) && self.screen == Screen::Main {
+            self.navigate(Route::Search);
+            self.search.focus = true;
+        }
         if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1)) {
             self.back();
         }
@@ -966,6 +1031,7 @@ impl UiApp for PlexifyApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(24, 8)))
                     .show(ui, |ui| self.content(ui));
+                self.maybe_search_server(ui.ctx().input(|i| i.time));
             }
         }
     }

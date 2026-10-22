@@ -79,6 +79,13 @@ pub fn fmt_long_duration(ms: u64) -> String {
     }
 }
 
+/// Sub-heading used inside scrollable pages.
+pub fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(14.0);
+    ui.label(RichText::new(title).size(20.0).strong());
+    ui.add_space(6.0);
+}
+
 /// "1 track" / "24 tracks".
 pub fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
@@ -149,7 +156,7 @@ pub struct TableOpts {
 
 pub const ROW_H: f32 = 48.0;
 
-/// Virtualised track list. `ids` are track ids in display order.
+/// Virtualised track list with its own scroll area. `ids` are track ids in display order.
 pub fn track_table(ui: &mut egui::Ui, ctx: &mut ViewCtx, ids: &[Id], opts: TableOpts, salt: &str) {
     if ids.is_empty() {
         ui.label(RichText::new("No tracks").color(theme::TEXT_DIM));
@@ -160,62 +167,78 @@ pub fn track_table(ui: &mut egui::Ui, ctx: &mut ViewCtx, ids: &[Id], opts: Table
         .auto_shrink([false, false])
         .show_rows(ui, ROW_H, ids.len(), |ui, range| {
             for row in range {
-                let id = ids[row];
-                let Some(t) = ctx.lib.track(id) else { continue };
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), Sense::click());
-                let playing = ctx.now_playing == Some(id);
-                if resp.hovered() {
-                    ui.painter().rect_filled(rect, 6.0, theme::CARD_HOVER);
-                }
-                let w = rect.width();
-                let mut x = rect.left() + 10.0;
-                let cy = rect.center().y;
-                // Number / playing marker.
-                let num = if opts.track_numbers { t.index as usize } else { row + 1 };
-                if playing {
-                    icons::paint(ui.painter(), Rect::from_center_size(egui::pos2(x + 12.0, cy), egui::vec2(16.0, 16.0)), Icon::Volume, theme::ACCENT);
-                } else if resp.hovered() {
-                    icons::paint(ui.painter(), Rect::from_center_size(egui::pos2(x + 12.0, cy), egui::vec2(16.0, 16.0)), Icon::Play, theme::TEXT);
-                } else {
-                    ui.painter().text(egui::pos2(x + 24.0, cy), Align2::RIGHT_CENTER, num.to_string(), FontId::proportional(13.0), theme::TEXT_DIM);
-                }
-                x += 40.0;
-                if opts.art {
-                    let r = Rect::from_min_size(egui::pos2(x, cy - 18.0), egui::vec2(36.0, 36.0));
-                    ctx.art.paint(ui, r, t.thumb.as_deref(), &t.album, Shape::Rounded(4));
-                    x += 46.0;
-                }
-                let dur_w = 60.0;
-                let album_w = if opts.album { (w * 0.28).min(320.0) } else { 0.0 };
-                let title_w = (rect.right() - x - dur_w - album_w - 20.0).max(60.0);
-                let title_color = if playing { theme::ACCENT } else { theme::TEXT };
-                if opts.artist {
-                    clipped(ui, egui::pos2(x, cy - 9.0), &t.title, 14.5, title_color, title_w, Align2::LEFT_CENTER);
-                    clipped(ui, egui::pos2(x, cy + 10.0), t.display_artist(), 12.5, theme::TEXT_DIM, title_w, Align2::LEFT_CENTER);
-                } else {
-                    clipped(ui, egui::pos2(x, cy), &t.title, 14.5, title_color, title_w, Align2::LEFT_CENTER);
-                }
-                if opts.album {
-                    let ax = rect.right() - dur_w - album_w - 10.0;
-                    clipped(ui, egui::pos2(ax, cy), &t.album, 13.0, theme::TEXT_DIM, album_w - 10.0, Align2::LEFT_CENTER);
-                }
-                if t.user_rating > 0.0 {
-                    let sr = Rect::from_center_size(egui::pos2(rect.right() - dur_w - 14.0, cy), egui::vec2(14.0, 14.0));
-                    icons::paint(ui.painter(), sr, Icon::StarFilled, theme::ACCENT.linear_multiply(0.8));
-                }
-                ui.painter().text(
-                    egui::pos2(rect.right() - 12.0, cy),
-                    Align2::RIGHT_CENTER,
-                    fmt_duration(t.duration_ms as u64),
-                    FontId::proportional(13.0),
-                    theme::TEXT_DIM,
-                );
-                if resp.double_clicked() {
-                    ctx.actions.push(UiAction::Play(ids.to_vec(), row));
-                }
-                resp.context_menu(|ui| track_menu(ui, ctx, id, ids, row));
+                track_row(ui, ctx, ids, opts, row);
             }
         });
+}
+
+/// One track row, drawn at the cursor. Used by both the virtualised table and inline lists.
+pub fn track_row(ui: &mut egui::Ui, ctx: &mut ViewCtx, ids: &[Id], opts: TableOpts, row: usize) {
+    let id = ids[row];
+    let Some(t) = ctx.lib.track(id) else { return };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), Sense::click());
+    let playing = ctx.now_playing == Some(id);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, theme::CARD_HOVER);
+    }
+    let w = rect.width();
+    let mut x = rect.left() + 10.0;
+    let cy = rect.center().y;
+    // Number / playing marker.
+    let num = if opts.track_numbers { t.index as usize } else { row + 1 };
+    if playing {
+        icons::paint(ui.painter(), Rect::from_center_size(egui::pos2(x + 12.0, cy), egui::vec2(16.0, 16.0)), Icon::Volume, theme::ACCENT);
+    } else if resp.hovered() {
+        icons::paint(ui.painter(), Rect::from_center_size(egui::pos2(x + 12.0, cy), egui::vec2(16.0, 16.0)), Icon::Play, theme::TEXT);
+    } else {
+        ui.painter().text(egui::pos2(x + 24.0, cy), Align2::RIGHT_CENTER, num.to_string(), FontId::proportional(13.0), theme::TEXT_DIM);
+    }
+    x += 40.0;
+    if opts.art {
+        let r = Rect::from_min_size(egui::pos2(x, cy - 18.0), egui::vec2(36.0, 36.0));
+        ctx.art.paint(ui, r, t.thumb.as_deref(), &t.album, Shape::Rounded(4));
+        x += 46.0;
+    }
+    let dur_w = 60.0;
+    let album_w = if opts.album { (w * 0.28).min(320.0) } else { 0.0 };
+    let title_w = (rect.right() - x - dur_w - album_w - 20.0).max(60.0);
+    let title_color = if playing { theme::ACCENT } else { theme::TEXT };
+    if opts.artist {
+        clipped(ui, egui::pos2(x, cy - 9.0), &t.title, 14.5, title_color, title_w, Align2::LEFT_CENTER);
+        clipped(ui, egui::pos2(x, cy + 10.0), t.display_artist(), 12.5, theme::TEXT_DIM, title_w, Align2::LEFT_CENTER);
+    } else {
+        clipped(ui, egui::pos2(x, cy), &t.title, 14.5, title_color, title_w, Align2::LEFT_CENTER);
+    }
+    if opts.album {
+        let ax = rect.right() - dur_w - album_w - 10.0;
+        clipped(ui, egui::pos2(ax, cy), &t.album, 13.0, theme::TEXT_DIM, album_w - 10.0, Align2::LEFT_CENTER);
+    }
+    if t.user_rating > 0.0 {
+        let sr = Rect::from_center_size(egui::pos2(rect.right() - dur_w - 14.0, cy), egui::vec2(14.0, 14.0));
+        icons::paint(ui.painter(), sr, Icon::StarFilled, theme::ACCENT.linear_multiply(0.8));
+    }
+    ui.painter().text(
+        egui::pos2(rect.right() - 12.0, cy),
+        Align2::RIGHT_CENTER,
+        fmt_duration(t.duration_ms as u64),
+        FontId::proportional(13.0),
+        theme::TEXT_DIM,
+    );
+    if resp.double_clicked() {
+        ctx.actions.push(UiAction::Play(ids.to_vec(), row));
+    }
+    resp.context_menu(|ui| track_menu(ui, ctx, id, ids, row));
+}
+
+/// Non-scrolling track list for pages that already scroll. Draws at most `max_rows` rows.
+pub fn track_list(ui: &mut egui::Ui, ctx: &mut ViewCtx, ids: &[Id], opts: TableOpts, max_rows: usize) {
+    if ids.is_empty() {
+        ui.label(RichText::new("No tracks").color(theme::TEXT_DIM));
+        return;
+    }
+    for row in 0..ids.len().min(max_rows) {
+        track_row(ui, ctx, ids, opts, row);
+    }
 }
 
 pub fn track_menu(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id, ids: &[Id], row: usize) {

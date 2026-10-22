@@ -39,6 +39,8 @@ fn main() {
         background: theme::BG,
     };
     let ctx = egui::Context::default();
+    // CJK/emoji titles fall back to an installed system font instead of rendering as boxes.
+    ctx.add_font_provider(Arc::new(plexify::ui::fonts::system_provider()));
     if let Err(e) = runner::run(options, ctx, move |ctx, _proxy| {
         let store: Arc<dyn secure_store::SecretStore> = Arc::from(secure_store::default_store(TOKEN_NAME));
         PlexifyApp::new(ctx, config, opts, store)
