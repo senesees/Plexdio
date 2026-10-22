@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use super::art::ArtCache;
 use super::icons::{self, Icon};
+use super::runner::WindowCmd;
+use crate::win::tray::{TrayEvent, TrayHandle};
 use super::views::common::{fmt_duration, LibTab, RadioSeed, Route, UiAction, ViewCtx};
 use super::views::library::BrowseState;
 use super::views::search::SearchState;
@@ -248,6 +250,20 @@ pub struct PlexifyApp {
     /// Playing event a moment later, and the app only repaints while it knows it is playing, so
     /// keep drawing until that event has been seen (or the deadline passes).
     wake_poll: Option<std::time::Instant>,
+    /// Compact always-on-top layout.
+    mini: bool,
+    /// Window geometry/behaviour changes still to be sent for the mini-player toggle.
+    mini_geometry: bool,
+    /// Tray icon and media keys (Windows).
+    tray: Option<TrayHandle>,
+    /// A quit was requested from the tray menu.
+    quitting: bool,
+    /// The window title last sent to the window manager.
+    window_title: String,
+    /// Hide the window on the next frame (close to tray, or show after hiding).
+    hide_window: bool,
+    /// Client area size seen in the last frame, saved on exit so the window reopens as it was.
+    last_window_size: Option<[f32; 2]>,
 }
 
 impl PlexifyApp {
@@ -309,6 +325,13 @@ impl PlexifyApp {
             radio_job: None,
             last_playing: None,
             wake_poll: None,
+            mini: false,
+            mini_geometry: false,
+            tray: None,
+            quitting: false,
+            window_title: String::new(),
+            hide_window: false,
+            last_window_size: None,
         };
         app.token = app.store.get();
         if app.token.is_some() {
@@ -578,6 +601,203 @@ impl PlexifyApp {
     pub fn save_config(&self) {
         if let Err(e) = self.config.save() {
             log::warn!("failed to save config: {e}");
+        }
+    }
+
+    /// Remember the current window size so the next start reopens as the user left it.
+    fn save_window_size(&mut self) {
+        if let Some(size) = self.last_window_size.take() {
+            if self.config.window_size != Some(size) {
+                self.config.window_size = Some(size);
+                self.save_config();
+            }
+        }
+    }
+
+    /// Play/pause from a shortcut, the tray menu or a media key.
+    fn toggle_playback(&mut self) {
+        if let Some(eng) = &self.engine {
+            eng.play_pause();
+        }
+        self.wake_poll = Some(std::time::Instant::now() + Duration::from_secs(2));
+        self.poll_playback();
+    }
+
+    /// Skip forward (`dir > 0`) or back.
+    fn skip_track(&mut self, dir: i32) {
+        if let Some(eng) = &self.engine {
+            if dir > 0 {
+                eng.next();
+            } else {
+                eng.prev();
+            }
+        }
+        self.wake_poll = Some(std::time::Instant::now() + Duration::from_secs(2));
+        self.poll_playback();
+    }
+
+    /// Seek relative to the current position, clamped to the track.
+    fn seek_by(&mut self, delta_ms: i64) {
+        if self.playback.duration_ms == 0 {
+            return;
+        }
+        let target = (self.playback.position_ms as i64 + delta_ms).clamp(0, self.playback.duration_ms as i64) as u64;
+        if let Some(eng) = &self.engine {
+            eng.seek(target);
+        }
+        self.wake_poll = Some(std::time::Instant::now() + Duration::from_secs(1));
+        self.poll_playback();
+    }
+
+    fn nudge_volume(&mut self, delta: f32) {
+        let v = (self.config.volume + delta).clamp(0.0, 1.0);
+        if let Some(eng) = &self.engine {
+            eng.set_volume(v);
+            if v > 0.0 && self.config.muted {
+                eng.set_muted(false);
+                self.config.muted = false;
+            }
+        }
+        self.config.volume = v;
+        self.save_config();
+        self.poll_playback();
+    }
+
+    fn toggle_mini(&mut self) {
+        self.mini = !self.mini;
+        self.mini_geometry = true;
+    }
+
+    /// Keyboard shortcuts while the main window has focus: space play/pause, arrows seek,
+    /// Ctrl+arrows skip/volume, Ctrl+M mini-player.
+    fn shortcuts(&mut self, ui: &mut egui::Ui) {
+        let (mut toggle, mut seek, mut skip, mut volume, mut mini) = (false, 0i64, 0i32, 0.0f32, false);
+        ui.input_mut(|i| {
+            toggle = i.consume_key(egui::Modifiers::NONE, egui::Key::Space);
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                seek += 5_000;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                seek -= 5_000;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowRight) {
+                skip += 1;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowLeft) {
+                skip -= 1;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp) {
+                volume += 0.05;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowDown) {
+                volume -= 0.05;
+            }
+            mini = i.consume_key(egui::Modifiers::COMMAND, egui::Key::M);
+        });
+        if toggle {
+            self.toggle_playback();
+        }
+        if seek != 0 {
+            self.seek_by(seek);
+        }
+        if skip != 0 {
+            self.skip_track(skip.signum());
+        }
+        if volume != 0.0 {
+            self.nudge_volume(volume);
+        }
+        if mini {
+            self.toggle_mini();
+        }
+    }
+
+    /// Compact always-on-top layout: art, title, basic transport and a seek bar.
+    fn mini_player(&mut self, ui: &mut egui::Ui) {
+        enum Cmd {
+            Toggle,
+            Next,
+            Prev,
+            Seek(u64),
+            Expand,
+        }
+        let st = self.playback.clone();
+        let track = st.track.clone();
+        let thumb = track
+            .as_ref()
+            .and_then(|t| self.library.as_ref().and_then(|l| l.track(t.id)))
+            .and_then(|t| t.thumb.clone());
+        let mut cmds = Vec::new();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
+            match &track {
+                Some(t) => self.art.paint(ui, rect, thumb.as_deref(), &t.title, super::art::Shape::Rounded(6)),
+                None => {
+                    ui.painter().rect_filled(rect, 6.0, theme::CARD_HOVER);
+                }
+            }
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                let (title, sub) = match &track {
+                    Some(t) => (t.title.clone(), format!("{} · {}", t.artist, t.album)),
+                    None => ("Nothing playing".to_string(), "Pick a track in the full window".to_string()),
+                };
+                ui.add(egui::Label::new(RichText::new(title).strong().size(15.0)).truncate());
+                ui.add(egui::Label::new(RichText::new(sub).small().color(theme::TEXT_DIM)).truncate());
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if icons::button(ui, Icon::Prev, 15.0, false).on_hover_text("Previous").clicked() {
+                        cmds.push(Cmd::Prev);
+                    }
+                    let playing = st.state == PlayState::Playing;
+                    if icons::button(ui, if playing { Icon::Pause } else { Icon::Play }, 20.0, false)
+                        .on_hover_text(if playing { "Pause" } else { "Play" })
+                        .clicked()
+                    {
+                        cmds.push(Cmd::Toggle);
+                    }
+                    if icons::button(ui, Icon::Next, 15.0, false).on_hover_text("Next").clicked() {
+                        cmds.push(Cmd::Next);
+                    }
+                    ui.add_space(6.0);
+                    let mut pos = st.position_ms as f64 / 1000.0;
+                    let dur = (st.duration_ms as f64 / 1000.0).max(0.001);
+                    ui.spacing_mut().slider_width = 110.0;
+                    if ui.add(egui::Slider::new(&mut pos, 0.0..=dur).show_value(false)).changed() {
+                        cmds.push(Cmd::Seek((pos * 1000.0) as u64));
+                    }
+                    ui.label(
+                        RichText::new(format!("{} / {}", fmt_duration(st.position_ms), fmt_duration(st.duration_ms)))
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icons::button(ui, Icon::MiniPlayer, 18.0, false).on_hover_text("Back to the full window").clicked() {
+                    cmds.push(Cmd::Expand);
+                }
+            });
+        });
+        for c in cmds {
+            match c {
+                Cmd::Toggle => self.toggle_playback(),
+                Cmd::Next => self.skip_track(1),
+                Cmd::Prev => self.skip_track(-1),
+                Cmd::Seek(ms) => {
+                    if let Some(eng) = &self.engine {
+                        eng.seek(ms);
+                    }
+                    self.poll_playback();
+                    // Keep polling while the seek lands.
+                    self.wake_poll = Some(std::time::Instant::now() + Duration::from_secs(1));
+                }
+                Cmd::Expand => self.toggle_mini(),
+            }
+        }
+        if st.state == PlayState::Playing {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
     }
 
@@ -1780,38 +2000,196 @@ impl PlexifyApp {
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
-        ui.add_space(12.0);
-        theme::card().show(ui, |ui| {
-            ui.label(RichText::new("Library cache").strong());
-            ui.label(format!("Database size: {}", human_bytes(crate::paths::dir_size(&crate::paths::db_dir()))));
-            let (status, _) = self.sync_status_text();
-            ui.label(RichText::new(status).small().color(theme::TEXT_DIM));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(!self.offline && !self.sync.running, |ui| {
-                    if theme::secondary_button(ui, "Refresh library").on_hover_text("Re-download the whole library").clicked() {
-                        self.start_sync(true);
+        ui.add_space(10.0);
+        let mut changed = false;
+        egui::ScrollArea::vertical().id_salt("settings").auto_shrink([false, false]).show(ui, |ui| {
+            theme::card().show(ui, |ui| {
+                ui.label(RichText::new("Playback").size(17.0).strong());
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Stream quality");
+                    let mut q = self.config.quality;
+                    ui.selectable_value(&mut q, crate::config::StreamQuality::Original, "Original");
+                    for kbps in [320u32, 256, 192, 128] {
+                        ui.selectable_value(&mut q, crate::config::StreamQuality::Kbps(kbps), format!("{kbps} kbps"));
+                    }
+                    if q != self.config.quality {
+                        self.config.quality = q;
+                        changed = true;
                     }
                 });
-                ui.add_enabled_ui(!self.sync.running, |ui| {
-                    if theme::secondary_button(ui, "Clear cache").clicked() {
-                        self.clear_library_cache();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Crossfade");
+                    let mut xf = self.config.crossfade_secs;
+                    if ui.add(egui::Slider::new(&mut xf, 0.0..=12.0).suffix(" s").step_by(0.5)).changed() {
+                        self.config.crossfade_secs = xf;
+                        if let Some(e) = &self.engine {
+                            e.set_crossfade((xf * 1000.0).round() as u32);
+                        }
+                        changed = true;
+                    }
+                    if xf <= 0.0 {
+                        ui.label(RichText::new("gapless").small().color(theme::TEXT_DIM));
                     }
                 });
+                ui.add_space(4.0);
+                let mut norm = self.config.normalization;
+                if ui.checkbox(&mut norm, "ReplayGain volume normalization").changed() {
+                    self.config.normalization = norm;
+                    if let Some(e) = &self.engine {
+                        e.set_normalization(norm);
+                    }
+                    changed = true;
+                }
+                let mut autoplay = self.config.autoplay;
+                if ui.checkbox(&mut autoplay, "Autoplay similar tracks when the queue ends").changed() {
+                    self.config.autoplay = autoplay;
+                    changed = true;
+                }
+            });
+
+            ui.add_space(10.0);
+            theme::card().show(ui, |ui| {
+                ui.label(RichText::new("Window").size(17.0).strong());
+                ui.add_space(6.0);
+                if theme::secondary_button(ui, if self.mini { "Leave mini-player" } else { "Mini-player" })
+                    .on_hover_text("A small always-on-top window (Ctrl+M)")
+                    .clicked()
+                {
+                    self.toggle_mini();
+                }
+                ui.add_space(4.0);
+                let tray = self.tray.is_some();
+                let mut min_tray = self.config.minimize_to_tray;
+                if ui.add_enabled(tray, egui::Checkbox::new(&mut min_tray, "Minimize to the tray")).changed() {
+                    self.config.minimize_to_tray = min_tray;
+                    changed = true;
+                }
+                let mut close_tray = self.config.close_to_tray;
+                if ui.add_enabled(tray, egui::Checkbox::new(&mut close_tray, "Close to the tray")).changed() {
+                    self.config.close_to_tray = close_tray;
+                    changed = true;
+                }
+                if !tray {
+                    ui.label(RichText::new("The tray icon is only available on Windows.").small().color(theme::TEXT_DIM));
+                }
+                let mut autostart = self.config.start_with_windows;
+                let autostart_ok = cfg!(windows);
+                if ui
+                    .add_enabled(autostart_ok, egui::Checkbox::new(&mut autostart, "Start Plexify with Windows"))
+                    .changed()
+                {
+                    if crate::win::autostart::set_enabled(autostart) {
+                        self.config.start_with_windows = autostart;
+                        changed = true;
+                    } else {
+                        self.banner = Some(("Could not update the Windows startup entry.".into(), true));
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            theme::card().show(ui, |ui| {
+                ui.label(RichText::new("Storage").size(17.0).strong());
+                ui.add_space(6.0);
+                ui.label(format!("Library database: {}", human_bytes(crate::paths::dir_size(&crate::paths::db_dir()))));
+                let (status, _) = self.sync_status_text();
+                ui.label(RichText::new(status).small().color(theme::TEXT_DIM));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!self.offline && !self.sync.running, |ui| {
+                        if theme::secondary_button(ui, "Refresh library").on_hover_text("Re-download the whole library").clicked() {
+                            self.start_sync(true);
+                        }
+                    });
+                    ui.add_enabled_ui(!self.sync.running, |ui| {
+                        if theme::secondary_button(ui, "Clear library cache").clicked() {
+                            self.clear_library_cache();
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label("Artwork cache");
+                    ui.label(
+                        RichText::new(format!("{} used", human_bytes(crate::paths::dir_size(&crate::paths::image_cache_dir()))))
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+                let mut img_mb = self.config.image_cache_mb as f64;
+                if ui
+                    .add(egui::Slider::new(&mut img_mb, 50.0..=2000.0).suffix(" MB").step_by(50.0))
+                    .changed()
+                {
+                    self.config.image_cache_mb = img_mb as u64;
+                    self.art.svc.set_cap_mb(img_mb as u64);
+                    changed = true;
+                }
+                if theme::secondary_button(ui, "Clear artwork cache").clicked() {
+                    self.art.svc.clear_disk();
+                    self.art.reset();
+                }
+
+                ui.add_space(10.0);
+                let mut audio_on = self.config.audio_cache_enabled;
+                if ui.checkbox(&mut audio_on, "Cache streamed audio").changed() {
+                    self.config.audio_cache_enabled = audio_on;
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Audio cache");
+                    ui.label(
+                        RichText::new(format!("{} used", human_bytes(crate::paths::dir_size(&crate::paths::audio_cache_dir()))))
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+                let mut audio_mb = self.config.audio_cache_mb as f64;
+                if ui
+                    .add(egui::Slider::new(&mut audio_mb, 100.0..=5000.0).suffix(" MB").step_by(100.0))
+                    .changed()
+                {
+                    self.config.audio_cache_mb = audio_mb as u64;
+                    changed = true;
+                }
+                if self.engine.is_some() {
+                    ui.label(RichText::new("Audio cache changes apply after a restart.").small().color(theme::TEXT_DIM));
+                }
+                if theme::secondary_button(ui, "Clear audio cache").clicked() {
+                    match remove_dir_all(crate::paths::audio_cache_dir()) {
+                        Ok(()) => self.banner = Some(("Audio cache cleared.".into(), false)),
+                        Err(e) => self.banner = Some((format!("Could not clear the audio cache: {e}"), true)),
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            theme::card().show(ui, |ui| {
+                ui.label(RichText::new("Account").size(17.0).strong());
+                ui.add_space(6.0);
+                if let Some(u) = &self.user {
+                    ui.label(format!("Signed in as {}", u.display_name()));
+                }
+                ui.label(RichText::new(format!("Token stored in: {}", self.store.describe())).small().color(theme::TEXT_DIM));
+                ui.add_space(8.0);
+                if theme::secondary_button(ui, "Sign out").clicked() {
+                    self.sign_out();
+                }
             });
         });
-        ui.add_space(12.0);
-        theme::card().show(ui, |ui| {
-            ui.label(RichText::new("Account").strong());
-            if let Some(u) = &self.user {
-                ui.label(format!("Signed in as {}", u.display_name()));
-            }
-            ui.label(RichText::new(format!("Token stored in: {}", self.store.describe())).small().color(theme::TEXT_DIM));
-            ui.add_space(8.0);
-            if theme::secondary_button(ui, "Sign out").clicked() {
-                self.sign_out();
-            }
-        });
+        if changed {
+            self.save_config();
+        }
+    }
+}
+
+fn remove_dir_all(dir: std::path::PathBuf) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -1865,9 +2243,18 @@ impl UiApp for PlexifyApp {
             crate::win::single_instance::publish_window(hwnd);
         }
         crate::win::fix_wine_event_target();
+        self.tray = crate::win::tray::start();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        if !self.mini {
+            if let Some(rect) = ui.ctx().input(|i| i.viewport().inner_rect) {
+                // Ignore transient sizes while the mini-player geometry is being applied.
+                if rect.width() >= 760.0 && rect.height() >= 480.0 {
+                    self.last_window_size = Some([rect.width(), rect.height()]);
+                }
+            }
+        }
         for msg in self.jobs.drain() {
             self.handle(msg);
         }
@@ -1891,6 +2278,9 @@ impl UiApp for PlexifyApp {
             self.navigate(Route::Search);
             self.search.focus = true;
         }
+        if self.screen == Screen::Main && !ui.ctx().egui_wants_keyboard_input() {
+            self.shortcuts(ui);
+        }
         if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1)) {
             self.back();
         }
@@ -1898,6 +2288,7 @@ impl UiApp for PlexifyApp {
             Screen::Busy(text) => super::views::login::busy_screen(ui, &text),
             Screen::Login => self.login_screen(ui),
             Screen::ServerSelect => self.server_screen(ui),
+            Screen::Main if self.mini => self.mini_player(ui),
             Screen::Main => {
                 if self.mixes_dirty && self.route == Route::Home {
                     self.refresh_mixes();
@@ -1930,5 +2321,76 @@ impl UiApp for PlexifyApp {
         self.cancel_login();
         self.poll_playback();
         self.maybe_save_session(true);
+        self.save_window_size();
+        self.tray = None; // removes the icon and stops the tray thread
+    }
+
+    /// Keep the window title in step with playback, handle tray/media-key events, and tell the
+    /// runner about mini-player geometry changes.
+    fn take_window_cmds(&mut self) -> Vec<WindowCmd> {
+        let mut cmds = Vec::new();
+        let mut events = Vec::new();
+        if let Some(tray) = &self.tray {
+            while let Some(e) = tray.try_recv() {
+                events.push(e);
+            }
+        }
+        for e in events {
+            match e {
+                TrayEvent::Show => cmds.push(WindowCmd::Show),
+                TrayEvent::PlayPause => self.toggle_playback(),
+                TrayEvent::Next => self.skip_track(1),
+                TrayEvent::Prev => self.skip_track(-1),
+                TrayEvent::Quit => {
+                    log::info!("quit requested from the tray");
+                    self.quitting = true;
+                }
+            }
+        }
+        if std::mem::take(&mut self.hide_window) {
+            self.save_window_size();
+            cmds.push(WindowCmd::Hide);
+        }
+        if std::mem::take(&mut self.mini_geometry) {
+            if self.mini {
+                cmds.push(WindowCmd::Resizable(false));
+                cmds.push(WindowCmd::AlwaysOnTop(true));
+                cmds.push(WindowCmd::Size(420, 150));
+            } else {
+                let [w, h] = self.config.window_size.unwrap_or([1180.0, 760.0]);
+                cmds.push(WindowCmd::AlwaysOnTop(false));
+                cmds.push(WindowCmd::Resizable(true));
+                cmds.push(WindowCmd::Size(w as u32, h as u32));
+            }
+        }
+        let title = match (&self.playback.track, self.playback.state) {
+            (Some(t), PlayState::Playing | PlayState::Paused) => format!("{} — {} · Plexify", t.title, t.artist),
+            _ => "Plexify".to_string(),
+        };
+        if title != self.window_title {
+            if let Some(tray) = &self.tray {
+                tray.set_tip(&title);
+            }
+            self.window_title = title.clone();
+            cmds.push(WindowCmd::Title(title));
+        }
+        cmds
+    }
+
+    fn minimizes_to_tray(&self) -> bool {
+        self.config.minimize_to_tray && self.tray.is_some()
+    }
+
+    fn on_close_requested(&mut self, _ctx: &egui::Context) -> bool {
+        if self.config.close_to_tray && self.tray.is_some() && !self.quitting {
+            log::info!("closing to the tray");
+            self.hide_window = true;
+            return false;
+        }
+        true
+    }
+
+    fn wants_exit(&self) -> bool {
+        self.quitting
     }
 }

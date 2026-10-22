@@ -27,6 +27,8 @@ fn main() {
         log::info!("using Plex endpoint override {u}");
     }
     let config = Config::load();
+    // Re-assert the Run entry on every start so a moved exe keeps working.
+    plexify::win::autostart::apply(config.start_with_windows);
     let size = config.window_size.unwrap_or([1180.0, 760.0]);
     let options = RunnerOptions {
         viewport: egui::ViewportBuilder::default()

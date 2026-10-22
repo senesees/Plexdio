@@ -1,7 +1,9 @@
 //! Windows-specific integration. Every item has a no-op fallback on other platforms so the
 //! app (and its tests) also build and run natively on Linux.
 
+pub mod autostart;
 pub mod single_instance;
+pub mod tray;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 

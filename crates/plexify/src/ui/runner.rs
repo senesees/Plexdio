@@ -21,6 +21,18 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+/// Window changes the app asks for after a frame: title, mini-player geometry, tray show/hide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowCmd {
+    Title(String),
+    AlwaysOnTop(bool),
+    Resizable(bool),
+    /// Logical client size in points.
+    Size(u32, u32),
+    Hide,
+    Show,
+}
+
 /// Implemented by the application.
 pub trait UiApp {
     /// Build the UI for one frame.
@@ -36,6 +48,14 @@ pub trait UiApp {
     fn wants_exit(&self) -> bool {
         false
     }
+    /// Window changes to apply after this frame.
+    fn take_window_cmds(&mut self) -> Vec<WindowCmd> {
+        Vec::new()
+    }
+    /// Hide the window to the tray instead of keeping it in the taskbar when minimized.
+    fn minimizes_to_tray(&self) -> bool {
+        false
+    }
     /// Called once on shutdown.
     fn on_exit(&mut self) {}
 }
@@ -44,6 +64,15 @@ pub trait UiApp {
 pub enum RunnerEvent {
     /// Re-evaluate repaint deadlines (sent by egui's repaint callback from any thread).
     Wake,
+}
+
+static WAKE: std::sync::OnceLock<EventLoopProxy<RunnerEvent>> = std::sync::OnceLock::new();
+
+/// Ask for a frame from another thread. Used by the tray thread, which has no egui context.
+pub fn wake() {
+    if let Some(proxy) = WAKE.get() {
+        let _ = proxy.send_event(RunnerEvent::Wake);
+    }
 }
 
 pub struct RunnerOptions {
@@ -78,6 +107,7 @@ pub fn run<A: UiApp + 'static>(
         .build()
         .map_err(|e| format!("cannot create event loop: {e}"))?;
     let proxy = event_loop.create_proxy();
+    let _ = WAKE.set(proxy.clone());
 
     let next_repaint: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     {
@@ -154,6 +184,28 @@ impl<A: UiApp> Runner<A> {
 
         gfx.state
             .handle_platform_output_with_event_loop(&gfx.window, event_loop, full_output.platform_output);
+
+        for cmd in self.app.take_window_cmds() {
+            match cmd {
+                WindowCmd::Title(t) => gfx.window.set_title(&t),
+                WindowCmd::AlwaysOnTop(on) => {
+                    let level = if on { winit::window::WindowLevel::AlwaysOnTop } else { winit::window::WindowLevel::Normal };
+                    gfx.window.set_window_level(level);
+                }
+                WindowCmd::Resizable(on) => gfx.window.set_resizable(on),
+                WindowCmd::Size(w, h) => {
+                    let _ = gfx.window.request_inner_size(winit::dpi::LogicalSize::new(w as f64, h as f64));
+                }
+                WindowCmd::Hide => {
+                    gfx.window.set_visible(false);
+                }
+                WindowCmd::Show => {
+                    gfx.window.set_minimized(false);
+                    gfx.window.set_visible(true);
+                    gfx.window.focus_window();
+                }
+            }
+        }
 
         let mut commands = Vec::new();
         let mut repaint_delay = Duration::MAX;
@@ -234,7 +286,9 @@ impl<A: UiApp> ApplicationHandler<RunnerEvent> for Runner<A> {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: RunnerEvent) {
-        // Deadlines are re-evaluated in about_to_wait.
+        // A wake may carry new work (tray clicks, media keys) as well as a repaint deadline, and
+        // repainting is cheap; the event loop goes back to waiting right after.
+        self.needs_paint = true;
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -268,6 +322,14 @@ impl<A: UiApp> ApplicationHandler<RunnerEvent> for Runner<A> {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.exiting {
             return;
+        }
+        if self.app.minimizes_to_tray() {
+            if let Some(gfx) = &self.gfx {
+                if gfx.window.is_minimized() == Some(true) && gfx.window.is_visible().unwrap_or(false) {
+                    gfx.window.set_visible(false);
+                    log::info!("window minimized to the tray");
+                }
+            }
         }
         let deadline = self.next_repaint.lock().ok().and_then(|g| *g);
         let now = Instant::now();
