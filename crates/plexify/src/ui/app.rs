@@ -3,6 +3,8 @@
 
 use crate::cache::db::{self as cachedb, LibraryDb};
 use crate::cache::sync::{sync_library, SyncProgress, SyncReport};
+use crate::audio::engine::{Engine, EngineConfig, PlayState, PlaybackStatus, TrackSpec};
+use crate::audio::source::{AudioCache, SourceSpec};
 use crate::config::Config;
 use crate::library_model::LibraryModel;
 use crate::plex::auth::PlexTv;
@@ -18,7 +20,7 @@ use std::time::Duration;
 
 use super::art::ArtCache;
 use super::icons::{self, Icon};
-use super::views::common::{LibTab, Route, UiAction, ViewCtx};
+use super::views::common::{fmt_duration, LibTab, Route, UiAction, ViewCtx};
 use super::views::library::BrowseState;
 use super::views::search::SearchState;
 use super::jobs::Jobs;
@@ -99,6 +101,30 @@ pub struct LoginState {
     pub info: Option<String>,
 }
 
+#[derive(Debug)]
+enum BarCmd {
+    Toggle,
+    Next,
+    Prev,
+    Seek(u64),
+    Volume(f32),
+    Mute(bool),
+}
+
+/// File extension for a codec name, used as the decoder hint and cache suffix.
+fn codec_extension(codec: &str) -> &'static str {
+    match codec {
+        "mp3" => "mp3",
+        "flac" => "flac",
+        "aac" => "m4a",
+        "alac" => "m4a",
+        "vorbis" => "ogg",
+        "opus" => "opus",
+        "pcm" | "wav" => "wav",
+        _ => "bin",
+    }
+}
+
 pub enum ProbeStatus {
     Checking,
     Ok(ServerConnection),
@@ -147,6 +173,10 @@ pub struct PlexifyApp {
     pub offline: bool,
     /// Server name shown in the sidebar (also known offline, from the cache).
     pub server_label: String,
+    /// Playback engine, created on the first play.
+    pub engine: Option<Engine>,
+    /// Last status polled from the engine.
+    pub playback: PlaybackStatus,
 }
 
 impl PlexifyApp {
@@ -192,6 +222,8 @@ impl PlexifyApp {
             sync: SyncState::default(),
             offline: false,
             server_label: String::new(),
+            engine: None,
+            playback: PlaybackStatus::default(),
         };
         app.token = app.store.get();
         if app.token.is_some() {
@@ -785,10 +817,123 @@ impl PlexifyApp {
         }
     }
 
-    /// Placeholder until the playback engine lands.
+    /// Turn UI playback intents into engine commands.
     fn playback_action(&mut self, a: UiAction) {
-        log::info!("playback action: {a:?}");
-        self.banner = Some(("Playback is not wired up yet.".into(), false));
+        match a {
+            UiAction::Play(ids, start) => self.play_ids(&ids, start),
+            UiAction::PlayShuffled(ids) => {
+                let mut ids = ids;
+                // Fisher-Yates. Smart shuffle with history/artist spread arrives with the queue.
+                let mut seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
+                    .unwrap_or(0x9e37_79b9)
+                    | 1;
+                for i in (1..ids.len()).rev() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    ids.swap(i, (seed as usize) % (i + 1));
+                }
+                self.play_ids(&ids, 0);
+            }
+            UiAction::PlayNext(_) | UiAction::AddToQueue(_) => {
+                self.banner = Some(("Queue editing arrives with the queue panel.".into(), false));
+            }
+            UiAction::Radio(seed) => {
+                self.banner = Some((format!("Radio from {seed:?} is not available yet."), false));
+            }
+            _ => {}
+        }
+    }
+
+    /// Start playback of `ids` at `start`, building stream sources for the current server.
+    fn play_ids(&mut self, ids: &[crate::library_model::Id], start: usize) {
+        if self.pms.is_none() {
+            self.banner = Some(("Connect to your server to play music.".into(), true));
+            return;
+        }
+        let specs = self.track_specs(ids);
+        if specs.is_empty() {
+            self.banner = Some(("These tracks have no playable audio.".into(), true));
+            return;
+        }
+        let idx = start.min(specs.len() - 1);
+        self.ensure_engine().play_playlist(specs, idx);
+        self.poll_playback();
+    }
+
+    /// Create the engine on first use. Doing it lazily keeps startup free of audio-device work.
+    fn ensure_engine(&mut self) -> &Engine {
+        if self.engine.is_none() {
+            let cache = AudioCache::new(
+                crate::paths::audio_cache_dir(),
+                self.config.audio_cache_mb.saturating_mul(1024 * 1024),
+                self.config.audio_cache_enabled,
+            );
+            cache.cleanup_partials();
+            let cfg = EngineConfig {
+                volume: self.config.volume,
+                muted: self.config.muted,
+                crossfade_ms: (self.config.crossfade_secs.clamp(0.0, 12.0) * 1000.0).round() as u32,
+                normalization: self.config.normalization,
+            };
+            log::info!("starting playback engine (crossfade {} ms, normalization {})", cfg.crossfade_ms, cfg.normalization);
+            self.engine = Some(Engine::start(cache, self.http.clone(), cfg));
+        }
+        self.engine.as_ref().expect("engine just created")
+    }
+
+    /// Stream descriptions for `ids`. Opus is not decodable locally and a bitrate cap asks the
+    /// server to transcode, so both go through the universal transcoder.
+    fn track_specs(&self, ids: &[crate::library_model::Id]) -> Vec<TrackSpec> {
+        let (Some(lib), Some(pms)) = (self.library.as_ref(), self.pms.as_ref()) else {
+            return Vec::new();
+        };
+        let cap = match self.config.quality {
+            crate::config::StreamQuality::Kbps(k) => Some(k),
+            crate::config::StreamQuality::Original => None,
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(t) = lib.track(*id) else { continue };
+            let codec = t.codec.as_deref().unwrap_or("").to_ascii_lowercase();
+            let container = t.container.as_deref().unwrap_or("").to_ascii_lowercase();
+            let source = if cap.is_some() || codec == "opus" {
+                let kbps = cap.unwrap_or(320);
+                let url = pms.transcode_url(&t.id.to_string(), kbps, &format!("plexify-{}", self.config.client_id), &self.config.client_id);
+                SourceSpec::Http { url, key: format!("{}_t{kbps}.mp3", t.id) }
+            } else if let Some(part) = t.part_key.as_deref() {
+                let ext = if container.is_empty() { codec_extension(&codec) } else { container.as_str() };
+                SourceSpec::Http { url: pms.part_url(part), key: format!("{}.{ext}", t.id) }
+            } else {
+                log::debug!("track {} has no part key; skipped", t.id);
+                continue;
+            };
+            out.push(TrackSpec {
+                id: t.id,
+                title: t.title.to_string(),
+                artist: t.display_artist().to_string(),
+                album: t.album.to_string(),
+                duration_ms: t.duration_ms as u64,
+                gain_db: t.gain,
+                album_gain_db: t.album_gain,
+                source,
+            });
+        }
+        out
+    }
+
+    fn poll_playback(&mut self) {
+        if let Some(e) = &self.engine {
+            let st = e.status();
+            if st.error.is_some() && st.error != self.playback.error {
+                if let Some(msg) = st.error.clone() {
+                    self.banner = Some((msg, true));
+                }
+            }
+            self.playback = st;
+        }
     }
 
     /// Rate a track locally (cache + model) and on the server.
@@ -836,10 +981,139 @@ impl PlexifyApp {
     }
 
     fn now_playing_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
+        let st = self.playback.clone();
+        let Some(track) = st.track.clone() else {
+            ui.add_space(8.0);
+            ui.horizontal_centered(|ui| {
+                ui.label(RichText::new("Nothing playing").color(theme::TEXT_DIM));
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("Pick a track, an album or a playlist — double-click a row to play.")
+                        .small()
+                        .color(theme::TEXT_DIM),
+                );
+            });
+            return;
+        };
+
+        let thumb = self.library.as_ref().and_then(|l| l.track(track.id)).and_then(|t| t.thumb.as_deref().map(str::to_string));
+        let tex = thumb.as_deref().and_then(|t| self.art.get(t, 48.0));
+        let mut cmds: Vec<BarCmd> = Vec::new();
+
         ui.horizontal_centered(|ui| {
-            ui.label(RichText::new("Nothing playing").color(theme::TEXT_DIM));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+            match tex {
+                Some(id) => {
+                    ui.painter().image(id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                }
+                None => {
+                    ui.painter().rect_filled(rect, 4.0, theme::CARD_HOVER);
+                }
+            }
+            // Reserve a fixed slot for the title block so the transport controls never shift
+            // sideways when the track changes.
+            ui.add_space(10.0);
+            let (info_rect, _) = ui.allocate_exact_size(egui::vec2(220.0, 48.0), egui::Sense::hover());
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(info_rect).layout(egui::Layout::top_down(egui::Align::LEFT)),
+                |ui| {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new(&track.title).strong().color(theme::TEXT).size(14.0)).truncate());
+                    ui.add(
+                        egui::Label::new(RichText::new(format!("{} · {}", track.artist, track.album)).small().color(theme::TEXT_DIM))
+                            .truncate(),
+                    );
+                },
+            );
+
+            ui.add_space(16.0);
+            if icons::button(ui, Icon::Prev, 18.0, false).on_hover_text("Previous").clicked() {
+                cmds.push(BarCmd::Prev);
+            }
+            let playing = st.state == PlayState::Playing;
+            if icons::button(ui, if playing { Icon::Pause } else { Icon::Play }, 24.0, false)
+                .on_hover_text(if playing { "Pause" } else { "Play" })
+                .clicked()
+            {
+                cmds.push(BarCmd::Toggle);
+            }
+            if icons::button(ui, Icon::Next, 18.0, false).on_hover_text("Next").clicked() {
+                cmds.push(BarCmd::Next);
+            }
+
+            ui.add_space(16.0);
+            let dur = track.duration_ms.max(st.duration_ms) as f64 / 1000.0;
+            let mut pos = (st.position_ms as f64 / 1000.0).clamp(0.0, dur.max(0.1));
+            ui.spacing_mut().slider_width = 240.0;
+            let resp = ui.add_enabled(dur > 0.5, egui::Slider::new(&mut pos, 0.0..=dur.max(0.1)).show_value(false).trailing_fill(true));
+            if resp.changed() {
+                cmds.push(BarCmd::Seek((pos * 1000.0) as u64));
+            }
+            // Fixed width as well: "0:08" and "1:02:03" would otherwise move the volume controls.
+            ui.add_sized(
+                [78.0, 18.0],
+                egui::Label::new(
+                    RichText::new(format!(
+                        "{} / {}",
+                        fmt_duration(st.position_ms),
+                        fmt_duration(track.duration_ms.max(st.duration_ms))
+                    ))
+                    .small()
+                    .color(theme::TEXT_DIM),
+                )
+                .halign(egui::Align::LEFT),
+            );
+
+            ui.add_space(12.0);
+            if icons::button(ui, if st.muted { Icon::Mute } else { Icon::Volume }, 18.0, false)
+                .on_hover_text(if st.muted { "Unmute" } else { "Mute" })
+                .clicked()
+            {
+                cmds.push(BarCmd::Mute(!st.muted));
+            }
+            let mut vol = st.volume as f64;
+            ui.spacing_mut().slider_width = 90.0;
+            if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false)).changed() {
+                cmds.push(BarCmd::Volume(vol as f32));
+            }
         });
+
+        let mut save = false;
+        if let Some(eng) = &self.engine {
+            for c in cmds {
+                log::info!("transport: {:?}", c);
+                match c {
+                    BarCmd::Toggle => eng.play_pause(),
+                    BarCmd::Next => eng.next(),
+                    BarCmd::Prev => eng.prev(),
+                    BarCmd::Seek(ms) => eng.seek(ms),
+                    BarCmd::Volume(v) => {
+                        eng.set_volume(v);
+                        self.config.volume = v;
+                        if v > 0.0 && self.config.muted {
+                            eng.set_muted(false);
+                            self.config.muted = false;
+                        }
+                        save = true;
+                    }
+                    BarCmd::Mute(m) => {
+                        eng.set_muted(m);
+                        self.config.muted = m;
+                        save = true;
+                    }
+                }
+            }
+        }
+        if save {
+            self.save_config();
+        }
+        if let Some(err) = &st.error {
+            ui.ctx().request_repaint();
+            let _ = err;
+        }
+        if st.state == PlayState::Playing {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     fn content(&mut self, ui: &mut egui::Ui) {
@@ -893,8 +1167,9 @@ impl PlexifyApp {
         let mut actions = Vec::new();
         let route = self.route.clone();
         let greeting = greeting();
+        let now_playing = self.playback.track.as_ref().map(|t| t.id);
         {
-            let mut vc = ViewCtx { lib, art: &mut self.art, actions: &mut actions, now_playing: None };
+            let mut vc = ViewCtx { lib, art: &mut self.art, actions: &mut actions, now_playing };
             use super::views::{detail, library, search};
             match &route {
                 Route::Home => detail::home_view(ui, &mut vc, &greeting),
@@ -1006,6 +1281,7 @@ impl UiApp for PlexifyApp {
         for msg in self.jobs.drain() {
             self.handle(msg);
         }
+        self.poll_playback();
         self.art.begin_frame(ui.ctx());
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) && self.screen == Screen::Main {
             self.navigate(Route::Search);

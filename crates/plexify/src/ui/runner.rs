@@ -150,7 +150,7 @@ impl<A: UiApp> Runner<A> {
         raw_input.viewports.insert(ViewportId::ROOT, gfx.viewport_info.clone());
 
         let app = &mut self.app;
-        let full_output = self.ctx.run_ui(raw_input, |ui| app.ui(ui));
+        let mut full_output = self.ctx.run_ui(raw_input, |ui| app.ui(ui));
 
         gfx.state
             .handle_platform_output_with_event_loop(&gfx.window, event_loop, full_output.platform_output);
@@ -176,20 +176,24 @@ impl<A: UiApp> Runner<A> {
         let size = gfx.window.inner_size();
         let visible = gfx.window.is_visible().unwrap_or(true) && gfx.window.is_minimized() != Some(true);
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            full_output.textures_delta.clear();
             return;
         };
         if !visible {
+            full_output.textures_delta.clear();
             return;
         }
         let primitives = self.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         if let Err(e) = gfx.surface.resize(w, h) {
             log::error!("surface resize failed: {e}");
+            full_output.textures_delta.clear();
             return;
         }
         let mut buffer = match gfx.surface.buffer_mut() {
             Ok(b) => b,
             Err(e) => {
                 log::error!("surface buffer unavailable: {e}");
+                full_output.textures_delta.clear();
                 return;
             }
         };
@@ -203,6 +207,8 @@ impl<A: UiApp> Runner<A> {
             unsafe { std::slice::from_raw_parts_mut(px.as_mut_ptr().cast::<[u8; 4]>(), px.len()) };
         let mut target = BufferMutRef::new(bytes, w.get() as usize, h.get() as usize);
         gfx.renderer.render(&mut target, &primitives, &full_output.textures_delta, full_output.pixels_per_point);
+        // The renderer applies the deltas by reference; epaint panics if they are dropped unapplied.
+        full_output.textures_delta.clear();
         if let Err(e) = buffer.present() {
             log::error!("present failed: {e}");
         }
