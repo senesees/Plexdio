@@ -4,7 +4,7 @@
 #   tools/wine-app.sh stats [secs]   -> RSS (MB) and CPU% averaged over [secs] (default 30)
 #   tools/wine-app.sh kill           -> terminate it
 set -euo pipefail
-pid() { ps -eo pid,args | awk '/[p]lexify\.exe/ && !/wine-app|run-windows|winedbg/ {print $1; exit}'; }
+pid() { ps -eo pid,args | awk '/[p]lexdio\.exe/ && !/wine-app|run-windows|winedbg/ {print $1; exit}'; }
 case "${1:-pid}" in
   pid) pid ;;
   stats)
