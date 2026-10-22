@@ -1,7 +1,7 @@
 //! Compact in-memory view of the cached library used by the UI (sorting, filtering, search
 //! and virtualised lists). Loaded from SQLite in one pass; repeated strings are interned.
 
-use crate::cache::db::LibraryDb;
+use crate::cache::db::{Kind, LibraryDb};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -122,6 +122,11 @@ impl LibraryModel {
         let started = std::time::Instant::now();
         let mut i = Interner::default();
         let mut m = LibraryModel { last_sync_at: db.meta_i64("last_sync_at"), ..Default::default() };
+        // Reserve exact-ish capacity: `Track` is large, so letting a Vec of 100k grow by doubling
+        // costs several MB (and a full copy) at the last reallocation.
+        m.artists.reserve(db.count(Kind::Artist)?);
+        m.albums.reserve(db.count(Kind::Album)?);
+        m.tracks.reserve(db.count(Kind::Track)?);
 
         let mut st = db.conn.prepare("SELECT id,title,title_sort,thumb,genre,summary,added_at FROM artists")?;
         let mut rows = st.query([])?;

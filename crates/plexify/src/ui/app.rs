@@ -800,11 +800,12 @@ impl PlexifyApp {
             self.settings_view(ui);
             return;
         }
-        if !self.history.is_empty() && matches!(self.route, Route::Artist(_) | Route::Album(_) | Route::Playlist(_) | Route::Genre(_)) {
-            if icons::button(ui, Icon::Back, 26.0, false).on_hover_text("Back").clicked() {
-                self.back();
-                return;
-            }
+        if !self.history.is_empty()
+            && matches!(self.route, Route::Artist(_) | Route::Album(_) | Route::Playlist(_) | Route::Genre(_))
+            && icons::button(ui, Icon::Back, 26.0, false).on_hover_text("Back").clicked()
+        {
+            self.back();
+            return;
         }
         let Some(lib) = self.library.as_ref() else {
             ui.horizontal(|ui| {

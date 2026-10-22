@@ -7,7 +7,7 @@
 
 pub mod library;
 
-use library::{Library, Track, AUDIO};
+use library::{Album, Artist, Library, Track, AUDIO};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
@@ -140,7 +140,10 @@ impl MockServer {
     }
 
     pub fn with_library<R>(&self, f: impl FnOnce(&mut Library) -> R) -> R {
-        f(&mut self.state.lock().unwrap().library)
+        let mut state = self.state.lock().unwrap();
+        let out = f(&mut state.library);
+        state.library.reindex();
+        out
     }
 
     pub fn set_server_down(&self, down: bool) {
@@ -337,11 +340,9 @@ fn route(state: &Arc<Mutex<State>>, method: &Method, path: &str, q: &HashMap<Str
             { "key": "3", "type": "movie", "title": "Movies", "agent": "tv.plex.agents.movie", "uuid": "sec-movies" }
         ] } })),
         (Method::Get, ["library", "sections", sec, "all"]) => {
-            let items = section_items(lib, sec, q);
-            let total = items.len();
             let start: usize = q.get("X-Plex-Container-Start").and_then(|s| s.parse().ok()).unwrap_or(0);
             let size: usize = q.get("X-Plex-Container-Size").and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
-            let page: Vec<Value> = items.into_iter().skip(start).take(size).collect();
+            let (page, total) = section_items(lib, sec, q, start, size);
             json_resp(200, &json!({ "MediaContainer": { "size": page.len(), "totalSize": total, "offset": start, "Metadata": page } }))
         }
         (Method::Get, ["library", "sections", sec, "genre"]) => {
@@ -557,18 +558,33 @@ fn ts_filter(q: &HashMap<String, String>, key: &str) -> Option<i64> {
     q.get(&format!("{key}>>")).or_else(|| q.get(&format!("{key}>"))).and_then(|v| v.trim_start_matches('=').parse().ok())
 }
 
-fn section_items(lib: &Library, sec: &str, q: &HashMap<String, String>) -> Vec<Value> {
+/// One page of a section listing. Items are filtered and paginated *before* JSON is built, so
+/// a page of a 100k-track library costs 1000 serializations instead of 100k.
+fn section_items(lib: &Library, sec: &str, q: &HashMap<String, String>, start: usize, size: usize) -> (Vec<Value>, usize) {
     if sec != MUSIC_SECTION {
-        return vec![];
+        return (vec![], 0);
     }
     let updated = ts_filter(q, "updatedAt");
     let added = ts_filter(q, "addedAt");
     let keep = |a: i64, u: i64| updated.is_none_or(|t| u >= t) && added.is_none_or(|t| a >= t);
+    let paginate = |total: usize| (start.min(total), size.min(total.saturating_sub(start)));
     match q.get("type").map(String::as_str) {
-        Some("8") => lib.artists.iter().filter(|a| keep(a.added_at, a.updated_at)).map(|a| artist_json(lib, a)).collect(),
-        Some("9") => lib.albums.iter().filter(|a| keep(a.added_at, a.updated_at)).map(|a| album_json(lib, a)).collect(),
-        Some("10") | None => lib.tracks.iter().filter(|t| keep(t.added_at, t.updated_at)).map(|t| track_json(lib, t, false)).collect(),
-        _ => vec![],
+        Some("8") => {
+            let items: Vec<&Artist> = lib.artists.iter().filter(|a| keep(a.added_at, a.updated_at)).collect();
+            let (s, n) = paginate(items.len());
+            (items[s..s + n].iter().map(|a| artist_json(lib, a)).collect(), items.len())
+        }
+        Some("9") => {
+            let items: Vec<&Album> = lib.albums.iter().filter(|a| keep(a.added_at, a.updated_at)).collect();
+            let (s, n) = paginate(items.len());
+            (items[s..s + n].iter().map(|a| album_json(lib, a)).collect(), items.len())
+        }
+        Some("10") | None => {
+            let items: Vec<&Track> = lib.tracks.iter().filter(|t| keep(t.added_at, t.updated_at)).collect();
+            let (s, n) = paginate(items.len());
+            (items[s..s + n].iter().map(|t| track_json(lib, t, false)).collect(), items.len())
+        }
+        _ => (vec![], 0),
     }
 }
 
@@ -586,7 +602,7 @@ fn artist_json(lib: &Library, a: &library::Artist) -> Value {
 
 fn album_json(lib: &Library, a: &library::Album) -> Value {
     let artist = lib.artist(a.artist_id);
-    let leafs = lib.tracks.iter().filter(|t| t.album_id == a.id).count();
+    let leafs = lib.leaf_counts.get(&a.id).copied().unwrap_or(0);
     // One album deliberately has no art to exercise the placeholder path.
     let thumb = if a.title == "Live at the Mill" { Value::Null } else { json!(format!("/library/metadata/{}/thumb/{}", a.id, a.updated_at)) };
     json!({

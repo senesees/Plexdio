@@ -94,6 +94,13 @@ pub struct Library {
     pub playlists: Vec<Playlist>,
     /// Logical clock for addedAt/updatedAt (unix seconds).
     pub clock: i64,
+    /// Lookup indexes. Rebuilt by `reindex()`; the large synthetic library needs them so a
+    /// track page doesn't scan every album for every track.
+    artist_idx: std::collections::HashMap<u64, usize>,
+    album_idx: std::collections::HashMap<u64, usize>,
+    track_idx: std::collections::HashMap<u64, usize>,
+    /// Number of tracks per album id.
+    pub leaf_counts: std::collections::HashMap<u64, usize>,
 }
 
 pub const BASE_TIME: i64 = 1_700_000_000;
@@ -104,17 +111,29 @@ impl Library {
         self.clock
     }
 
+    /// Rebuild the id indexes and per-album track counts. Call after mutating the vectors.
+    pub fn reindex(&mut self) {
+        self.artist_idx = self.artists.iter().enumerate().map(|(i, a)| (a.id, i)).collect();
+        self.album_idx = self.albums.iter().enumerate().map(|(i, a)| (a.id, i)).collect();
+        self.track_idx = self.tracks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
+        self.leaf_counts.clear();
+        for t in &self.tracks {
+            *self.leaf_counts.entry(t.album_id).or_insert(0) += 1;
+        }
+    }
+
     pub fn artist(&self, id: u64) -> Option<&Artist> {
-        self.artists.iter().find(|a| a.id == id)
+        self.artist_idx.get(&id).map(|&i| &self.artists[i])
     }
     pub fn album(&self, id: u64) -> Option<&Album> {
-        self.albums.iter().find(|a| a.id == id)
+        self.album_idx.get(&id).map(|&i| &self.albums[i])
     }
     pub fn track(&self, id: u64) -> Option<&Track> {
-        self.tracks.iter().find(|t| t.id == id)
+        self.track_idx.get(&id).map(|&i| &self.tracks[i])
     }
     pub fn track_mut(&mut self, id: u64) -> Option<&mut Track> {
-        self.tracks.iter_mut().find(|t| t.id == id)
+        let i = *self.track_idx.get(&id)?;
+        Some(&mut self.tracks[i])
     }
 
     /// Hand-made demo library with every fixture format, a gapless album and playlists.
@@ -198,6 +217,7 @@ impl Library {
             added_at: t,
             updated_at: t,
         });
+        lib.reindex();
         lib
     }
 
@@ -252,6 +272,7 @@ impl Library {
             added_at: lib.clock,
             updated_at: lib.clock,
         });
+        lib.reindex();
         lib
     }
 }

@@ -70,11 +70,18 @@ pub fn fmt_duration(ms: u64) -> String {
 
 pub fn fmt_long_duration(ms: u64) -> String {
     let m = ms / 60_000;
-    if m >= 60 {
+    if ms < 60_000 {
+        format!("{} sec", ms / 1000)
+    } else if m >= 60 {
         format!("{} h {} min", m / 60, m % 60)
     } else {
         format!("{m} min")
     }
+}
+
+/// "1 track" / "24 tracks".
+pub fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// Text that is clipped with an ellipsis to `width`.

@@ -7,18 +7,28 @@ use crate::ui::theme;
 use egui::RichText;
 use std::sync::Arc;
 
+/// Contents of a detail page's header.
+struct Hero<'a> {
+    thumb: Option<&'a str>,
+    seed: &'a str,
+    round: bool,
+    kind: &'a str,
+    title: &'a str,
+    sub: &'a str,
+}
+
 /// Big header: art on the left, kind/title/subtitle on the right.
-fn hero(ui: &mut egui::Ui, ctx: &mut ViewCtx, thumb: Option<&str>, seed: &str, round: bool, kind: &str, title: &str, sub: &str) {
+fn hero(ui: &mut egui::Ui, ctx: &mut ViewCtx, h: Hero) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(180.0, 180.0), egui::Sense::hover());
-        ctx.art.paint(ui, rect, thumb, seed, if round { Shape::Circle } else { Shape::Rounded(8) });
+        ctx.art.paint(ui, rect, h.thumb, h.seed, if h.round { Shape::Circle } else { Shape::Rounded(8) });
         ui.add_space(18.0);
         ui.vertical(|ui| {
             ui.add_space(40.0);
-            ui.label(RichText::new(kind).small().strong().color(theme::TEXT_DIM));
-            ui.label(RichText::new(title).size(34.0).strong());
+            ui.label(RichText::new(h.kind).small().strong().color(theme::TEXT_DIM));
+            ui.label(RichText::new(h.title).size(34.0).strong());
             ui.add_space(4.0);
-            ui.label(RichText::new(sub).color(theme::TEXT_DIM));
+            ui.label(RichText::new(h.sub).color(theme::TEXT_DIM));
         });
     });
     ui.add_space(12.0);
@@ -34,7 +44,7 @@ pub fn album_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
     let total: u64 = ids.iter().filter_map(|t| lib.track(*t)).map(|t| t.duration_ms as u64).sum();
     let year = if a.year > 0 { format!("{} · ", a.year) } else { String::new() };
     let sub = format!("{}{}{} tracks · {}", year, a.genre.as_deref().map(|g| format!("{g} · ")).unwrap_or_default(), ids.len(), fmt_long_duration(total));
-    hero(ui, ctx, a.thumb.as_deref(), &a.title, false, "ALBUM", &a.title, &sub);
+    hero(ui, ctx, Hero { thumb: a.thumb.as_deref(), seed: &a.title, round: false, kind: "ALBUM", title: &a.title, sub: &sub });
     let artist_id = a.artist_id;
     ui.horizontal(|ui| {
         if lib.artist(artist_id).is_some() {
@@ -60,7 +70,7 @@ pub fn artist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
     let albums: Vec<usize> = lib.artist_albums.get(&id).cloned().unwrap_or_default();
     let ids = lib.artist_track_ids(id);
     let sub = format!("{}{} albums · {} tracks", a.genre.as_deref().map(|g| format!("{g} · ")).unwrap_or_default(), albums.len(), ids.len());
-    hero(ui, ctx, a.thumb.as_deref(), &a.title, true, "ARTIST", &a.title, &sub);
+    hero(ui, ctx, Hero { thumb: a.thumb.as_deref(), seed: &a.title, round: true, kind: "ARTIST", title: &a.title, sub: &sub });
     play_buttons(ui, ctx, &ids, Some(RadioSeed::Artist(id)));
     ui.add_space(10.0);
     // Popular: most played tracks of the artist.
@@ -107,7 +117,7 @@ pub fn playlist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
     let ids: Vec<Id> = p.items.iter().copied().filter(|t| lib.track(*t).is_some()).collect();
     let total: u64 = ids.iter().filter_map(|t| lib.track(*t)).map(|t| t.duration_ms as u64).sum();
     let sub = format!("{}{} tracks · {}", if p.smart { "Smart playlist · " } else { "" }, ids.len(), fmt_long_duration(total));
-    hero(ui, ctx, p.composite.as_deref(), &p.title, false, "PLAYLIST", &p.title, &sub);
+    hero(ui, ctx, Hero { thumb: p.composite.as_deref(), seed: &p.title, round: false, kind: "PLAYLIST", title: &p.title, sub: &sub });
     play_buttons(ui, ctx, &ids, None);
     ui.add_space(8.0);
     track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true }, "playlist-tracks");
@@ -157,11 +167,11 @@ pub fn home_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, greeting: &str) {
         ui.label(RichText::new(greeting).size(28.0).strong());
         ui.label(
             RichText::new(format!(
-                "{} artists · {} albums · {} tracks · {} playlists",
-                lib.artists.len(),
-                lib.albums.len(),
-                lib.tracks.len(),
-                lib.playlists.len()
+                "{} · {} · {} · {}",
+                plural(lib.artists.len(), "artist", "artists"),
+                plural(lib.albums.len(), "album", "albums"),
+                plural(lib.tracks.len(), "track", "tracks"),
+                plural(lib.playlists.len(), "playlist", "playlists")
             ))
             .color(theme::TEXT_DIM),
         );

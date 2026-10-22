@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use super::icons::{self, Icon};
 
 /// Maximum textures kept alive (each is at most 400x400 RGBA).
-const MAX_TEXTURES: usize = 160;
+const MAX_TEXTURES: usize = 96;
 
 pub struct ArtCache {
     pub svc: ImageService,

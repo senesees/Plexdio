@@ -274,7 +274,7 @@ pub fn library_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, state: &mut BrowseStat
                         ui.painter().text(
                             rect.left_bottom() + egui::vec2(14.0, -12.0),
                             egui::Align2::LEFT_BOTTOM,
-                            format!("{n} albums"),
+                            if *n == 1 { "1 album".to_string() } else { format!("{n} albums") },
                             egui::FontId::proportional(12.5),
                             theme::TEXT_DIM,
                         );
