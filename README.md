@@ -4,7 +4,7 @@ A small, native Windows 10/11 x64 music player for Plex — a lean alternative t
 One self-contained exe (9.5 MB), no installer, no runtime, no Electron.
 
 *Formerly **Plexify**, then briefly **PlexDio**. Settings, the library cache, the saved sign-in and the start-with-Windows
-entry carry over automatically on first start — see [Upgrading from Plexify](#upgrading-from-plexify).*
+entry carry over automatically on first start.*
 
 ![Home](docs/home.png)
 
@@ -198,23 +198,6 @@ Notable choices:
 Data locations: `%APPDATA%\Plexdio\config.json` (settings, resume queue),
 `%LOCALAPPDATA%\Plexdio\db\*.sqlite` (library cache), `…\images` (artwork, LRU),
 `…\audio` (audio cache, LRU), `…\logs\plexdio.log`.
-
-## Upgrading from Plexify
-
-On its first start Plexdio:
-
-- renames `%APPDATA%\Plexify` and `%LOCALAPPDATA%\Plexify` to `Plexdio` (only if the new
-  folders do not exist yet), keeping settings, the library cache and the resume queue;
-- moves the saved sign-in from the Credential Manager entry `Plexify/plex-token` (or
-  `PlexDio/plex-token`) to `Plexdio/plex-token`;
-- removes the old `Plexify` start-with-Windows entry (the setting re-adds it for
-  `plexdio.exe`).
-
-The environment variables were renamed too (`PLEXIFY_*` → `PLEXDIO_*`).
-
-Coming from **PlexDio** needs nothing: Windows folder and registry names ignore case, so the
-existing `PlexDio` folders and start-with-Windows entry are used as they are, and the saved
-sign-in is looked up under both spellings.
 
 ## Footprint
 
