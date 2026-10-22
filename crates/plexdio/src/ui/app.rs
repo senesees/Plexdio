@@ -2230,200 +2230,237 @@ impl PlexDioApp {
         ui.add_space(10.0);
         let mut changed = false;
         egui::ScrollArea::vertical().id_salt("settings").auto_shrink([false, false]).show(ui, |ui| {
-            theme::card().show(ui, |ui| {
-                ui.label(RichText::new("Playback").size(17.0).strong());
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Stream quality");
-                    let mut q = self.config.quality;
-                    ui.selectable_value(&mut q, crate::config::StreamQuality::Original, "Original");
-                    for kbps in [320u32, 256, 192, 128] {
-                        ui.selectable_value(&mut q, crate::config::StreamQuality::Kbps(kbps), format!("{kbps} kbps"));
-                    }
-                    if q != self.config.quality {
-                        self.config.quality = q;
-                        changed = true;
-                    }
+            // Two columns of equal-width cards when there is room, one column otherwise.
+            if ui.available_width() >= 960.0 {
+                ui.columns(2, |cols| {
+                    settings_card(&mut cols[0], "Playback", |ui| self.settings_playback(ui, &mut changed));
+                    settings_card(&mut cols[0], "Window", |ui| self.settings_window(ui, &mut changed));
+                    settings_card(&mut cols[0], "Discord", |ui| self.settings_discord(ui, &mut changed));
+                    settings_card(&mut cols[1], "Storage", |ui| self.settings_storage(ui, &mut changed));
+                    settings_card(&mut cols[1], "Account", |ui| self.settings_account(ui));
                 });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Crossfade");
-                    let mut xf = self.config.crossfade_secs;
-                    if ui.add(egui::Slider::new(&mut xf, 0.0..=12.0).suffix(" s").step_by(0.5)).changed() {
-                        self.config.crossfade_secs = xf;
-                        if let Some(e) = &self.engine {
-                            e.set_crossfade((xf * 1000.0).round() as u32);
-                        }
-                        changed = true;
-                    }
-                    if xf <= 0.0 {
-                        ui.label(RichText::new("gapless").small().color(theme::TEXT_DIM));
-                    }
-                });
-                ui.add_space(4.0);
-                let mut norm = self.config.normalization;
-                if ui.checkbox(&mut norm, "ReplayGain volume normalization").changed() {
-                    self.config.normalization = norm;
-                    if let Some(e) = &self.engine {
-                        e.set_normalization(norm);
-                    }
-                    changed = true;
-                }
-                let mut autoplay = self.config.autoplay;
-                if ui.checkbox(&mut autoplay, "Autoplay similar tracks when the queue ends").changed() {
-                    self.config.autoplay = autoplay;
-                    changed = true;
-                }
-                let discord_ok = crate::discord::client_id().is_some();
-                let mut discord = self.config.discord_presence;
-                if ui
-                    .add_enabled(discord_ok, egui::Checkbox::new(&mut discord, "Show what I'm listening to on Discord"))
-                    .on_hover_text("Discord Rich Presence: your Discord status shows the current song while it plays")
-                    .changed()
-                {
-                    self.config.discord_presence = discord;
-                    changed = true;
-                }
-                if !discord_ok {
-                    ui.label(RichText::new("Discord status needs a Discord application ID in this build.").small().color(theme::TEXT_DIM));
-                }
-            });
-
-            ui.add_space(10.0);
-            theme::card().show(ui, |ui| {
-                ui.label(RichText::new("Window").size(17.0).strong());
-                ui.add_space(6.0);
-                if theme::secondary_button(ui, if self.mini { "Leave mini-player" } else { "Mini-player" })
-                    .on_hover_text("A small always-on-top window (Ctrl+M)")
-                    .clicked()
-                {
-                    self.toggle_mini();
-                }
-                ui.add_space(4.0);
-                let tray = self.tray.is_some();
-                let mut min_tray = self.config.minimize_to_tray;
-                if ui.add_enabled(tray, egui::Checkbox::new(&mut min_tray, "Minimize to the tray")).changed() {
-                    self.config.minimize_to_tray = min_tray;
-                    changed = true;
-                }
-                let mut close_tray = self.config.close_to_tray;
-                if ui.add_enabled(tray, egui::Checkbox::new(&mut close_tray, "Close to the tray")).changed() {
-                    self.config.close_to_tray = close_tray;
-                    changed = true;
-                }
-                if !tray {
-                    ui.label(RichText::new("The tray icon is only available on Windows.").small().color(theme::TEXT_DIM));
-                }
-                let mut autostart = self.config.start_with_windows;
-                let autostart_ok = cfg!(windows);
-                if ui
-                    .add_enabled(autostart_ok, egui::Checkbox::new(&mut autostart, "Start PlexDio with Windows"))
-                    .changed()
-                {
-                    if crate::win::autostart::set_enabled(autostart) {
-                        self.config.start_with_windows = autostart;
-                        changed = true;
-                    } else {
-                        self.banner = Some(("Could not update the Windows startup entry.".into(), true));
-                    }
-                }
-            });
-
-            ui.add_space(10.0);
-            theme::card().show(ui, |ui| {
-                ui.label(RichText::new("Storage").size(17.0).strong());
-                ui.add_space(6.0);
-                ui.label(format!("Library database: {}", human_bytes(crate::paths::dir_size(&crate::paths::db_dir()))));
-                let (status, _) = self.sync_status_text();
-                ui.label(RichText::new(status).small().color(theme::TEXT_DIM));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!self.offline && !self.sync.running, |ui| {
-                        if theme::secondary_button(ui, "Refresh library").on_hover_text("Re-download the whole library").clicked() {
-                            self.start_sync(true);
-                        }
-                    });
-                    ui.add_enabled_ui(!self.sync.running, |ui| {
-                        if theme::secondary_button(ui, "Clear library cache").clicked() {
-                            self.clear_library_cache();
-                        }
-                    });
-                });
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label("Artwork cache");
-                    ui.label(
-                        RichText::new(format!("{} used", human_bytes(crate::paths::dir_size(&crate::paths::image_cache_dir()))))
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                });
-                let mut img_mb = self.config.image_cache_mb as f64;
-                if ui
-                    .add(egui::Slider::new(&mut img_mb, 50.0..=2000.0).suffix(" MB").step_by(50.0))
-                    .changed()
-                {
-                    self.config.image_cache_mb = img_mb as u64;
-                    self.art.svc.set_cap_mb(img_mb as u64);
-                    changed = true;
-                }
-                if theme::secondary_button(ui, "Clear artwork cache").clicked() {
-                    self.art.svc.clear_disk();
-                    self.art.reset();
-                }
-
-                ui.add_space(10.0);
-                let mut audio_on = self.config.audio_cache_enabled;
-                if ui.checkbox(&mut audio_on, "Cache streamed audio").changed() {
-                    self.config.audio_cache_enabled = audio_on;
-                    changed = true;
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Audio cache");
-                    ui.label(
-                        RichText::new(format!("{} used", human_bytes(crate::paths::dir_size(&crate::paths::audio_cache_dir()))))
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                });
-                let mut audio_mb = self.config.audio_cache_mb as f64;
-                if ui
-                    .add(egui::Slider::new(&mut audio_mb, 100.0..=5000.0).suffix(" MB").step_by(100.0))
-                    .changed()
-                {
-                    self.config.audio_cache_mb = audio_mb as u64;
-                    changed = true;
-                }
-                if self.engine.is_some() {
-                    ui.label(RichText::new("Audio cache changes apply after a restart.").small().color(theme::TEXT_DIM));
-                }
-                if theme::secondary_button(ui, "Clear audio cache").clicked() {
-                    match remove_dir_all(crate::paths::audio_cache_dir()) {
-                        Ok(()) => self.banner = Some(("Audio cache cleared.".into(), false)),
-                        Err(e) => self.banner = Some((format!("Could not clear the audio cache: {e}"), true)),
-                    }
-                }
-            });
-
-            ui.add_space(10.0);
-            theme::card().show(ui, |ui| {
-                ui.label(RichText::new("Account").size(17.0).strong());
-                ui.add_space(6.0);
-                if let Some(u) = &self.user {
-                    ui.label(format!("Signed in as {}", u.display_name()));
-                }
-                ui.label(RichText::new(format!("Token stored in: {}", self.store.describe())).small().color(theme::TEXT_DIM));
-                ui.add_space(8.0);
-                if theme::secondary_button(ui, "Sign out").clicked() {
-                    self.sign_out();
-                }
-            });
+            } else {
+                ui.set_max_width(720.0);
+                settings_card(ui, "Playback", |ui| self.settings_playback(ui, &mut changed));
+                settings_card(ui, "Window", |ui| self.settings_window(ui, &mut changed));
+                settings_card(ui, "Discord", |ui| self.settings_discord(ui, &mut changed));
+                settings_card(ui, "Storage", |ui| self.settings_storage(ui, &mut changed));
+                settings_card(ui, "Account", |ui| self.settings_account(ui));
+            }
         });
         if changed {
             self.save_config();
         }
     }
+
+    fn settings_playback(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        use crate::config::StreamQuality;
+        let label = |q: StreamQuality| match q {
+            StreamQuality::Original => "Original".to_string(),
+            StreamQuality::Kbps(k) => format!("{k} kbps"),
+        };
+        setting_row(ui, "Streaming quality", Some("Original plays files as they are; a cap converts them on the server"), |ui| {
+            let mut q = self.config.quality;
+            egui::ComboBox::from_id_salt("stream-quality").selected_text(label(q)).width(120.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut q, StreamQuality::Original, "Original");
+                for kbps in [320u32, 256, 192, 128] {
+                    ui.selectable_value(&mut q, StreamQuality::Kbps(kbps), format!("{kbps} kbps"));
+                }
+            });
+            if q != self.config.quality {
+                self.config.quality = q;
+                *changed = true;
+            }
+        });
+        let gapless = self.config.crossfade_secs <= 0.0;
+        setting_row(ui, "Crossfade", Some(if gapless { "Off: tracks play gapless" } else { "Overlap the end of a track with the next one" }), |ui| {
+            let mut xf = self.config.crossfade_secs;
+            slider_value(ui, format!("{xf:.1} s"));
+            ui.spacing_mut().slider_width = 140.0;
+            if ui.add(egui::Slider::new(&mut xf, 0.0..=12.0).step_by(0.5).show_value(false)).changed() {
+                self.config.crossfade_secs = xf;
+                if let Some(e) = &self.engine {
+                    e.set_crossfade((xf * 1000.0).round() as u32);
+                }
+                *changed = true;
+            }
+        });
+        setting_row(ui, "Volume normalization", Some("Use ReplayGain so every track plays at a similar loudness"), |ui| {
+            let mut norm = self.config.normalization;
+            if theme::toggle(ui, &mut norm).changed() {
+                self.config.normalization = norm;
+                if let Some(e) = &self.engine {
+                    e.set_normalization(norm);
+                }
+                *changed = true;
+            }
+        });
+        setting_row(ui, "Autoplay", Some("Keep playing similar tracks when the queue ends"), |ui| {
+            let mut autoplay = self.config.autoplay;
+            if theme::toggle(ui, &mut autoplay).changed() {
+                self.config.autoplay = autoplay;
+                *changed = true;
+            }
+        });
+    }
+
+    fn settings_window(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        setting_row(ui, "Mini-player", Some("A small always-on-top window (Ctrl+M)"), |ui| {
+            if theme::secondary_button(ui, if self.mini { "Leave" } else { "Open" }).clicked() {
+                self.toggle_mini();
+            }
+        });
+        let tray = self.tray.is_some();
+        let tray_note = if tray { None } else { Some("Only available on Windows") };
+        setting_row(ui, "Minimize to the tray", tray_note.or(Some("Hide the window instead of keeping it in the taskbar")), |ui| {
+            let mut v = self.config.minimize_to_tray;
+            if ui.add_enabled_ui(tray, |ui| theme::toggle(ui, &mut v)).inner.changed() {
+                self.config.minimize_to_tray = v;
+                *changed = true;
+            }
+        });
+        setting_row(ui, "Close to the tray", tray_note.or(Some("Keep playing in the background when the window is closed")), |ui| {
+            let mut v = self.config.close_to_tray;
+            if ui.add_enabled_ui(tray, |ui| theme::toggle(ui, &mut v)).inner.changed() {
+                self.config.close_to_tray = v;
+                *changed = true;
+            }
+        });
+        let autostart_ok = cfg!(windows);
+        setting_row(ui, "Start with Windows", Some(if autostart_ok { "Open PlexDio when you sign in" } else { "Only available on Windows" }), |ui| {
+            let mut v = self.config.start_with_windows;
+            if ui.add_enabled_ui(autostart_ok, |ui| theme::toggle(ui, &mut v)).inner.changed() {
+                if crate::win::autostart::set_enabled(v) {
+                    self.config.start_with_windows = v;
+                    *changed = true;
+                } else {
+                    self.banner = Some(("Could not update the Windows startup entry.".into(), true));
+                }
+            }
+        });
+    }
+
+    fn settings_discord(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        let ok = crate::discord::client_id().is_some();
+        let desc = if ok { "Your Discord status shows the song while it plays" } else { "Needs a Discord application ID in this build" };
+        setting_row(ui, "Show what I'm listening to", Some(desc), |ui| {
+            let mut v = self.config.discord_presence;
+            if ui.add_enabled_ui(ok, |ui| theme::toggle(ui, &mut v)).inner.changed() {
+                self.config.discord_presence = v;
+                *changed = true;
+            }
+        });
+    }
+
+    fn settings_storage(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        let (status, _) = self.sync_status_text();
+        let db = format!("{} · {status}", human_bytes(crate::paths::dir_size(&crate::paths::db_dir())));
+        setting_row(ui, "Library database", Some(&db), |ui| {
+            ui.add_enabled_ui(!self.sync.running, |ui| {
+                if theme::secondary_button(ui, "Clear").on_hover_text("Delete the cached library and fetch it again").clicked() {
+                    self.clear_library_cache();
+                }
+            });
+            ui.add_enabled_ui(!self.offline && !self.sync.running, |ui| {
+                if theme::secondary_button(ui, "Refresh").on_hover_text("Re-download the whole library").clicked() {
+                    self.start_sync(true);
+                }
+            });
+        });
+
+        let art_used = format!("{} used", human_bytes(crate::paths::dir_size(&crate::paths::image_cache_dir())));
+        setting_row(ui, "Artwork cache", Some(&art_used), |ui| {
+            if theme::secondary_button(ui, "Clear").clicked() {
+                self.art.svc.clear_disk();
+                self.art.reset();
+            }
+        });
+        setting_row(ui, "Artwork cache size", None, |ui| {
+            let mut mb = self.config.image_cache_mb as f64;
+            slider_value(ui, format!("{mb:.0} MB"));
+            ui.spacing_mut().slider_width = 140.0;
+            if ui.add(egui::Slider::new(&mut mb, 50.0..=2000.0).step_by(50.0).show_value(false)).changed() {
+                self.config.image_cache_mb = mb as u64;
+                self.art.svc.set_cap_mb(mb as u64);
+                *changed = true;
+            }
+        });
+
+        setting_row(ui, "Cache streamed audio", Some("Replaying a track does not download it again"), |ui| {
+            let mut v = self.config.audio_cache_enabled;
+            if theme::toggle(ui, &mut v).changed() {
+                self.config.audio_cache_enabled = v;
+                *changed = true;
+            }
+        });
+        let mut audio_used = format!("{} used", human_bytes(crate::paths::dir_size(&crate::paths::audio_cache_dir())));
+        if self.engine.is_some() {
+            audio_used.push_str(" · size changes apply after a restart");
+        }
+        setting_row(ui, "Audio cache", Some(&audio_used), |ui| {
+            if theme::secondary_button(ui, "Clear").clicked() {
+                match remove_dir_all(crate::paths::audio_cache_dir()) {
+                    Ok(()) => self.banner = Some(("Audio cache cleared.".into(), false)),
+                    Err(e) => self.banner = Some((format!("Could not clear the audio cache: {e}"), true)),
+                }
+            }
+        });
+        setting_row(ui, "Audio cache size", None, |ui| {
+            let mut mb = self.config.audio_cache_mb as f64;
+            slider_value(ui, format!("{mb:.0} MB"));
+            ui.spacing_mut().slider_width = 140.0;
+            if ui.add(egui::Slider::new(&mut mb, 100.0..=5000.0).step_by(100.0).show_value(false)).changed() {
+                self.config.audio_cache_mb = mb as u64;
+                *changed = true;
+            }
+        });
+    }
+
+    fn settings_account(&mut self, ui: &mut egui::Ui) {
+        let name = self.user.as_ref().map(|u| format!("Signed in as {}", u.display_name())).unwrap_or_else(|| "Signed in".into());
+        let store = format!("Token stored in {}", self.store.describe());
+        let mut sign_out = false;
+        setting_row(ui, &name, Some(&store), |ui| {
+            sign_out = theme::secondary_button(ui, "Sign out").clicked();
+        });
+        if sign_out {
+            self.sign_out();
+        }
+    }
+}
+
+/// A full-width settings card with a title.
+fn settings_card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(title).size(17.0).strong());
+        ui.add_space(4.0);
+        add(ui);
+    });
+    ui.add_space(12.0);
+}
+
+/// Fixed-width value shown to the right of a settings slider (rows lay out right to left).
+fn slider_value(ui: &mut egui::Ui, text: String) {
+    ui.add_sized([62.0, 18.0], egui::Label::new(RichText::new(text).color(theme::TEXT_DIM)).halign(Align::RIGHT));
+}
+
+/// One setting: name and an optional description on the left, the control on the right.
+/// Controls are laid out right to left, so add them in reverse visual order.
+fn setting_row(ui: &mut egui::Ui, label: &str, desc: Option<&str>, control: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let text_w = (ui.available_width() * 0.55).max(140.0);
+        ui.vertical(|ui| {
+            ui.set_max_width(text_w);
+            ui.label(RichText::new(label).size(14.0));
+            if let Some(d) = desc {
+                ui.add(egui::Label::new(RichText::new(d).small().color(theme::TEXT_DIM)).wrap());
+            }
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), control);
+    });
+    ui.add_space(6.0);
 }
 
 fn remove_dir_all(dir: std::path::PathBuf) -> std::io::Result<()> {

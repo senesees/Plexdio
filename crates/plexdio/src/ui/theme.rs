@@ -79,6 +79,24 @@ pub fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
+/// On/off switch (Spotify-style settings toggle). Marks the response changed when flipped.
+pub fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(38.0, 22.0), egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+    let enabled = ui.is_enabled();
+    let dim = |c: Color32| if enabled { c } else { c.gamma_multiply(0.4) };
+    let track = if *on { ACCENT } else if resp.hovered() { Color32::from_rgb(96, 96, 96) } else { Color32::from_rgb(80, 80, 80) };
+    ui.painter().rect_filled(rect, CornerRadius::same(11), dim(track));
+    let r = rect.height() / 2.0 - 3.0;
+    let x = egui::lerp((rect.left() + r + 3.0)..=(rect.right() - r - 3.0), t);
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), r, dim(Color32::WHITE));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Rounded card frame.
 pub fn card() -> egui::Frame {
     egui::Frame::new()
