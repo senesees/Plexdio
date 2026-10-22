@@ -1061,13 +1061,23 @@ impl PlexDioApp {
         // Server / library switcher.
         let server = self.server_label.clone();
         let lib = self.section.as_ref().and_then(|s| s.title.clone()).unwrap_or_default();
-        let resp = ui.add_sized(
-            [ui.available_width(), 44.0],
-            egui::Button::new(RichText::new(format!("{lib}\n{server}")).size(12.5).color(theme::TEXT_DIM))
-                .fill(egui::Color32::from_rgb(20, 20, 20))
-                .corner_radius(8),
-        );
-        if resp.on_hover_text("Switch server or library").clicked() {
+        // Icon tile, library over server name, and a chevron that hints at the picker.
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::click());
+        let fill = if resp.hovered() { egui::Color32::from_rgb(32, 32, 32) } else { egui::Color32::from_rgb(20, 20, 20) };
+        ui.painter().rect_filled(rect, 8.0, fill);
+        let tile = egui::Rect::from_center_size(egui::pos2(rect.left() + 24.0, rect.center().y), egui::vec2(32.0, 32.0));
+        ui.painter().rect_filled(tile, 6.0, theme::ACCENT.linear_multiply(0.18));
+        icons::paint(ui.painter(), tile.shrink(7.0), Icon::Library, theme::ACCENT);
+        let text_x = tile.right() + 10.0;
+        let text_w = (rect.right() - 26.0 - text_x).max(20.0);
+        let lib_text = if lib.is_empty() { "No library" } else { lib.as_str() };
+        super::views::common::clipped(ui, egui::pos2(text_x, rect.center().y - 8.0), lib_text, 13.5, theme::TEXT, text_w, egui::Align2::LEFT_CENTER);
+        if !server.is_empty() {
+            super::views::common::clipped(ui, egui::pos2(text_x, rect.center().y + 9.0), &server, 11.5, theme::TEXT_DIM, text_w, egui::Align2::LEFT_CENTER);
+        }
+        let chevron = egui::Rect::from_center_size(egui::pos2(rect.right() - 14.0, rect.center().y), egui::vec2(14.0, 14.0));
+        icons::paint(ui.painter(), chevron, Icon::Down, if resp.hovered() { theme::TEXT } else { theme::TEXT_DIM });
+        if resp.on_hover_text("Switch server or library").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             self.auto_select = false;
             if self.offline {
                 self.reconnect();
