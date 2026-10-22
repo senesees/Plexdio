@@ -470,31 +470,113 @@ fn hash_key(key: &str) -> u64 {
     h
 }
 
+/// Consecutive failed attempts (no new bytes in between) before the download gives up.
+const MAX_RETRIES: u32 = 6;
+
+/// Download the whole stream, reconnecting after network drops ("peer disconnected", resets,
+/// timeouts). Each reconnect asks for the bytes after what is already on disk (`Range`), so the
+/// decoder just waits a moment and playback carries on where it was.
 fn download(http: &Http, url: &str, dl: &Arc<Download>) -> Result<(), String> {
-    let (status, len, mut reader) = http.get_stream(url, None).map_err(|e: PlexError| e.to_string())?;
-    if !(200..=299).contains(&status) {
-        return Err(format!("HTTP {status}"));
+    let mut failures = 0u32;
+    loop {
+        let (before, total) = dl.state.lock().map(|s| (s.available, s.total)).unwrap_or((0, None));
+        if total.is_some_and(|t| before > 0 && before >= t) {
+            // Every byte arrived before the connection dropped; asking for more would get a 416.
+            return Ok(());
+        }
+        let err = match download_from(http, url, dl, before) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if dl.cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        if !err.retryable {
+            return Err(err.message);
+        }
+        let after = dl.state.lock().map(|s| s.available).unwrap_or(0);
+        // Progress since the last failure means the connection works; start counting again.
+        failures = if after > before { 1 } else { failures + 1 };
+        if failures > MAX_RETRIES {
+            return Err(format!("{} (gave up after {MAX_RETRIES} reconnects)", err.message));
+        }
+        let wait = Duration::from_millis(500 * (1 << (failures - 1).min(4)));
+        log::warn!("{}; reconnecting at byte {after} in {} ms (attempt {failures}/{MAX_RETRIES})", err.message, wait.as_millis());
+        let until = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < until {
+            if dl.cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
-    log::debug!("audio download response {status} ({len:?} bytes)");
+}
+
+struct DownloadError {
+    message: String,
+    /// Network trouble worth reconnecting for (not 401/404, not a cache write error).
+    retryable: bool,
+}
+
+impl DownloadError {
+    fn retry(message: String) -> Self {
+        Self { message, retryable: true }
+    }
+    fn fatal(message: String) -> Self {
+        Self { message, retryable: false }
+    }
+}
+
+/// One connection: request the bytes from `offset` on and append them until the stream ends.
+fn download_from(http: &Http, url: &str, dl: &Arc<Download>, offset: u64) -> Result<(), DownloadError> {
+    let (status, len, mut reader) = http.get_stream(url, Some(offset)).map_err(|e: PlexError| {
+        let retryable = !matches!(e, PlexError::Unauthorized | PlexError::NotFound);
+        DownloadError { message: e.to_string(), retryable }
+    })?;
+    if !(200..=299).contains(&status) {
+        return Err(DownloadError::retry(format!("HTTP {status}")));
+    }
+    log::debug!("audio download response {status} ({len:?} bytes) from byte {offset}");
+    // 206: the body starts at `offset`. 200: the server ignored the range and sends everything,
+    // so the bytes we already have are skipped.
+    let mut skip = if status == 206 { 0 } else { offset };
     {
-        let mut st = dl.state.lock().map_err(|_| "state poisoned".to_string())?;
-        st.total = len;
+        let mut st = dl.state.lock().map_err(|_| DownloadError::fatal("state poisoned".into()))?;
+        if st.total.is_none() {
+            st.total = if status == 206 { len.map(|l| l + offset) } else { len };
+        }
     }
     dl.wake.notify_all();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         if dl.cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
+            return Err(DownloadError::fatal("cancelled".into()));
         }
-        let n = reader.read(&mut buf).map_err(|e| format!("download: {e}"))?;
+        let n = reader.read(&mut buf).map_err(|e| DownloadError::retry(format!("download: {e}")))?;
         if n == 0 {
-            return Ok(());
+            let st = dl.state.lock().map_err(|_| DownloadError::fatal("state poisoned".into()))?;
+            // A connection that closes early looks like a clean end; check against the length.
+            return match st.total {
+                Some(total) if st.available < total => {
+                    Err(DownloadError::retry(format!("download: connection closed at {} of {total} bytes", st.available)))
+                }
+                _ => Ok(()),
+            };
+        }
+        let mut chunk = &buf[..n];
+        if skip > 0 {
+            let k = (skip as usize).min(chunk.len());
+            skip -= k as u64;
+            chunk = &chunk[k..];
+            if chunk.is_empty() {
+                continue;
+            }
         }
         {
-            let mut st = dl.state.lock().map_err(|_| "state poisoned".to_string())?;
+            let mut st = dl.state.lock().map_err(|_| DownloadError::fatal("state poisoned".into()))?;
             let at = st.available;
-            write_all_at(&st.file, &buf[..n], at).map_err(|e| format!("cache write: {e}"))?;
-            st.available += n as u64;
+            write_all_at(&st.file, chunk, at).map_err(|e| DownloadError::fatal(format!("cache write: {e}")))?;
+            st.available += chunk.len() as u64;
             // Publish before waking so readers never see a stale length.
             drop(st);
         }
