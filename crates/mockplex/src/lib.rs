@@ -419,6 +419,16 @@ fn route(state: &Arc<Mutex<State>>, method: &Method, path: &str, q: &HashMap<Str
                 .collect();
             json_resp(200, &json!({ "MediaContainer": { "size": items.len(), "Metadata": items } }))
         }
+        (Method::Get, ["library", "metadata", id, "related"]) if lib.artist(id.parse().unwrap_or(0)).is_some() => {
+            // Artist pages: Plex's "Similar Artists" hub. Mock similarity = same genre.
+            let id: u64 = id.parse().unwrap_or(0);
+            let genre = lib.artist(id).map(|a| a.genre.clone()).unwrap_or_default();
+            let similar: Vec<Value> =
+                lib.artists.iter().filter(|a| a.id != id && a.genre == genre).take(20).map(|a| artist_json(lib, a)).collect();
+            json_resp(200, &json!({ "MediaContainer": { "size": 1, "Hub": [
+                { "hubIdentifier": "artist.similar", "title": "Similar Artists", "type": "artist", "size": similar.len(), "Metadata": similar }
+            ] } }))
+        }
         (Method::Get, ["library", "metadata", id, "related"]) => {
             let id: u64 = id.parse().unwrap_or(0);
             let artist_id = lib.track(id).and_then(|t| lib.album(t.album_id)).map(|a| a.artist_id).or_else(|| lib.album(id).map(|a| a.artist_id));

@@ -6,3 +6,4 @@ pub mod mixes;
 pub mod radio;
 pub mod report;
 pub mod session;
+pub mod similar;

@@ -33,3 +33,16 @@ fn without_plex_pass_the_station_uses_the_local_fallback() {
     let client = pms(&mock);
     assert!(radio::sonic_ids(&client, 10_000, 10).is_empty(), "404 means local fallback");
 }
+
+#[test]
+fn related_artists_come_from_the_artist_hubs() {
+    let mock = MockServer::start(MockConfig::default()).unwrap();
+    let client = pms(&mock);
+    let lib = mockplex::library::Library::fixture();
+    let seed = &lib.artists[0];
+    let ids = plexdio::player::similar::server_ids(&client, seed.id as i64);
+    assert!(!ids.contains(&(seed.id as i64)), "an artist is not similar to itself");
+    let expected: Vec<i64> = lib.artists.iter().filter(|a| a.id != seed.id && a.genre == seed.genre).map(|a| a.id as i64).collect();
+    assert!(!expected.is_empty(), "the fixture has artists sharing a genre");
+    assert_eq!(ids, expected, "every artist from the similar-artists hub, in order");
+}

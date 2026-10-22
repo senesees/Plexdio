@@ -249,6 +249,11 @@ pub struct PlexDioApp {
     radio_job: Option<RadioJob>,
     /// The station the user started last, shown on the Radio page.
     radio_station: Option<RadioStation>,
+    /// Similar artists per artist page, and the library version they were computed for.
+    similar: std::collections::HashMap<Id, Vec<Id>>,
+    similar_ver: u64,
+    /// Related-artists lookup in flight: (artist, answer from the server).
+    similar_job: Option<(Id, std::sync::mpsc::Receiver<Vec<Id>>)>,
     /// Last track the engine actually played (the seed for autoplay).
     last_playing: Option<Id>,
     /// Set when a station was enqueued behind a finished queue. The engine reports its first
@@ -333,6 +338,9 @@ impl PlexDioApp {
             mixes_dirty: true,
             radio_job: None,
             radio_station: None,
+            similar: std::collections::HashMap::new(),
+            similar_ver: 0,
+            similar_job: None,
             last_playing: None,
             wake_poll: None,
             mini: false,
@@ -1321,6 +1329,51 @@ impl PlexDioApp {
         self.finish_station(job.mode, job.seed, job.base, from_server);
     }
 
+    /// Look up similar artists for an artist page once per library version. The server's related
+    /// hubs are fetched off the UI thread; offline, the local genre match answers immediately.
+    fn ensure_similar(&mut self, artist: Id) {
+        if self.similar_ver != self.library_ver {
+            self.similar.clear();
+            self.similar_job = None;
+            self.similar_ver = self.library_ver;
+        }
+        if self.similar.contains_key(&artist) || self.similar_job.as_ref().is_some_and(|(a, _)| *a == artist) {
+            return;
+        }
+        let Some(pms) = self.pms.clone().filter(|_| !self.offline) else {
+            self.finish_similar(artist, Vec::new());
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("similar-artists".into()).spawn(move || {
+            let _ = tx.send(crate::player::similar::server_ids(&pms, artist));
+        });
+        match spawned {
+            // A newer page replaces an older lookup; the old answer is simply dropped.
+            Ok(_) => self.similar_job = Some((artist, rx)),
+            Err(_) => self.finish_similar(artist, Vec::new()),
+        }
+    }
+
+    fn finish_similar(&mut self, artist: Id, from_server: Vec<Id>) {
+        let Some(lib) = self.library.as_ref() else { return };
+        let ids = crate::player::similar::similar_artists(lib, artist, &from_server, crate::player::similar::LIMIT);
+        log::debug!("similar artists for {artist}: {} ({} from the server)", ids.len(), from_server.len());
+        self.similar.insert(artist, ids);
+    }
+
+    fn poll_similar(&mut self) {
+        let Some((artist, rx)) = &self.similar_job else { return };
+        let artist = *artist;
+        let from_server = match rx.try_recv() {
+            Ok(ids) => ids,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Vec::new(),
+        };
+        self.similar_job = None;
+        self.finish_similar(artist, from_server);
+    }
+
     /// Rebuild the Home mixes from the library and the local play history.
     fn refresh_mixes(&mut self) {
         let Some(lib) = &self.library else { return };
@@ -2041,6 +2094,9 @@ impl PlexDioApp {
             self.back();
             return;
         }
+        if let Route::Artist(id) = self.route {
+            self.ensure_similar(id);
+        }
         let Some(lib) = self.library.as_ref() else {
             ui.horizontal(|ui| {
                 theme::spinner(ui, 16.0);
@@ -2066,7 +2122,7 @@ impl PlexDioApp {
         let greeting = greeting();
         let now_playing = self.playback.track.as_ref().map(|t| t.id);
         {
-            let mut vc = ViewCtx { lib, art: &mut self.art, actions: &mut actions, now_playing, mixes: &self.mixes };
+            let mut vc = ViewCtx { lib, art: &mut self.art, actions: &mut actions, now_playing, mixes: &self.mixes, similar: &self.similar };
             use super::views::{detail, library, search};
             match &route {
                 Route::Home => detail::home_view(ui, &mut vc, &greeting),
@@ -2371,6 +2427,10 @@ impl UiApp for PlexDioApp {
         }
         self.poll_playback();
         self.poll_radio();
+        self.poll_similar();
+        if self.similar_job.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
         if self.radio_job.is_some() {
             // No playback is running while the lookup is in flight, so keep polling for the
             // worker's answer even though the app is otherwise idle.

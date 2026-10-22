@@ -75,6 +75,8 @@ pub struct ViewCtx<'a> {
     pub now_playing: Option<Id>,
     /// Home mixes, refreshed after syncs and plays.
     pub mixes: &'a crate::player::mixes::Mixes,
+    /// Similar artists looked up so far ("Fans also like"), by artist id.
+    pub similar: &'a std::collections::HashMap<Id, Vec<Id>>,
 }
 
 pub fn fmt_duration(ms: u64) -> String {

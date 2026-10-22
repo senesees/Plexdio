@@ -71,6 +71,7 @@ pub fn artist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
     let ids = lib.artist_track_ids(id);
     let sub = format!("{}{} albums · {} tracks", a.genre.as_deref().map(|g| format!("{g} · ")).unwrap_or_default(), albums.len(), ids.len());
     let mut open = None;
+    let mut open_artist = None;
     // One scroll area for the whole page (like Spotify), so Discography is reachable in small
     // windows instead of being squeezed into whatever height is left.
     egui::ScrollArea::vertical().id_salt(("artist-page", id)).auto_shrink([false, false]).show(ui, |ui| {
@@ -102,7 +103,31 @@ pub fn artist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
                 }
             },
         );
+        // "Fans also like": hidden until the lookup is done, and when nothing matches.
+        let similar: Vec<&crate::library_model::Artist> =
+            ctx.similar.get(&id).map(|ids| ids.iter().filter_map(|s| lib.artist(*s)).collect()).unwrap_or_default();
+        if !similar.is_empty() {
+            ui.add_space(10.0);
+            ui.label(RichText::new("Fans also like").size(18.0).strong());
+            ui.add_space(6.0);
+            card_row(
+                ui,
+                ctx.art,
+                similar.len(),
+                true,
+                "artist-similar",
+                |i| CardItem { thumb: similar[i].thumb.as_deref(), title: &similar[i].title, subtitle: "Artist", seed: &similar[i].title },
+                |i, r| {
+                    if r.clicked() {
+                        open_artist = Some(similar[i].id);
+                    }
+                },
+            );
+        }
     });
+    if let Some(a) = open_artist {
+        ctx.actions.push(UiAction::Navigate(Route::Artist(a)));
+    }
     if let Some(id) = open {
         ctx.actions.push(UiAction::Navigate(Route::Album(id)));
     }
