@@ -29,6 +29,8 @@ pub enum WindowCmd {
     Resizable(bool),
     /// Logical client size in points.
     Size(u32, u32),
+    /// Smallest logical client size the user (and the OS) may resize to.
+    MinSize(u32, u32),
     Hide,
     Show,
 }
@@ -199,6 +201,9 @@ impl<A: UiApp> Runner<A> {
                     gfx.window.set_window_level(level);
                 }
                 WindowCmd::Resizable(on) => gfx.window.set_resizable(on),
+                WindowCmd::MinSize(w, h) => {
+                    gfx.window.set_min_inner_size(Some(winit::dpi::LogicalSize::new(w as f64, h as f64)));
+                }
                 WindowCmd::Size(w, h) => {
                     let _ = gfx.window.request_inner_size(winit::dpi::LogicalSize::new(w as f64, h as f64));
                 }

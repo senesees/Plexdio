@@ -36,6 +36,8 @@ use super::runner::UiApp;
 use super::theme;
 
 pub const TOKEN_NAME: &str = "plex-token";
+/// Client size of the mini-player window (logical points).
+const MINI_SIZE: [u32; 2] = [420, 84];
 
 /// Command-line options.
 #[derive(Debug, Clone, Default)]
@@ -690,6 +692,13 @@ impl PlexDioApp {
         self.poll_playback();
     }
 
+    /// The custom close button: same rules as the native one (hide to the tray, or quit).
+    fn close_window(&mut self, ctx: &egui::Context) {
+        if self.on_close_requested(ctx) {
+            self.quitting = true;
+        }
+    }
+
     fn toggle_mini(&mut self) {
         self.mini = !self.mini;
         self.mini_geometry = true;
@@ -746,6 +755,13 @@ impl PlexDioApp {
             Prev,
             Seek(u64),
             Expand,
+            Close,
+        }
+        // No title bar here: dragging anywhere on the background moves the window. Registered
+        // first, so the buttons and the slider on top of it keep their clicks.
+        let drag = ui.interact(ui.max_rect(), ui.scope_id().with("mini_drag"), egui::Sense::click_and_drag());
+        if drag.drag_started_by(egui::PointerButton::Primary) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
         let st = self.playback.clone();
         let track = st.track.clone();
@@ -754,10 +770,10 @@ impl PlexDioApp {
             .and_then(|t| self.library.as_ref().and_then(|l| l.track(t.id)))
             .and_then(|t| t.thumb.clone());
         let mut cmds = Vec::new();
-        ui.add_space(4.0);
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
+            ui.add_space(10.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
             match &track {
                 Some(t) => self.art.paint(ui, rect, thumb.as_deref(), &t.title, super::art::Shape::Rounded(6)),
                 None => {
@@ -802,6 +818,10 @@ impl PlexDioApp {
                 });
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(4.0);
+                if icons::button(ui, Icon::Close, 16.0, false).on_hover_text("Close").clicked() {
+                    cmds.push(Cmd::Close);
+                }
                 if icons::button(ui, Icon::MiniPlayer, 18.0, false).on_hover_text("Back to the full window").clicked() {
                     cmds.push(Cmd::Expand);
                 }
@@ -821,6 +841,7 @@ impl PlexDioApp {
                     self.wake_poll = Some(std::time::Instant::now() + Duration::from_secs(1));
                 }
                 Cmd::Expand => self.toggle_mini(),
+                Cmd::Close => self.close_window(ui.ctx()),
             }
         }
         if st.state == PlayState::Playing {
@@ -2530,12 +2551,13 @@ impl UiApp for PlexDioApp {
         if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1)) {
             self.back();
         }
-        let title = self.window_title.clone();
-        // Same rules as the native close button: hide to the tray (sets `hide_window`) or quit.
-        if super::titlebar::show(ui, &title, !self.mini) == super::titlebar::TitleAction::Close
-            && self.on_close_requested(&ui.ctx().clone())
-        {
-            self.quitting = true;
+        // The mini-player has no title bar: it is dragged by its background and has its own
+        // close button.
+        if !self.mini {
+            let title = self.window_title.clone();
+            if super::titlebar::show(ui, &title, true) == super::titlebar::TitleAction::Close {
+                self.close_window(ui.ctx());
+            }
         }
         match self.screen.clone() {
             Screen::Busy(text) => super::views::login::busy_screen(ui, &text),
@@ -2618,14 +2640,16 @@ impl UiApp for PlexDioApp {
         }
         if std::mem::take(&mut self.mini_geometry) {
             if self.mini {
+                // The main window's minimum size would otherwise stretch the mini-player.
+                cmds.push(WindowCmd::MinSize(MINI_SIZE[0], MINI_SIZE[1]));
                 cmds.push(WindowCmd::Resizable(false));
                 cmds.push(WindowCmd::AlwaysOnTop(true));
-                // Room for the mini layout plus the custom title bar.
-                cmds.push(WindowCmd::Size(420, 150 + super::titlebar::HEIGHT as u32));
+                cmds.push(WindowCmd::Size(MINI_SIZE[0], MINI_SIZE[1]));
             } else {
                 let [w, h] = self.config.window_size.unwrap_or([1180.0, 760.0]);
                 cmds.push(WindowCmd::AlwaysOnTop(false));
                 cmds.push(WindowCmd::Resizable(true));
+                cmds.push(WindowCmd::MinSize(760, 480));
                 cmds.push(WindowCmd::Size(w as u32, h as u32));
             }
         }
