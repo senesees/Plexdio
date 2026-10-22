@@ -2248,7 +2248,11 @@ impl UiApp for PlexifyApp {
     fn on_window_created(&mut self, _ctx: &egui::Context, window: &winit::window::Window) {
         if let Some(hwnd) = crate::win::hwnd_of(window) {
             crate::win::single_instance::publish_window(hwnd);
-            self.smtc = crate::win::smtc::init(hwnd, self.smtc_events.clone());
+            // Wine's SMTC stub never delivers button callbacks and has no overlay to fill, so the
+            // media keys from the tray are the whole story there.
+            if !crate::win::is_wine() {
+                self.smtc = crate::win::smtc::init(hwnd, self.smtc_events.clone());
+            }
         }
         crate::win::fix_wine_event_target();
         self.tray = crate::win::tray::start();

@@ -121,7 +121,13 @@ pub fn run<A: UiApp + 'static>(
             if let Ok(mut nr) = next_repaint.lock() {
                 *nr = Some(nr.map_or(when, |t| t.min(when)));
             }
-            let _ = proxy.send_event(RunnerEvent::Wake);
+            // Only interrupt the event loop when the repaint is due now. Waking for a delayed
+            // request would paint immediately, and that paint requests the next one: a loop that
+            // burns a core while playing (the seek bar asks for 4 repaints a second). Delayed
+            // requests are picked up by the `WaitUntil` deadline in `about_to_wait`.
+            if info.delay.is_zero() {
+                let _ = proxy.send_event(RunnerEvent::Wake);
+            }
         });
     }
 
