@@ -1649,6 +1649,18 @@ impl PlexDioApp {
             None => (None, None),
         };
 
+        // Spotify-style three columns: track info | transport over the seek bar | rating, queue
+        // and volume. Widths follow the bar width so nothing is pushed off at the minimum size.
+        let full = ui.available_width();
+        let wide = full >= 1000.0;
+        let info_w = (full * 0.24).clamp(130.0, 260.0);
+        let vol_w = if wide { 90.0 } else { 64.0 };
+        let gap = ui.spacing().item_spacing.x;
+        // Stars (wide only), queue, mute, volume slider; each followed by item spacing.
+        let right_w = if wide { 5.0 * (14.0 + gap) + 8.0 } else { 0.0 } + (18.0 + gap) * 2.0 + vol_w + gap;
+        let left_w = 48.0 + 10.0 + info_w + 3.0 * gap;
+        let center_w = (full - left_w - right_w - 2.0 * gap).max(160.0);
+
         ui.horizontal_centered(|ui| {
             let sense = if album_route.is_some() { egui::Sense::click() } else { egui::Sense::hover() };
             let (rect, cover) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), sense);
@@ -1668,7 +1680,7 @@ impl PlexDioApp {
             // Reserve a fixed slot for the title block so the transport controls never shift
             // sideways when the track changes.
             ui.add_space(10.0);
-            let (info_rect, _) = ui.allocate_exact_size(egui::vec2(220.0, 48.0), egui::Sense::hover());
+            let (info_rect, _) = ui.allocate_exact_size(egui::vec2(info_w, 48.0), egui::Sense::hover());
             ui.scope_builder(
                 egui::UiBuilder::new().max_rect(info_rect).layout(egui::Layout::top_down(egui::Align::LEFT)),
                 |ui| {
@@ -1689,90 +1701,102 @@ impl PlexDioApp {
                 },
             );
 
-            ui.add_space(12.0);
-            if icons::button(ui, Icon::Shuffle, 18.0, st.shuffle)
-                .on_hover_text(if st.shuffle { "Shuffle is on" } else { "Shuffle the queue" })
-                .clicked()
-            {
-                cmds.push(BarCmd::Shuffle(!st.shuffle));
-            }
-            ui.add_space(4.0);
-            if icons::button(ui, Icon::Prev, 18.0, false).on_hover_text("Previous").clicked() {
-                cmds.push(BarCmd::Prev);
-            }
-            let playing = st.state == PlayState::Playing;
-            if icons::button(ui, if playing { Icon::Pause } else { Icon::Play }, 24.0, false)
-                .on_hover_text(if playing { "Pause" } else { "Play" })
-                .clicked()
-            {
-                cmds.push(BarCmd::Toggle);
-            }
-            if icons::button(ui, Icon::Next, 18.0, false).on_hover_text("Next").clicked() {
-                cmds.push(BarCmd::Next);
-            }
-            ui.add_space(4.0);
-            let (repeat_icon, repeat_hint) = match st.repeat {
-                RepeatMode::Off => (Icon::Repeat, "Repeat off"),
-                RepeatMode::All => (Icon::Repeat, "Repeat all"),
-                RepeatMode::One => (Icon::RepeatOne, "Repeat one"),
-            };
-            if icons::button(ui, repeat_icon, 18.0, st.repeat != RepeatMode::Off)
-                .on_hover_text(repeat_hint)
-                .clicked()
-            {
-                cmds.push(BarCmd::Repeat);
-            }
-            ui.add_space(8.0);
-            // Star rating of the current track (Plex ratings are 2 points per star).
-            let rating = self.library.as_ref().and_then(|l| l.track(track.id)).map_or(0u8, |t| (t.user_rating.clamp(0.0, 10.0)).round() as u8);
-            for star in 1..=5u8 {
-                let filled = rating >= star * 2;
-                let resp = icons::button(ui, if filled { Icon::StarFilled } else { Icon::Star }, 14.0, filled)
-                    .on_hover_text(format!("{star} star{}", if star == 1 { "" } else { "s" }));
-                if resp.clicked() {
-                    cmds.push(BarCmd::Rate(if rating == star * 2 { 0 } else { star * 2 }));
-                }
-            }
-            ui.add_space(8.0);
-            if icons::button(ui, Icon::Queue, 18.0, self.queue_open).on_hover_text("Queue").clicked() {
-                cmds.push(BarCmd::Queue);
-            }
-
-            ui.add_space(16.0);
-            let dur = track.duration_ms.max(st.duration_ms) as f64 / 1000.0;
-            let mut pos = (st.position_ms as f64 / 1000.0).clamp(0.0, dur.max(0.1));
-            ui.spacing_mut().slider_width = 240.0;
-            let resp = ui.add_enabled(dur > 0.5, egui::Slider::new(&mut pos, 0.0..=dur.max(0.1)).show_value(false).trailing_fill(true));
-            if resp.changed() {
-                cmds.push(BarCmd::Seek((pos * 1000.0) as u64));
-            }
-            // Fixed width as well: "0:08" and "1:02:03" would otherwise move the volume controls.
-            ui.add_sized(
-                [78.0, 18.0],
-                egui::Label::new(
-                    RichText::new(format!(
-                        "{} / {}",
-                        fmt_duration(st.position_ms),
-                        fmt_duration(track.duration_ms.max(st.duration_ms))
-                    ))
-                    .small()
-                    .color(theme::TEXT_DIM),
-                )
-                .halign(egui::Align::LEFT),
+            // Center column: transport row, then elapsed / seek bar / duration.
+            ui.add_space(gap);
+            let (center_rect, _) = ui.allocate_exact_size(egui::vec2(center_w, 56.0), egui::Sense::hover());
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(center_rect).layout(egui::Layout::top_down(egui::Align::LEFT)),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        // shuffle, prev, play, next, repeat
+                        let transport_w = 18.0 * 4.0 + 24.0 + 12.0 * 4.0;
+                        ui.add_space(((center_w - transport_w) / 2.0 - 12.0).max(0.0));
+                        if icons::button(ui, Icon::Shuffle, 18.0, st.shuffle)
+                            .on_hover_text(if st.shuffle { "Shuffle is on" } else { "Shuffle the queue" })
+                            .clicked()
+                        {
+                            cmds.push(BarCmd::Shuffle(!st.shuffle));
+                        }
+                        if icons::button(ui, Icon::Prev, 18.0, false).on_hover_text("Previous").clicked() {
+                            cmds.push(BarCmd::Prev);
+                        }
+                        let playing = st.state == PlayState::Playing;
+                        if icons::button(ui, if playing { Icon::Pause } else { Icon::Play }, 24.0, false)
+                            .on_hover_text(if playing { "Pause" } else { "Play" })
+                            .clicked()
+                        {
+                            cmds.push(BarCmd::Toggle);
+                        }
+                        if icons::button(ui, Icon::Next, 18.0, false).on_hover_text("Next").clicked() {
+                            cmds.push(BarCmd::Next);
+                        }
+                        let (repeat_icon, repeat_hint) = match st.repeat {
+                            RepeatMode::Off => (Icon::Repeat, "Repeat off"),
+                            RepeatMode::All => (Icon::Repeat, "Repeat all"),
+                            RepeatMode::One => (Icon::RepeatOne, "Repeat one"),
+                        };
+                        if icons::button(ui, repeat_icon, 18.0, st.repeat != RepeatMode::Off)
+                            .on_hover_text(repeat_hint)
+                            .clicked()
+                        {
+                            cmds.push(BarCmd::Repeat);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        // Fixed-width time labels: "0:08" and "1:02:03" would otherwise move the bar.
+                        const TIME_W: f32 = 44.0;
+                        let dur_ms = track.duration_ms.max(st.duration_ms);
+                        let time = |ui: &mut egui::Ui, ms: u64, align: egui::Align| {
+                            ui.add_sized(
+                                [TIME_W, 18.0],
+                                egui::Label::new(RichText::new(fmt_duration(ms)).small().color(theme::TEXT_DIM)).halign(align),
+                            );
+                        };
+                        time(ui, st.position_ms, egui::Align::RIGHT);
+                        let dur = dur_ms as f64 / 1000.0;
+                        let mut pos = (st.position_ms as f64 / 1000.0).clamp(0.0, dur.max(0.1));
+                        ui.spacing_mut().slider_width = (center_w - 2.0 * TIME_W - 2.0 * gap - 4.0).max(40.0);
+                        let resp = ui.add_enabled(dur > 0.5, egui::Slider::new(&mut pos, 0.0..=dur.max(0.1)).show_value(false).trailing_fill(true));
+                        if resp.changed() {
+                            cmds.push(BarCmd::Seek((pos * 1000.0) as u64));
+                        }
+                        time(ui, dur_ms, egui::Align::LEFT);
+                    });
+                },
             );
 
-            ui.add_space(12.0);
-            if icons::button(ui, if st.muted { Icon::Mute } else { Icon::Volume }, 18.0, false)
-                .on_hover_text(if st.muted { "Unmute" } else { "Mute" })
-                .clicked()
-            {
-                cmds.push(BarCmd::Mute(!st.muted));
-            }
-            let mut vol = st.volume as f64;
-            ui.spacing_mut().slider_width = 90.0;
-            if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false)).changed() {
-                cmds.push(BarCmd::Volume(vol as f32));
-            }
+            // Right column, laid out from the window edge inwards.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let mut vol = st.volume as f64;
+                ui.spacing_mut().slider_width = vol_w;
+                if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false)).changed() {
+                    cmds.push(BarCmd::Volume(vol as f32));
+                }
+                if icons::button(ui, if st.muted { Icon::Mute } else { Icon::Volume }, 18.0, false)
+                    .on_hover_text(if st.muted { "Unmute" } else { "Mute" })
+                    .clicked()
+                {
+                    cmds.push(BarCmd::Mute(!st.muted));
+                }
+                if icons::button(ui, Icon::Queue, 18.0, self.queue_open).on_hover_text("Queue").clicked() {
+                    cmds.push(BarCmd::Queue);
+                }
+                // Star rating of the current track (Plex ratings are 2 points per star). Narrow
+                // windows rate from the track's context menu instead.
+                if wide {
+                    ui.add_space(8.0);
+                    let rating = self.library.as_ref().and_then(|l| l.track(track.id)).map_or(0u8, |t| (t.user_rating.clamp(0.0, 10.0)).round() as u8);
+                    for star in (1..=5u8).rev() {
+                        let filled = rating >= star * 2;
+                        let resp = icons::button(ui, if filled { Icon::StarFilled } else { Icon::Star }, 14.0, filled)
+                            .on_hover_text(format!("{star} star{}", if star == 1 { "" } else { "s" }));
+                        if resp.clicked() {
+                            cmds.push(BarCmd::Rate(if rating == star * 2 { 0 } else { star * 2 }));
+                        }
+                    }
+                }
+            });
         });
 
         let mut save = false;
