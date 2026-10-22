@@ -323,6 +323,12 @@ impl<A: UiApp> ApplicationHandler<RunnerEvent> for Runner<A> {
         if response.repaint {
             self.needs_paint = true;
         }
+        // While the user drags a window edge, Windows runs its own modal sizing loop and
+        // `about_to_wait` does not fire until the button is released, so the content would stay
+        // at the old size. Paint right here instead, once egui has seen the new size.
+        if matches!(event, WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }) && !self.exiting {
+            self.paint(event_loop);
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
