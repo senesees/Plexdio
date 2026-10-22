@@ -121,6 +121,8 @@ enum BarCmd {
     Repeat,
     Queue,
     Rate(u8),
+    /// Open the album or artist of the playing track.
+    Go(Route),
 }
 
 #[derive(Debug)]
@@ -1640,9 +1642,21 @@ impl PlexDioApp {
         let thumb = self.library.as_ref().and_then(|l| l.track(track.id)).and_then(|t| t.thumb.as_deref().map(str::to_string));
         let tex = thumb.as_deref().and_then(|t| self.art.get(t, 48.0));
         let mut cmds: Vec<BarCmd> = Vec::new();
+        // Where the cover, title, artist and album link to (like Spotify). The artist link is
+        // only offered when the artist has a page in this library.
+        let (album_route, artist_route) = match self.library.as_ref().and_then(|l| l.track(track.id).map(|t| (l, t))) {
+            Some((l, t)) => (Some(Route::Album(t.album_id)), l.artist(t.artist_id).is_some().then_some(Route::Artist(t.artist_id))),
+            None => (None, None),
+        };
 
         ui.horizontal_centered(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+            let sense = if album_route.is_some() { egui::Sense::click() } else { egui::Sense::hover() };
+            let (rect, cover) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), sense);
+            if let Some(r) = &album_route {
+                if cover.on_hover_text("Go to album").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    cmds.push(BarCmd::Go(r.clone()));
+                }
+            }
             match tex {
                 Some(id) => {
                     ui.painter().image(id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
@@ -1659,11 +1673,19 @@ impl PlexDioApp {
                 egui::UiBuilder::new().max_rect(info_rect).layout(egui::Layout::top_down(egui::Align::LEFT)),
                 |ui| {
                     ui.add_space(4.0);
-                    ui.add(egui::Label::new(RichText::new(&track.title).strong().color(theme::TEXT).size(14.0)).truncate());
-                    ui.add(
-                        egui::Label::new(RichText::new(format!("{} · {}", track.artist, track.album)).small().color(theme::TEXT_DIM))
-                            .truncate(),
-                    );
+                    if bar_link(ui, RichText::new(&track.title).strong().color(theme::TEXT).size(14.0), album_route.is_some()) {
+                        cmds.extend(album_route.clone().map(BarCmd::Go));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if bar_link(ui, RichText::new(&track.artist).small().color(theme::TEXT_DIM), artist_route.is_some()) {
+                            cmds.extend(artist_route.clone().map(BarCmd::Go));
+                        }
+                        ui.label(RichText::new("·").small().color(theme::TEXT_DIM));
+                        if bar_link(ui, RichText::new(&track.album).small().color(theme::TEXT_DIM), album_route.is_some()) {
+                            cmds.extend(album_route.clone().map(BarCmd::Go));
+                        }
+                    });
                 },
             );
 
@@ -1755,6 +1777,7 @@ impl PlexDioApp {
 
         let mut save = false;
         let mut rate = None;
+        let mut go = None;
         if let Some(eng) = &self.engine {
             for c in cmds {
                 log::info!("transport: {:?}", c);
@@ -1793,11 +1816,15 @@ impl PlexDioApp {
                         // Re-borrow after the loop's immutable borrows; deferred below.
                         rate = Some(r);
                     }
+                    BarCmd::Go(r) => go = Some(r),
                 }
             }
         }
         if let Some(r) = rate {
             self.rate_track(track.id, r);
+        }
+        if let Some(r) = go {
+            self.navigate(r);
         }
         if save {
             self.save_config();
@@ -2245,6 +2272,22 @@ fn route_category(r: &Route) -> u8 {
         // Not a sidebar entry; nothing is highlighted.
         Route::Radio => 5,
     }
+}
+
+/// Truncated text that acts as a link when `enabled`: underlined with a hand cursor on hover
+/// (Spotify's now-playing style). Returns true when clicked.
+fn bar_link(ui: &mut egui::Ui, text: RichText, enabled: bool) -> bool {
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let resp = ui.add(egui::Label::new(text).sense(sense).truncate());
+    if !enabled {
+        return false;
+    }
+    if resp.hovered() {
+        let r = resp.rect;
+        let color = ui.visuals().override_text_color.unwrap_or(theme::TEXT);
+        ui.painter().line_segment([egui::pos2(r.left(), r.bottom()), egui::pos2(r.right(), r.bottom())], egui::Stroke::new(1.0, color));
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 fn nav_button(ui: &mut egui::Ui, selected: bool, icon: Icon, label: &str) -> bool {
