@@ -2,7 +2,7 @@
 
 use plexdio::ui::runner::{self, RunnerOptions};
 use plexdio::ui::theme;
-use plexdio::ui::app::{LaunchOptions, PlexDioApp, TOKEN_NAME};
+use plexdio::ui::app::{LaunchOptions, PlexdioApp, TOKEN_NAME};
 use plexdio::{config::Config, logging, paths, secure_store, win::single_instance};
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ fn load_icon() -> egui::IconData {
 fn main() {
     paths::migrate_legacy_dirs();
     let log_path = logging::init(&paths::log_dir(), cfg!(debug_assertions));
-    log::info!("PlexDio {} starting (log: {})", env!("CARGO_PKG_VERSION"), log_path.display());
+    log::info!("Plexdio {} starting (log: {})", env!("CARGO_PKG_VERSION"), log_path.display());
 
     let Some(_guard) = single_instance::acquire() else {
         log::info!("another instance is running; activating it");
@@ -33,8 +33,8 @@ fn main() {
     let size = config.window_size.unwrap_or([1180.0, 760.0]);
     let options = RunnerOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("PlexDio")
-            .with_app_id("PlexDio")
+            .with_title("Plexdio")
+            .with_app_id("Plexdio")
             // The app draws its own themed title bar (ui/titlebar.rs).
             .with_decorations(false)
             .with_inner_size(size)
@@ -48,9 +48,9 @@ fn main() {
     ctx.add_font_provider(Arc::new(plexdio::ui::fonts::system_provider()));
     if let Err(e) = runner::run(options, ctx, move |ctx, _proxy| {
         let store: Arc<dyn secure_store::SecretStore> = Arc::from(secure_store::default_store(TOKEN_NAME));
-        PlexDioApp::new(ctx, config, opts, store)
+        PlexdioApp::new(ctx, config, opts, store)
     }) {
         log::error!("UI terminated with error: {e}");
     }
-    log::info!("PlexDio exiting");
+    log::info!("Plexdio exiting");
 }

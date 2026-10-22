@@ -1,7 +1,7 @@
 //! `mockplex [--port N] [--bind ADDR] [--advertise HOST] [--synthetic N] [--no-sonic]
 //!           [--manual-approve] [--quiet]`
 //!
-//! Then start PlexDio with `--plex-tv-url http://HOST:PORT`.
+//! Then start Plexdio with `--plex-tv-url http://HOST:PORT`.
 
 use mockplex::{MockConfig, MockServer};
 

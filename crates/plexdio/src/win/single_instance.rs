@@ -56,7 +56,7 @@ fn mutex_name() -> String {
     for b in crate::paths::cache_dir().to_string_lossy().bytes() {
         h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
     }
-    format!("Local\\PlexDio.SingleInstance.{h:016x}")
+    format!("Local\\Plexdio.SingleInstance.{h:016x}")
 }
 
 /// Remember our window so a later instance can activate it.

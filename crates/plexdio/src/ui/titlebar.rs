@@ -58,10 +58,10 @@ pub fn show(ui: &mut egui::Ui, title: &str, can_maximize: bool) -> TitleAction {
             let mark = Rect::from_center_size(egui::pos2(bar.left() + 20.0, bar.center().y), egui::vec2(16.0, 16.0));
             p.circle_filled(mark.center(), 8.0, theme::ACCENT);
             icons::paint(p, mark.shrink(4.0), Icon::Play, theme::BAR);
-            p.text(egui::pos2(bar.left() + 36.0, bar.center().y), Align2::LEFT_CENTER, "PlexDio", FontId::proportional(13.0), theme::TEXT);
+            p.text(egui::pos2(bar.left() + 36.0, bar.center().y), Align2::LEFT_CENTER, "Plexdio", FontId::proportional(13.0), theme::TEXT);
 
             // Now-playing title, centered and clipped to the space between name and buttons.
-            if !title.is_empty() && title != "PlexDio" {
+            if !title.is_empty() && title != "Plexdio" {
                 // Symmetric around the window center, clear of the name and the buttons.
                 let cx = bar.center().x;
                 let room = 2.0 * (cx - (bar.left() + 110.0)).min(drag_rect.right() - 12.0 - cx);

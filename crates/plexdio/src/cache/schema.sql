@@ -1,4 +1,4 @@
--- PlexDio library cache (one database per server + library section).
+-- Plexdio library cache (one database per server + library section).
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 

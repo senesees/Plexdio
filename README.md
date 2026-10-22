@@ -1,9 +1,9 @@
-# PlexDio
+# Plexdio
 
 A small, native Windows 10/11 x64 music player for Plex — a lean alternative to Plexamp.
 One self-contained exe (9.5 MB), no installer, no runtime, no Electron.
 
-*Formerly **Plexify**. Settings, the library cache, the saved sign-in and the start-with-Windows
+*Formerly **Plexify**, then briefly **PlexDio**. Settings, the library cache, the saved sign-in and the start-with-Windows
 entry carry over automatically on first start — see [Upgrading from Plexify](#upgrading-from-plexify).*
 
 ![Home](docs/home.png)
@@ -53,7 +53,7 @@ Mini-player:
   runs out, autoplay picks up from the last track.
 - **Reporting**: `/:/timeline` while playing (every 10 s and on state changes), `/:/scrobble`
   at 90 %, and star ratings through `/:/rate`.
-- **Discord Rich Presence** (optional): your Discord status shows "Listening to PlexDio" with
+- **Discord Rich Presence** (optional): your Discord status shows "Listening to Plexdio" with
   the song, artist, album and a progress bar while music plays; pausing clears it. See
   [Discord setup](#discord-setup).
 - **Windows integration**: a themed title bar (drag, double-click to maximise, resize from any
@@ -81,15 +81,15 @@ With the equaliser off or flat it is bypassed completely (bit-exact output).
 Discord requires every app to have its own application ID; the app's name is what Discord
 shows as "Listening to …".
 
-1. Create an application named **PlexDio** at <https://discord.com/developers/applications>.
+1. Create an application named **Plexdio** at <https://discord.com/developers/applications>.
 2. Put its **Application ID** into `CLIENT_ID` in `crates/plexdio/src/discord.rs` and rebuild
    (or set `PLEXDIO_DISCORD_CLIENT_ID` for a quick test without rebuilding).
-3. Optional: under *Rich Presence → Art Assets*, upload the PlexDio icon named `plexdio`; it
+3. Optional: under *Rich Presence → Art Assets*, upload the Plexdio icon named `plexdio`; it
    becomes the large image.
 4. In the app: *Settings → Discord → Show what I'm listening to*. It is off by default because
    it shares your listening activity.
 
-Without an ID the setting is greyed out. PlexDio talks to the Discord desktop app over its
+Without an ID the setting is greyed out. Plexdio talks to the Discord desktop app over its
 local IPC pipe, retries every 15 s while Discord is closed, and stays within Discord's rate
 limit (5 updates per 20 s).
 
@@ -164,7 +164,7 @@ test runs), `PLEXDIO_LOG` (`error`…`trace`), `PLEXDIO_PLEX_TV_URL`,
 ```
 crates/plexdio
   main.rs            single instance, logging, config, launch, Plexify migration
-  config.rs          %APPDATA%\PlexDio\config.json
+  config.rs          %APPDATA%\Plexdio\config.json
   secure_store.rs    Credential Manager -> DPAPI file fallback
   logging.rs         rotating file log (1 MB x 3)
   discord.rs         Discord Rich Presence over the local IPC pipe
@@ -195,22 +195,26 @@ Notable choices:
   binary size down.
 - **No XML.** Every request asks for `application/json`.
 
-Data locations: `%APPDATA%\PlexDio\config.json` (settings, resume queue),
-`%LOCALAPPDATA%\PlexDio\db\*.sqlite` (library cache), `…\images` (artwork, LRU),
+Data locations: `%APPDATA%\Plexdio\config.json` (settings, resume queue),
+`%LOCALAPPDATA%\Plexdio\db\*.sqlite` (library cache), `…\images` (artwork, LRU),
 `…\audio` (audio cache, LRU), `…\logs\plexdio.log`.
 
 ## Upgrading from Plexify
 
-On its first start PlexDio:
+On its first start Plexdio:
 
-- renames `%APPDATA%\Plexify` and `%LOCALAPPDATA%\Plexify` to `PlexDio` (only if the new
+- renames `%APPDATA%\Plexify` and `%LOCALAPPDATA%\Plexify` to `Plexdio` (only if the new
   folders do not exist yet), keeping settings, the library cache and the resume queue;
-- moves the saved sign-in from the Credential Manager entry `Plexify/plex-token` to
-  `PlexDio/plex-token`;
+- moves the saved sign-in from the Credential Manager entry `Plexify/plex-token` (or
+  `PlexDio/plex-token`) to `Plexdio/plex-token`;
 - removes the old `Plexify` start-with-Windows entry (the setting re-adds it for
   `plexdio.exe`).
 
 The environment variables were renamed too (`PLEXIFY_*` → `PLEXDIO_*`).
+
+Coming from **PlexDio** needs nothing: Windows folder and registry names ignore case, so the
+existing `PlexDio` folders and start-with-Windows entry are used as they are, and the saved
+sign-in is looked up under both spellings.
 
 ## Footprint
 
@@ -243,7 +247,7 @@ The app runs under Wine with two adaptations, both in `src/win/`:
   work through `RegisterHotKey`.
 
 With Wine's default settings the X11 window manager still draws its own frame over the top
-of the window, covering PlexDio's title bar. To see the app as it looks on Windows (the
+of the window, covering Plexdio's title bar. To see the app as it looks on Windows (the
 screenshots above were taken this way), turn that off:
 
 ```sh

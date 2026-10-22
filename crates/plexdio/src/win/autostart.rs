@@ -3,7 +3,7 @@
 
 /// Name of the Run value (stable across versions so re-enabling replaces it).
 #[cfg_attr(not(windows), allow(dead_code))]
-const VALUE: &str = "PlexDio";
+const VALUE: &str = "Plexdio";
 
 /// True when the Run value exists (regardless of the exact path it points at).
 #[cfg(windows)]

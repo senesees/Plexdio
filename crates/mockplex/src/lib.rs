@@ -1,6 +1,6 @@
 //! Mock plex.tv + Plex Media Server.
 //!
-//! Serves the JSON flavour of the endpoints PlexDio uses, backed by an in-memory library
+//! Serves the JSON flavour of the endpoints Plexdio uses, backed by an in-memory library
 //! (see [`library`]) and embedded audio fixtures, so the app and its tests can run without a
 //! Plex account. One HTTP listener plays both roles: point `--plex-tv-url` at it and the
 //! advertised server connection points back at it too.
@@ -258,7 +258,7 @@ fn route(state: &Arc<Mutex<State>>, method: &Method, path: &str, q: &HashMap<Str
             st.next_pin += 1;
             let code = format!("mockcode{id}");
             st.pins.insert(id, PinState { code: code.clone(), polls: 0, approved: false });
-            return json_resp(201, &json!({ "id": id, "code": code, "product": "PlexDio", "trusted": false,
+            return json_resp(201, &json!({ "id": id, "code": code, "product": "Plexdio", "trusted": false,
                 "expiresIn": 1800, "authToken": null, "newRegistration": null }));
         }
         (Method::Get, ["api", "v2", "pins", id]) => {

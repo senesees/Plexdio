@@ -1,6 +1,6 @@
 //! Sign-in screen (Plex PIN flow) and the generic busy screen.
 
-use crate::ui::app::PlexDioApp;
+use crate::ui::app::PlexdioApp;
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme;
 use egui::{Align, Layout, RichText};
@@ -34,7 +34,7 @@ pub fn busy_screen(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-impl PlexDioApp {
+impl PlexdioApp {
     pub fn login_screen(&mut self, ui: &mut egui::Ui) {
         let mut start = false;
         let mut cancel = false;
@@ -50,7 +50,7 @@ impl PlexDioApp {
         centered(ui, 460.0, |ui| {
             logo(ui, 72.0);
             ui.add_space(16.0);
-            ui.label(RichText::new("PlexDio").size(34.0).strong());
+            ui.label(RichText::new("Plexdio").size(34.0).strong());
             ui.label(RichText::new("Your Plex music, light as a feather.").size(15.0).color(theme::TEXT_DIM));
             ui.add_space(28.0);
             theme::card().show(ui, |ui| {
@@ -60,7 +60,7 @@ impl PlexDioApp {
                         ui.label(RichText::new("Approve the sign-in in your browser").size(17.0).strong());
                         ui.add_space(6.0);
                         ui.label(
-                            RichText::new("A Plex page has opened. Sign in there and allow PlexDio; this window continues automatically.")
+                            RichText::new("A Plex page has opened. Sign in there and allow Plexdio; this window continues automatically.")
                                 .color(theme::TEXT_DIM),
                         );
                         ui.add_space(14.0);

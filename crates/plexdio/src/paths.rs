@@ -1,10 +1,10 @@
-//! Filesystem locations. Config lives in the roaming profile (%APPDATA%\PlexDio),
-//! caches and logs in the local profile (%LOCALAPPDATA%\PlexDio).
+//! Filesystem locations. Config lives in the roaming profile (%APPDATA%\Plexdio),
+//! caches and logs in the local profile (%LOCALAPPDATA%\Plexdio).
 //! `PLEXDIO_HOME` overrides both (used by tests and side-by-side runs).
 
 use std::path::PathBuf;
 
-const APP_DIR: &str = "PlexDio";
+const APP_DIR: &str = "Plexdio";
 /// Folder name used before the app was renamed from Plexify.
 const LEGACY_APP_DIR: &str = "Plexify";
 

@@ -179,7 +179,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let menu: HMENU = CreatePopupMenu();
                         if !menu.is_null() {
                             let items = [
-                                (MENU_SHOW, "Show PlexDio"),
+                                (MENU_SHOW, "Show Plexdio"),
                                 (MENU_PLAY, "Play / Pause"),
                                 (MENU_NEXT, "Next track"),
                                 (MENU_PREV, "Previous track"),
@@ -189,7 +189,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 AppendMenuW(menu, MF_STRING, id, t.as_ptr());
                             }
                             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-                            let quit = wide("Quit PlexDio");
+                            let quit = wide("Quit Plexdio");
                             AppendMenuW(menu, MF_STRING, MENU_QUIT, quit.as_ptr());
                             let cmd = TrackPopupMenu(
                                 menu,
@@ -272,8 +272,8 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
     nid.hIcon = icon;
     let tip: Vec<u16> = TIP
         .lock()
-        .map(|t| if t.is_empty() { "PlexDio".to_string() } else { t.clone() })
-        .unwrap_or_else(|_| "PlexDio".into())
+        .map(|t| if t.is_empty() { "Plexdio".to_string() } else { t.clone() })
+        .unwrap_or_else(|_| "Plexdio".into())
         .encode_utf16()
         .collect();
     let n = tip.len().min(nid.szTip.len() - 1);
@@ -301,7 +301,7 @@ fn run_tray(tx: Sender<TrayEvent>, ready: Sender<isize>) {
     unsafe {
         EVENTS.with(|s| *s.borrow_mut() = Some(tx));
         let hinst = Module(std::ptr::null());
-        let class_name = wide("PlexDioTray");
+        let class_name = wide("PlexdioTray");
         let wc = WNDCLASSW {
             style: 0,
             lpfnWndProc: Some(wndproc),
@@ -323,7 +323,7 @@ fn run_tray(tx: Sender<TrayEvent>, ready: Sender<isize>) {
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
-            wide("PlexDio").as_ptr(),
+            wide("Plexdio").as_ptr(),
             0,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

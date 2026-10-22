@@ -4,9 +4,9 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("../../assets/icon.ico")
-            .set("ProductName", "PlexDio")
-            .set("FileDescription", "PlexDio - lightweight Plex music player")
-            .set("CompanyName", "PlexDio")
+            .set("ProductName", "Plexdio")
+            .set("FileDescription", "Plexdio - lightweight Plex music player")
+            .set("CompanyName", "Plexdio")
             .set("LegalCopyright", "MIT")
             .set_manifest_file("app.manifest");
         if let Err(e) = res.compile() {

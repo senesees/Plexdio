@@ -31,7 +31,7 @@ fn pin_flow_until_authorized() {
     let pin = tv.create_pin().unwrap();
     let url = tv.auth_url(&pin);
     assert!(url.starts_with(&format!("{}/auth#?clientID=test-client&code={}", mock.url, pin.code)), "{url}");
-    assert!(url.contains("context%5Bdevice%5D%5Bproduct%5D=PlexDio"));
+    assert!(url.contains("context%5Bdevice%5D%5Bproduct%5D=Plexdio"));
     // Pending on the first poll, then auto-approved by the mock.
     assert_eq!(tv.check_pin(&pin).unwrap(), None);
     let token = tv.wait_for_pin(&pin, Duration::from_millis(20), Duration::from_secs(5), &AtomicBool::new(false)).unwrap();

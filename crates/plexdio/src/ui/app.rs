@@ -187,7 +187,7 @@ pub struct ServerEntry {
     pub sections: Option<Result<Vec<Directory>, String>>,
 }
 
-pub struct PlexDioApp {
+pub struct PlexdioApp {
     pub config: Config,
     pub opts: LaunchOptions,
     pub route: Route,
@@ -286,7 +286,7 @@ pub struct PlexDioApp {
     last_window_size: Option<[f32; 2]>,
 }
 
-impl PlexDioApp {
+impl PlexdioApp {
     pub fn new(ctx: &egui::Context, config: Config, opts: LaunchOptions, store: Arc<dyn SecretStore>) -> Self {
         theme::apply(ctx);
         let http = Http::new(ClientInfo::new(config.client_id.clone()));
@@ -1090,7 +1090,7 @@ impl PlexDioApp {
             let (r, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
             ui.painter().circle_filled(r.center(), 13.0, theme::ACCENT);
             icons::paint(ui.painter(), r.shrink(6.0), Icon::Play, egui::Color32::from_rgb(24, 24, 24));
-            ui.label(RichText::new("PlexDio").size(22.0).strong());
+            ui.label(RichText::new("Plexdio").size(22.0).strong());
         });
         ui.add_space(12.0);
         // Server / library switcher.
@@ -2376,7 +2376,7 @@ impl PlexDioApp {
             }
         });
         let autostart_ok = cfg!(windows);
-        setting_row(ui, "Start with Windows", Some(if autostart_ok { "Open PlexDio when you sign in" } else { "Only available on Windows" }), |ui| {
+        setting_row(ui, "Start with Windows", Some(if autostart_ok { "Open Plexdio when you sign in" } else { "Only available on Windows" }), |ui| {
             let mut v = self.config.start_with_windows;
             if ui.add_enabled_ui(autostart_ok, |ui| theme::toggle(ui, &mut v)).inner.changed() {
                 if crate::win::autostart::set_enabled(v) {
@@ -2581,7 +2581,7 @@ fn nav_button(ui: &mut egui::Ui, selected: bool, icon: Icon, label: &str) -> boo
     resp.clicked()
 }
 
-impl UiApp for PlexDioApp {
+impl UiApp for PlexdioApp {
     fn on_window_created(&mut self, _ctx: &egui::Context, window: &winit::window::Window) {
         if let Some(hwnd) = crate::win::hwnd_of(window) {
             crate::win::single_instance::publish_window(hwnd);
@@ -2751,7 +2751,7 @@ impl UiApp for PlexDioApp {
                     playing,
                 }),
                 None => smtc.update(&NowPlaying {
-                    title: "PlexDio",
+                    title: "Plexdio",
                     artist: "",
                     album: "",
                     position_ms: 0,
@@ -2762,8 +2762,8 @@ impl UiApp for PlexDioApp {
         }
         self.update_discord();
         let title = match (&self.playback.track, self.playback.state) {
-            (Some(t), PlayState::Playing | PlayState::Paused) => format!("{} — {} · PlexDio", t.title, t.artist),
-            _ => "PlexDio".to_string(),
+            (Some(t), PlayState::Playing | PlayState::Paused) => format!("{} — {} · Plexdio", t.title, t.artist),
+            _ => "Plexdio".to_string(),
         };
         if title != self.window_title {
             if let Some(tray) = &self.tray {

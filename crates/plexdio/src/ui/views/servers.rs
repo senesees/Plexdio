@@ -1,7 +1,7 @@
 //! Server and music-library picker.
 
 use crate::plex::models::Directory;
-use crate::ui::app::{PlexDioApp, ProbeStatus, Screen};
+use crate::ui::app::{PlexdioApp, ProbeStatus, Screen};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme;
 use egui::{Color32, RichText, Sense};
@@ -14,7 +14,7 @@ enum Action {
     SignOut,
 }
 
-impl PlexDioApp {
+impl PlexdioApp {
     pub fn server_screen(&mut self, ui: &mut egui::Ui) {
         let mut action = None;
         let can_go_back = self.pms.is_some() && self.section.is_some();

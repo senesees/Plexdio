@@ -97,13 +97,16 @@ pub mod windows_impl {
 
     pub struct CredManager {
         target: Vec<u16>,
-        /// Target used before the app was renamed from Plexify; moved over on first read.
-        legacy: Vec<u16>,
+        /// Targets used by earlier names of the app (Plexify, PlexDio); moved over on first read.
+        legacy: Vec<(String, Vec<u16>)>,
+        new_name: String,
     }
 
     impl CredManager {
         pub fn new(name: &str) -> Self {
-            Self { target: wide(&format!("PlexDio/{name}")), legacy: wide(&format!("Plexify/{name}")) }
+            let new_name = format!("Plexdio/{name}");
+            let legacy = ["Plexify", "PlexDio"].iter().map(|old| format!("{old}/{name}")).map(|t| (t.clone(), wide(&t))).collect();
+            Self { target: wide(&new_name), legacy, new_name }
         }
     }
 
@@ -127,12 +130,17 @@ pub mod windows_impl {
                 return Some(s);
             }
             // Pre-rename install: move the token to the new name so the user stays signed in.
-            let s = read(&self.legacy)?;
-            if self.set(&s).is_ok() {
-                unsafe { CredDeleteW(self.legacy.as_ptr(), CRED_TYPE_GENERIC, 0) };
-                log::info!("moved the saved sign-in from Plexify to PlexDio");
+            for (old_name, old) in &self.legacy {
+                let Some(s) = read(old) else { continue };
+                // Credential names may compare case-insensitively ("PlexDio" vs "Plexdio"):
+                // never delete an entry that could be the one just written.
+                if self.set(&s).is_ok() && !old_name.eq_ignore_ascii_case(&self.new_name) {
+                    unsafe { CredDeleteW(old.as_ptr(), CRED_TYPE_GENERIC, 0) };
+                    log::info!("moved the saved sign-in from {old_name} to {}", self.new_name);
+                }
+                return Some(s);
             }
-            Some(s)
+            None
         }
 
         fn set(&self, secret: &str) -> Result<(), String> {
@@ -159,6 +167,11 @@ pub mod windows_impl {
         }
 
         fn delete(&self) -> Result<(), String> {
+            // Signing out also drops entries from earlier app names, so none of them can sign
+            // the user back in on the next start.
+            for (_, old) in &self.legacy {
+                unsafe { CredDeleteW(old.as_ptr(), CRED_TYPE_GENERIC, 0) };
+            }
             if unsafe { CredDeleteW(self.target.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0 {
                 let err = unsafe { GetLastError() };
                 if err != ERROR_NOT_FOUND {

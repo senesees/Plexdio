@@ -129,7 +129,7 @@ pub fn init(hwnd: isize, events: SmtcEvents) -> Option<Smtc> {
     let timeline = windows::Media::SystemMediaTransportControlsTimelineProperties::new().ok();
     if let Ok(updater) = controls.DisplayUpdater() {
         let _ = updater.SetType(MediaPlaybackType::Music);
-        let _ = updater.MusicProperties().and_then(|p| p.SetTitle(&HSTRING::from("PlexDio")));
+        let _ = updater.MusicProperties().and_then(|p| p.SetTitle(&HSTRING::from("Plexdio")));
         let _ = updater.Update();
     }
     let _ = controls.SetPlaybackStatus(MediaPlaybackStatus::Stopped);

@@ -3,7 +3,7 @@ name = "mockplex"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Mock plex.tv + Plex Media Server for exercising PlexDio without real credentials"
+description = "Mock plex.tv + Plex Media Server for exercising Plexdio without real credentials"
 
 [lib]
 path = "src/lib.rs"

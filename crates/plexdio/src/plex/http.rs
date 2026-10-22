@@ -23,12 +23,12 @@ impl ClientInfo {
     pub fn new(client_id: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
-            product: "PlexDio".into(),
+            product: "Plexdio".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             platform: "Windows".into(),
             device_name: std::env::var("COMPUTERNAME")
                 .or_else(|_| std::env::var("HOSTNAME"))
-                .unwrap_or_else(|_| "PlexDio PC".into()),
+                .unwrap_or_else(|_| "Plexdio PC".into()),
         }
     }
 
@@ -71,7 +71,7 @@ fn build_agent(timeout: Duration, insecure: bool) -> Agent {
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .tls_config(tls)
-        .user_agent(concat!("PlexDio/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Plexdio/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
 }

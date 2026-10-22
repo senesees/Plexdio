@@ -231,7 +231,7 @@ impl PmsClient {
         format!(
             "{}/music/:/transcode/universal/start.mp3?path={path}&mediaIndex=0&partIndex=0&protocol=http\
              &directPlay=0&directStream=0&musicBitrate={max_kbps}&maxAudioBitrate={max_kbps}\
-             &session={}&X-Plex-Client-Identifier={}&X-Plex-Product=PlexDio&X-Plex-Platform=Windows&X-Plex-Token={}",
+             &session={}&X-Plex-Client-Identifier={}&X-Plex-Product=Plexdio&X-Plex-Platform=Windows&X-Plex-Token={}",
             self.conn.uri,
             urlencoding::encode(session),
             urlencoding::encode(client_id),
