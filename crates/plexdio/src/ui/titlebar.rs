@@ -46,7 +46,7 @@ pub fn show(ui: &mut egui::Ui, title: &str, can_maximize: bool) -> TitleAction {
             let grab = Rect::from_min_max(drag_rect.min + egui::vec2(inset, inset), drag_rect.max);
 
             // Drag area first, so the buttons placed on top of it win the hover.
-            let drag = ui.interact(grab, ui.id().with("title_drag"), Sense::click_and_drag());
+            let drag = ui.interact(grab, ui.scope_id().with("title_drag"), Sense::click_and_drag());
             if can_maximize && drag.double_clicked() {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Maximized(!maximized));
             } else if drag.drag_started_by(egui::PointerButton::Primary) {
@@ -83,7 +83,7 @@ pub fn show(ui: &mut egui::Ui, title: &str, can_maximize: bool) -> TitleAction {
             let mut button = |ui: &mut egui::Ui, glyph: Glyph, tip: &str| -> bool {
                 x -= BUTTON_W;
                 let r = Rect::from_min_size(egui::pos2(x, bar.top()), egui::vec2(BUTTON_W, bar.height()));
-                let resp = ui.interact(r, ui.id().with(("title_btn", tip)), Sense::click()).on_hover_text(tip);
+                let resp = ui.interact(r, ui.scope_id().with(("title_btn", tip)), Sense::click()).on_hover_text(tip);
                 let hovered = resp.hovered();
                 if hovered {
                     let fill = if glyph == Glyph::Close { CLOSE_HOVER } else { theme::CARD_HOVER };
