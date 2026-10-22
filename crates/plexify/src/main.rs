@@ -34,6 +34,8 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_title("Plexify")
             .with_app_id("Plexify")
+            // The app draws its own themed title bar (ui/titlebar.rs).
+            .with_decorations(false)
             .with_inner_size(size)
             .with_min_inner_size([760.0, 480.0])
             .with_icon(load_icon())

@@ -28,7 +28,7 @@ use super::icons::{self, Icon};
 use super::runner::WindowCmd;
 use crate::win::smtc::{NowPlaying, Smtc, SmtcButton, SmtcEvents};
 use crate::win::tray::{TrayEvent, TrayHandle};
-use super::views::common::{fmt_duration, LibTab, RadioSeed, Route, UiAction, ViewCtx};
+use super::views::common::{fmt_duration, LibTab, RadioSeed, RadioStation, Route, UiAction, ViewCtx};
 use super::views::library::BrowseState;
 use super::views::search::SearchState;
 use super::jobs::Jobs;
@@ -245,6 +245,8 @@ pub struct PlexifyApp {
     mixes_dirty: bool,
     /// Sonic-similarity lookup in flight for a new radio station or autoplay.
     radio_job: Option<RadioJob>,
+    /// The station the user started last, shown on the Radio page.
+    radio_station: Option<RadioStation>,
     /// Last track the engine actually played (the seed for autoplay).
     last_playing: Option<Id>,
     /// Set when a station was enqueued behind a finished queue. The engine reports its first
@@ -328,6 +330,7 @@ impl PlexifyApp {
             mixes: Mixes::default(),
             mixes_dirty: true,
             radio_job: None,
+            radio_station: None,
             last_playing: None,
             wake_poll: None,
             mini: false,
@@ -403,6 +406,7 @@ impl PlexifyApp {
         self.report_base = None;
         self.mixes = Mixes::default();
         self.radio_job = None;
+        self.radio_station = None;
         self.wake_poll = None;
         Session::clear();
         self.saved_session = Session::default();
@@ -1216,6 +1220,15 @@ impl PlexifyApp {
                 }
             }
         };
+        // Open the station page right away; its tracks fill in when the lookup finishes.
+        let (name, thumb, round) = match &seed {
+            RadioSeed::Track(id) => lib.track(*id).map(|t| (t.title.to_string(), t.thumb.as_deref().map(str::to_string), false)),
+            RadioSeed::Album(id) => lib.album(*id).map(|a| (a.title.to_string(), a.thumb.as_deref().map(str::to_string), false)),
+            RadioSeed::Artist(id) => lib.artist(*id).map(|a| (a.title.to_string(), a.thumb.as_deref().map(str::to_string), true)),
+        }
+        .unwrap_or_default();
+        self.radio_station = Some(RadioStation { name, thumb, round, ids: Vec::new(), loading: true });
+        self.navigate(Route::Radio);
         self.start_station(seed_id, base, RadioMode::Play);
     }
 
@@ -1251,6 +1264,12 @@ impl PlexifyApp {
         let rest = radio::station(lib, seed, &from_server, &exclude, radio::STATION_LEN, radio_salt());
         let mut ids = base;
         ids.extend(rest);
+        if mode == RadioMode::Play {
+            if let Some(st) = self.radio_station.as_mut() {
+                st.ids = ids.clone();
+                st.loading = false;
+            }
+        }
         if ids.is_empty() {
             self.banner = Some(("No tracks available for this station.".into(), true));
             return;
@@ -1955,7 +1974,7 @@ impl PlexifyApp {
             return;
         }
         if !self.history.is_empty()
-            && matches!(self.route, Route::Artist(_) | Route::Album(_) | Route::Playlist(_) | Route::Genre(_))
+            && matches!(self.route, Route::Artist(_) | Route::Album(_) | Route::Playlist(_) | Route::Genre(_) | Route::Radio)
             && icons::button(ui, Icon::Back, 26.0, false).on_hover_text("Back").clicked()
         {
             self.back();
@@ -1996,6 +2015,7 @@ impl PlexifyApp {
                 Route::Artist(id) => detail::artist_view(ui, &mut vc, *id),
                 Route::Playlist(id) => detail::playlist_view(ui, &mut vc, *id),
                 Route::Genre(g) => detail::genre_view(ui, &mut vc, g),
+                Route::Radio => detail::radio_view(ui, &mut vc, self.radio_station.as_ref()),
                 Route::Search => search::search_view(ui, &mut vc, &mut self.search, self.library_ver),
                 Route::Settings => {}
             }
@@ -2222,6 +2242,8 @@ fn route_category(r: &Route) -> u8 {
         Route::Library(_) | Route::Artist(_) | Route::Album(_) | Route::Genre(_) => 2,
         Route::Playlists | Route::Playlist(_) => 3,
         Route::Settings => 4,
+        // Not a sidebar entry; nothing is highlighted.
+        Route::Radio => 5,
     }
 }
 
@@ -2296,6 +2318,13 @@ impl UiApp for PlexifyApp {
         if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1)) {
             self.back();
         }
+        let title = self.window_title.clone();
+        // Same rules as the native close button: hide to the tray (sets `hide_window`) or quit.
+        if super::titlebar::show(ui, &title, !self.mini) == super::titlebar::TitleAction::Close
+            && self.on_close_requested(&ui.ctx().clone())
+        {
+            self.quitting = true;
+        }
         match self.screen.clone() {
             Screen::Busy(text) => super::views::login::busy_screen(ui, &text),
             Screen::Login => self.login_screen(ui),
@@ -2326,6 +2355,9 @@ impl UiApp for PlexifyApp {
                     .show(ui, |ui| self.content(ui));
                 self.maybe_search_server(ui.ctx().input(|i| i.time));
             }
+        }
+        if !self.mini {
+            super::titlebar::resize_edges(ui);
         }
     }
 
@@ -2375,7 +2407,8 @@ impl UiApp for PlexifyApp {
             if self.mini {
                 cmds.push(WindowCmd::Resizable(false));
                 cmds.push(WindowCmd::AlwaysOnTop(true));
-                cmds.push(WindowCmd::Size(420, 150));
+                // Room for the mini layout plus the custom title bar.
+                cmds.push(WindowCmd::Size(420, 150 + super::titlebar::HEIGHT as u32));
             } else {
                 let [w, h] = self.config.window_size.unwrap_or([1180.0, 760.0]);
                 cmds.push(WindowCmd::AlwaysOnTop(false));

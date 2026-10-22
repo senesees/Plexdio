@@ -264,9 +264,23 @@ mod cpal_sink {
                         data.fill(T::EQUILIBRIUM);
                         return;
                     }
+                    // The ring holds interleaved stereo; map each L/R pair onto the device layout
+                    // (mono gets the average, extra channels beyond the first two stay silent).
                     for frame in data.chunks_mut(channels) {
-                        for sample in frame.iter_mut() {
-                            let v = consumer.pop().map(|s| s * volume).unwrap_or(0.0);
+                        let (l, r) = if consumer.slots() >= 2 {
+                            let l = consumer.pop().unwrap_or(0.0);
+                            let r = consumer.pop().unwrap_or(0.0);
+                            (l * volume, r * volume)
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        for (i, sample) in frame.iter_mut().enumerate() {
+                            let v = match (channels, i) {
+                                (1, _) => (l + r) * 0.5,
+                                (_, 0) => l,
+                                (_, 1) => r,
+                                _ => 0.0,
+                            };
                             *sample = T::from_sample(v);
                         }
                     }
@@ -295,25 +309,32 @@ mod cpal_sink {
         }
 
         fn push(&mut self, samples: &[f32]) -> usize {
-            if self.shared.flush.load(Ordering::Relaxed) {
-                // The callback has not drained the old audio yet.
+            // The callback has not drained the old audio yet. Wait for it (one device period,
+            // a few ms) so the start of the new audio is not dropped.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while self.shared.flush.load(Ordering::Relaxed) {
+                if std::time::Instant::now() >= deadline {
+                    return 0;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Commit whole frames in one chunk so the callback never sees half a frame.
+            let n = (samples.len().min(self.producer.slots())) / 2 * 2;
+            if n == 0 {
                 return 0;
             }
-            let mut written = 0;
-            for s in samples {
-                if self.producer.push(*s).is_err() {
-                    break;
-                }
-                written += 1;
+            match self.producer.write_chunk_uninit(n) {
+                Ok(chunk) => chunk.fill_from_iter(samples[..n].iter().copied()) / 2,
+                Err(_) => 0,
             }
-            written / 2
         }
 
         fn buffered_frames(&self) -> usize {
             if self.shared.flush.load(Ordering::Relaxed) {
                 return 0;
             }
-            self.producer.slots() / 2
+            // `slots()` is the *free* space; what is queued is the rest of the ring.
+            (self.producer.buffer().capacity() - self.producer.slots()) / 2
         }
 
         fn pause(&mut self) {

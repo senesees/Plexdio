@@ -5,4 +5,5 @@ pub mod icons;
 pub mod jobs;
 pub mod runner;
 pub mod theme;
+pub mod titlebar;
 pub mod views;

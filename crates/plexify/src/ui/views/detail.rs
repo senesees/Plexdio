@@ -123,6 +123,46 @@ pub fn playlist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
     track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true }, "playlist-tracks");
 }
 
+pub fn radio_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, station: Option<&RadioStation>) {
+    let Some(st) = station else {
+        ui.label(RichText::new("No radio station yet. Start one from a track, album or artist.").color(theme::TEXT_DIM));
+        return;
+    };
+    let lib = ctx.lib;
+    let ids: Vec<Id> = st.ids.iter().copied().filter(|t| lib.track(*t).is_some()).collect();
+    let total: u64 = ids.iter().filter_map(|t| lib.track(*t)).map(|t| t.duration_ms as u64).sum();
+    // "With A, B and C" from the first distinct artists, like Spotify's radio header.
+    let mut artists: Vec<&str> = Vec::new();
+    for t in ids.iter().filter_map(|t| lib.track(*t)) {
+        let a = t.display_artist();
+        if !artists.contains(&a) {
+            artists.push(a);
+            if artists.len() == 3 {
+                break;
+            }
+        }
+    }
+    let with = match artists.as_slice() {
+        [] => String::new(),
+        [a] => format!("With {a} · "),
+        [a, b] => format!("With {a} and {b} · "),
+        [a, b, c, ..] => format!("With {a}, {b}, {c} and more · "),
+    };
+    let sub = if st.loading { "Finding similar tracks…".to_string() } else { format!("{with}{} tracks · {}", ids.len(), fmt_long_duration(total)) };
+    let title = format!("{} Radio", st.name);
+    hero(ui, ctx, Hero { thumb: st.thumb.as_deref(), seed: &st.name, round: st.round, kind: "RADIO", title: &title, sub: &sub });
+    if st.loading {
+        ui.horizontal(|ui| {
+            theme::spinner(ui, 16.0);
+            ui.label(RichText::new("Building your station…").color(theme::TEXT_DIM));
+        });
+        return;
+    }
+    play_buttons(ui, ctx, &ids, None);
+    ui.add_space(8.0);
+    track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true }, "radio-tracks");
+}
+
 pub fn genre_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, genre: &Arc<str>) {
     let lib = ctx.lib;
     let albums: Vec<usize> = (0..lib.albums.len()).filter(|&i| lib.albums[i].genre.as_deref() == Some(&**genre)).collect();

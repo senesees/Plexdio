@@ -26,7 +26,23 @@ pub enum Route {
     Album(Id),
     Playlist(Id),
     Genre(Arc<str>),
+    /// The station started last (kept in [`RadioStation`] on the app).
+    Radio,
     Settings,
+}
+
+/// A started radio station, shown as its own page (like Spotify's radio playlists).
+#[derive(Debug, Clone, Default)]
+pub struct RadioStation {
+    /// Name of the seed (track, album or artist title).
+    pub name: String,
+    pub thumb: Option<String>,
+    /// Round art for artist seeds.
+    pub round: bool,
+    /// Station tracks in play order; empty while `loading`.
+    pub ids: Vec<Id>,
+    /// The similar-tracks lookup is still running.
+    pub loading: bool,
 }
 
 /// Where a radio station starts from.
