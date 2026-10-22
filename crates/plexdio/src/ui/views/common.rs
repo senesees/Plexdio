@@ -198,18 +198,24 @@ pub fn track_row(ui: &mut egui::Ui, ctx: &mut ViewCtx, ids: &[Id], opts: TableOp
     let Some(t) = ctx.lib.track(id) else { return };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), Sense::click());
     let playing = ctx.now_playing == Some(id);
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 6.0, theme::CARD_HOVER);
-    }
     let w = rect.width();
     let mut x = rect.left() + 10.0;
     let cy = rect.center().y;
+    // The hover play icon is a single-click button (Spotify style); double-clicking the row
+    // still plays too. It sits on top of the row, so hovering it keeps the row highlighted.
+    let icon_rect = Rect::from_center_size(egui::pos2(x + 12.0, cy), egui::vec2(16.0, 16.0));
+    let play = (!playing).then(|| ui.interact(icon_rect.expand(8.0), resp.id.with("play"), Sense::click()));
+    let play_hovered = play.as_ref().is_some_and(|p| p.hovered());
+    let hovered = resp.hovered() || play_hovered;
+    if hovered {
+        ui.painter().rect_filled(rect, 6.0, theme::CARD_HOVER);
+    }
     // Number / playing marker.
     let num = if opts.track_numbers { t.index as usize } else { row + 1 };
     if playing {
-        icons::paint(ui.painter(), Rect::from_center_size(egui::pos2(x + 12.0, cy), egui::vec2(16.0, 16.0)), Icon::Volume, theme::ACCENT);
-    } else if resp.hovered() {
-        icons::paint(ui.painter(), Rect::from_center_size(egui::pos2(x + 12.0, cy), egui::vec2(16.0, 16.0)), Icon::Play, theme::TEXT);
+        icons::paint(ui.painter(), icon_rect, Icon::Volume, theme::ACCENT);
+    } else if hovered {
+        icons::paint(ui.painter(), icon_rect, Icon::Play, if play_hovered { theme::ACCENT } else { theme::TEXT });
     } else {
         ui.painter().text(egui::pos2(x + 24.0, cy), Align2::RIGHT_CENTER, num.to_string(), FontId::proportional(13.0), theme::TEXT_DIM);
     }
@@ -244,7 +250,8 @@ pub fn track_row(ui: &mut egui::Ui, ctx: &mut ViewCtx, ids: &[Id], opts: TableOp
         FontId::proportional(13.0),
         theme::TEXT_DIM,
     );
-    if resp.double_clicked() {
+    let play_clicked = play.is_some_and(|p| p.on_hover_text("Play").on_hover_cursor(egui::CursorIcon::PointingHand).clicked());
+    if play_clicked || resp.double_clicked() {
         ctx.actions.push(UiAction::Play(ids.to_vec(), row));
     }
     resp.context_menu(|ui| track_menu(ui, ctx, id, ids, row));
