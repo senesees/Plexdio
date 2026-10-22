@@ -53,6 +53,8 @@ pub struct Config {
     pub minimize_to_tray: bool,
     pub close_to_tray: bool,
     pub start_with_windows: bool,
+    /// Show the playing track on Discord (Rich Presence). Off by default: it shares activity.
+    pub discord_presence: bool,
     pub window_size: Option<[f32; 2]>,
 }
 
@@ -78,6 +80,7 @@ impl Default for Config {
             minimize_to_tray: false,
             close_to_tray: false,
             start_with_windows: false,
+            discord_presence: false,
             window_size: None,
         }
     }

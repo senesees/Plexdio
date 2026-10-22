@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod cache;
 pub mod config;
+pub mod discord;
 pub mod library_model;
 pub mod logging;
 pub mod paths;

@@ -268,6 +268,10 @@ pub struct PlexDioApp {
     tray: Option<TrayHandle>,
     /// Windows media overlay (SMTC); absent when the OS does not offer it.
     smtc: Option<Smtc>,
+    /// Discord Rich Presence worker, running while the setting is on.
+    discord: Option<crate::discord::DiscordPresence>,
+    /// Last presence sent: (track id, start time in unix ms); `None` when cleared.
+    discord_last: Option<(i64, i64)>,
     /// Buttons pressed on the media overlay, delivered on the next frame.
     smtc_events: SmtcEvents,
     /// A quit was requested from the tray menu.
@@ -347,6 +351,8 @@ impl PlexDioApp {
             mini_geometry: false,
             tray: None,
             smtc: None,
+            discord: None,
+            discord_last: None,
             smtc_events: SmtcEvents::default(),
             quitting: false,
             window_title: String::new(),
@@ -2142,6 +2148,62 @@ impl PlexDioApp {
         }
     }
 
+    /// Keep the Discord status in step with playback (setting on, a track playing). Paused or
+    /// stopped clears it, like Spotify. Sends only on a new track, play/pause, or a seek.
+    fn update_discord(&mut self) {
+        let client = if self.config.discord_presence { crate::discord::client_id() } else { None };
+        match (&self.discord, client) {
+            (None, Some(id)) => {
+                self.discord = crate::discord::DiscordPresence::start(id);
+                self.discord_last = None;
+            }
+            (Some(_), None) => {
+                // Dropping the worker clears the status.
+                self.discord = None;
+                self.discord_last = None;
+            }
+            _ => {}
+        }
+        let Some(discord) = &self.discord else { return };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let st = &self.playback;
+        let wanted = match (&st.track, st.state) {
+            (Some(t), PlayState::Playing) => {
+                let start_ms = now_ms - st.position_ms as i64;
+                let duration = t.duration_ms.max(st.duration_ms) as i64;
+                Some((t, start_ms, (duration > 0).then_some(start_ms + duration)))
+            }
+            _ => None,
+        };
+        let changed = match (&wanted, self.discord_last) {
+            (None, None) => false,
+            (Some((t, start, _)), Some((id, last_start))) => t.id != id || (start - last_start).abs() > 2_000,
+            _ => true,
+        };
+        if !changed {
+            return;
+        }
+        match wanted {
+            Some((t, start_ms, end_ms)) => {
+                discord.set(Some(crate::discord::Presence {
+                    title: t.title.clone(),
+                    artist: t.artist.clone(),
+                    album: t.album.clone(),
+                    start_ms,
+                    end_ms,
+                }));
+                self.discord_last = Some((t.id, start_ms));
+            }
+            None => {
+                discord.set(None);
+                self.discord_last = None;
+            }
+        }
+    }
+
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
         ui.add_space(10.0);
@@ -2190,6 +2252,19 @@ impl PlexDioApp {
                 if ui.checkbox(&mut autoplay, "Autoplay similar tracks when the queue ends").changed() {
                     self.config.autoplay = autoplay;
                     changed = true;
+                }
+                let discord_ok = crate::discord::client_id().is_some();
+                let mut discord = self.config.discord_presence;
+                if ui
+                    .add_enabled(discord_ok, egui::Checkbox::new(&mut discord, "Show what I'm listening to on Discord"))
+                    .on_hover_text("Discord Rich Presence: your Discord status shows the current song while it plays")
+                    .changed()
+                {
+                    self.config.discord_presence = discord;
+                    changed = true;
+                }
+                if !discord_ok {
+                    ui.label(RichText::new("Discord status needs a Discord application ID in this build.").small().color(theme::TEXT_DIM));
                 }
             });
 
@@ -2505,6 +2580,7 @@ impl UiApp for PlexDioApp {
         self.save_window_size();
         self.tray = None; // removes the icon and stops the tray thread
         self.smtc = None; // releases the media overlay session
+        self.discord = None; // clears the Discord status
     }
 
     /// Keep the window title in step with playback, handle tray/media-key events, and tell the
@@ -2574,6 +2650,7 @@ impl UiApp for PlexDioApp {
                 }),
             }
         }
+        self.update_discord();
         let title = match (&self.playback.track, self.playback.state) {
             (Some(t), PlayState::Playing | PlayState::Paused) => format!("{} — {} · PlexDio", t.title, t.artist),
             _ => "PlexDio".to_string(),
