@@ -5,12 +5,14 @@ use crate::cache::db::{self as cachedb, LibraryDb};
 use crate::cache::sync::{sync_library, SyncProgress, SyncReport};
 use crate::audio::engine::{Engine, EngineConfig, PlayState, PlaybackStatus, TrackSpec};
 use crate::audio::source::{AudioCache, SourceSpec};
-use crate::config::Config;
+use crate::config::{Config, RepeatMode};
 use crate::library_model::LibraryModel;
 use crate::plex::auth::PlexTv;
 use crate::plex::models::{Directory, Hub, Pin, PlexUser, Resource};
 use crate::plex::resources::{pick_best, ServerConnection};
-use crate::plex::server::PmsClient;
+use crate::player::report::{Reporter, ReportState};
+use crate::player::session::Session;
+use crate::plex::server::{PlayState as ServerPlayState, PmsClient};
 use crate::plex::{ClientInfo, Http, PlexError};
 use crate::secure_store::SecretStore;
 use egui::{Align, Layout, RichText};
@@ -109,6 +111,18 @@ enum BarCmd {
     Seek(u64),
     Volume(f32),
     Mute(bool),
+    Shuffle(bool),
+    Repeat,
+    Queue,
+    Rate(u8),
+}
+
+#[derive(Debug)]
+enum QueueCmd {
+    Remove(usize),
+    Move(usize, usize),
+    ClearUpcoming,
+    Close,
 }
 
 /// File extension for a codec name, used as the decoder hint and cache suffix.
@@ -177,6 +191,22 @@ pub struct PlexifyApp {
     pub engine: Option<Engine>,
     /// Last status polled from the engine.
     pub playback: PlaybackStatus,
+    /// Turns engine status into `/:/timeline` and `/:/scrobble` calls.
+    pub report: ReportState,
+    pub reporter: Option<Reporter>,
+    /// Base URL of the server the reporter belongs to.
+    pub report_base: Option<String>,
+    /// Last session written to disk (lets us skip unchanged writes).
+    pub saved_session: Session,
+    pub last_session_save: std::time::Instant,
+    /// The saved queue has been restored already (once per run).
+    pub restored: bool,
+    /// Last track recorded in the local play history.
+    pub last_played_id: Option<i64>,
+    /// Whether the queue side panel is open.
+    pub queue_open: bool,
+    /// Play-order position of the queue row being dragged.
+    pub queue_drag: Option<usize>,
 }
 
 impl PlexifyApp {
@@ -224,6 +254,15 @@ impl PlexifyApp {
             server_label: String::new(),
             engine: None,
             playback: PlaybackStatus::default(),
+            report: ReportState::default(),
+            reporter: None,
+            report_base: None,
+            saved_session: Session::load().unwrap_or_default(),
+            last_session_save: std::time::Instant::now(),
+            restored: false,
+            last_played_id: None,
+            queue_open: false,
+            queue_drag: None,
         };
         app.token = app.store.get();
         if app.token.is_some() {
@@ -284,6 +323,10 @@ impl PlexifyApp {
         self.search = SearchState::default();
         self.offline = false;
         self.selected_server = None;
+        self.reporter = None;
+        self.report_base = None;
+        Session::clear();
+        self.saved_session = Session::default();
         self.config.last_server_id = None;
         self.config.last_section_key = None;
         self.config.last_connection_uri = None;
@@ -657,6 +700,7 @@ impl PlexifyApp {
                 if first_load && !self.offline {
                     self.start_sync(false);
                 }
+                self.maybe_restore_session();
             }
             Msg::SearchHubs(seq, gen, query, res) => {
                 if seq != self.search.server_seq {
@@ -837,8 +881,25 @@ impl PlexifyApp {
                 }
                 self.play_ids(&ids, 0);
             }
-            UiAction::PlayNext(_) | UiAction::AddToQueue(_) => {
-                self.banner = Some(("Queue editing arrives with the queue panel.".into(), false));
+            UiAction::PlayNext(ids) => {
+                let specs = self.queue_specs(&ids);
+                if specs.is_empty() {
+                    return;
+                }
+                let n = specs.len();
+                self.ensure_engine().insert_next(specs);
+                self.banner = Some((format!("Added {n} {} to play next.", if n == 1 { "track" } else { "tracks" }), false));
+                self.poll_playback();
+            }
+            UiAction::AddToQueue(ids) => {
+                let specs = self.queue_specs(&ids);
+                if specs.is_empty() {
+                    return;
+                }
+                let n = specs.len();
+                self.ensure_engine().enqueue(specs);
+                self.banner = Some((format!("Added {n} {} to the queue.", if n == 1 { "track" } else { "tracks" }), false));
+                self.poll_playback();
             }
             UiAction::Radio(seed) => {
                 self.banner = Some((format!("Radio from {seed:?} is not available yet."), false));
@@ -863,6 +924,19 @@ impl PlexifyApp {
         self.poll_playback();
     }
 
+    /// Specs for queue edits: like [`Self::track_specs`] but reports why nothing could be queued.
+    fn queue_specs(&mut self, ids: &[crate::library_model::Id]) -> Vec<TrackSpec> {
+        if self.pms.is_none() {
+            self.banner = Some(("Connect to your server to queue music.".into(), true));
+            return Vec::new();
+        }
+        let specs = self.track_specs(ids);
+        if specs.is_empty() {
+            self.banner = Some(("These tracks have no playable audio.".into(), true));
+        }
+        specs
+    }
+
     /// Create the engine on first use. Doing it lazily keeps startup free of audio-device work.
     fn ensure_engine(&mut self) -> &Engine {
         if self.engine.is_none() {
@@ -879,7 +953,10 @@ impl PlexifyApp {
                 normalization: self.config.normalization,
             };
             log::info!("starting playback engine (crossfade {} ms, normalization {})", cfg.crossfade_ms, cfg.normalization);
-            self.engine = Some(Engine::start(cache, self.http.clone(), cfg));
+            let eng = Engine::start(cache, self.http.clone(), cfg);
+            eng.set_shuffle(self.config.shuffle);
+            eng.set_repeat(self.config.repeat);
+            self.engine = Some(eng);
         }
         self.engine.as_ref().expect("engine just created")
     }
@@ -918,6 +995,8 @@ impl PlexifyApp {
                 duration_ms: t.duration_ms as u64,
                 gain_db: t.gain,
                 album_gain_db: t.album_gain,
+                // Smart shuffle favours well-rated and often-played tracks.
+                weight: 1.0 + t.user_rating * 0.15 + (t.view_count as f32).ln_1p() * 0.6,
                 source,
             });
         }
@@ -925,15 +1004,147 @@ impl PlexifyApp {
     }
 
     fn poll_playback(&mut self) {
-        if let Some(e) = &self.engine {
-            let st = e.status();
-            if st.error.is_some() && st.error != self.playback.error {
-                if let Some(msg) = st.error.clone() {
-                    self.banner = Some((msg, true));
-                }
+        let Some(e) = &self.engine else { return };
+        let st = e.status();
+        if st.error.is_some() && st.error != self.playback.error {
+            if let Some(msg) = st.error.clone() {
+                self.banner = Some((msg, true));
             }
-            self.playback = st;
         }
+        self.playback = st;
+        self.report_playback();
+        self.maybe_save_session(false);
+    }
+
+    /// Report progress to the server and count plays locally. Called after every status poll.
+    fn report_playback(&mut self) {
+        let (state, track, duration, position, playing) = {
+            let st = &self.playback;
+            let state = match st.state {
+                PlayState::Playing => ServerPlayState::Playing,
+                PlayState::Paused => ServerPlayState::Paused,
+                PlayState::Idle => ServerPlayState::Stopped,
+            };
+            let track = st.track.as_ref().map(|t| t.id);
+            let duration = st.duration_ms.max(st.track.as_ref().map_or(0, |t| t.duration_ms));
+            (state, track, duration, st.position_ms, st.state == PlayState::Playing)
+        };
+        let actions = self.report.observe(track, state, position, duration);
+        if !actions.is_empty() {
+            self.ensure_reporter();
+            if let Some(r) = &self.reporter {
+                r.apply(&actions);
+            }
+        }
+        // Local play history (Most played mixes and shuffle weights read this).
+        if playing && track != self.last_played_id {
+            self.last_played_id = track;
+            if let (Some(id), Some(path)) = (track, self.db_path.clone()) {
+                let at = crate::logging::unix_now();
+                std::thread::spawn(move || {
+                    if let Ok(db) = LibraryDb::open(&path) {
+                        if let Err(e) = db.record_play(id, at) {
+                            log::debug!("could not record play: {e}");
+                        }
+                    }
+                });
+            }
+        }
+        if track.is_none() {
+            self.last_played_id = None;
+        }
+    }
+
+    /// (Re)create the reporting thread when the server it talks to changes.
+    fn ensure_reporter(&mut self) {
+        let Some(pms) = self.pms.clone() else { return };
+        let base = pms.base().to_string();
+        if self.reporter.is_some() && self.report_base.as_deref() == Some(base.as_str()) {
+            return;
+        }
+        self.reporter = Some(Reporter::start(pms));
+        self.report_base = Some(base);
+    }
+
+    /// Persist queue, slot, position and shuffle/repeat so a restart resumes in place.
+    fn maybe_save_session(&mut self, force: bool) {
+        if self.engine.is_none() {
+            return;
+        }
+        let st = &self.playback;
+        if st.queue.is_empty() {
+            return;
+        }
+        if !force && self.last_session_save.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        let mut pairs: Vec<(usize, i64)> = st.queue.iter().map(|e| (e.index, e.info.id)).collect();
+        pairs.sort_by_key(|p| p.0);
+        let sess = Session {
+            queue: pairs.into_iter().map(|p| p.1).collect(),
+            index: st.index,
+            position_ms: st.position_ms,
+            shuffle: st.shuffle,
+            repeat: st.repeat,
+        };
+        if !force && sess == self.saved_session {
+            return;
+        }
+        // Don't rewrite the file for a position-only change of a second or two.
+        if !force
+            && sess.queue == self.saved_session.queue
+            && sess.index == self.saved_session.index
+            && sess.shuffle == self.saved_session.shuffle
+            && sess.repeat == self.saved_session.repeat
+            && sess.position_ms.abs_diff(self.saved_session.position_ms) < 2_000
+        {
+            return;
+        }
+        if let Err(e) = sess.save() {
+            log::debug!("could not save the session: {e}");
+        }
+        self.saved_session = sess;
+        self.last_session_save = std::time::Instant::now();
+    }
+
+    /// Restore the queue saved by the previous run, paused at its old position.
+    fn maybe_restore_session(&mut self) {
+        if self.restored || self.offline || self.pms.is_none() {
+            return;
+        }
+        self.restored = true;
+        let Some(sess) = Session::load() else { return };
+        if sess.queue.is_empty() || self.library.is_none() {
+            return;
+        }
+        let lib = self.library.as_ref().expect("checked above");
+        let mut ids = Vec::with_capacity(sess.queue.len());
+        let mut index = 0usize;
+        for (i, id) in sess.queue.iter().enumerate() {
+            if lib.track(*id).is_some() {
+                if i <= sess.index {
+                    index = ids.len();
+                }
+                ids.push(*id);
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let specs = self.track_specs(&ids);
+        if specs.is_empty() {
+            return;
+        }
+        let index = index.min(specs.len() - 1);
+        log::info!("restoring session: {} tracks at slot {} ({})", specs.len(), index, sess.position_ms);
+        self.config.shuffle = sess.shuffle;
+        self.config.repeat = sess.repeat;
+        let eng = self.ensure_engine();
+        eng.set_shuffle(sess.shuffle);
+        eng.set_repeat(sess.repeat);
+        eng.restore(specs, index, sess.position_ms);
+        self.saved_session = sess;
+        self.poll_playback();
     }
 
     /// Rate a track locally (cache + model) and on the server.
@@ -1026,7 +1237,14 @@ impl PlexifyApp {
                 },
             );
 
-            ui.add_space(16.0);
+            ui.add_space(12.0);
+            if icons::button(ui, Icon::Shuffle, 18.0, st.shuffle)
+                .on_hover_text(if st.shuffle { "Shuffle is on" } else { "Shuffle the queue" })
+                .clicked()
+            {
+                cmds.push(BarCmd::Shuffle(!st.shuffle));
+            }
+            ui.add_space(4.0);
             if icons::button(ui, Icon::Prev, 18.0, false).on_hover_text("Previous").clicked() {
                 cmds.push(BarCmd::Prev);
             }
@@ -1039,6 +1257,33 @@ impl PlexifyApp {
             }
             if icons::button(ui, Icon::Next, 18.0, false).on_hover_text("Next").clicked() {
                 cmds.push(BarCmd::Next);
+            }
+            ui.add_space(4.0);
+            let (repeat_icon, repeat_hint) = match st.repeat {
+                RepeatMode::Off => (Icon::Repeat, "Repeat off"),
+                RepeatMode::All => (Icon::Repeat, "Repeat all"),
+                RepeatMode::One => (Icon::RepeatOne, "Repeat one"),
+            };
+            if icons::button(ui, repeat_icon, 18.0, st.repeat != RepeatMode::Off)
+                .on_hover_text(repeat_hint)
+                .clicked()
+            {
+                cmds.push(BarCmd::Repeat);
+            }
+            ui.add_space(8.0);
+            // Star rating of the current track (Plex ratings are 2 points per star).
+            let rating = self.library.as_ref().and_then(|l| l.track(track.id)).map_or(0u8, |t| (t.user_rating.clamp(0.0, 10.0)).round() as u8);
+            for star in 1..=5u8 {
+                let filled = rating >= star * 2;
+                let resp = icons::button(ui, if filled { Icon::StarFilled } else { Icon::Star }, 14.0, filled)
+                    .on_hover_text(format!("{star} star{}", if star == 1 { "" } else { "s" }));
+                if resp.clicked() {
+                    cmds.push(BarCmd::Rate(if rating == star * 2 { 0 } else { star * 2 }));
+                }
+            }
+            ui.add_space(8.0);
+            if icons::button(ui, Icon::Queue, 18.0, self.queue_open).on_hover_text("Queue").clicked() {
+                cmds.push(BarCmd::Queue);
             }
 
             ui.add_space(16.0);
@@ -1079,6 +1324,7 @@ impl PlexifyApp {
         });
 
         let mut save = false;
+        let mut rate = None;
         if let Some(eng) = &self.engine {
             for c in cmds {
                 log::info!("transport: {:?}", c);
@@ -1101,8 +1347,27 @@ impl PlexifyApp {
                         self.config.muted = m;
                         save = true;
                     }
+                    BarCmd::Shuffle(on) => {
+                        eng.set_shuffle(on);
+                        self.config.shuffle = on;
+                        save = true;
+                    }
+                    BarCmd::Repeat => {
+                        let mode = st.repeat.cycle();
+                        eng.set_repeat(mode);
+                        self.config.repeat = mode;
+                        save = true;
+                    }
+                    BarCmd::Queue => self.queue_open = !self.queue_open,
+                    BarCmd::Rate(r) => {
+                        // Re-borrow after the loop's immutable borrows; deferred below.
+                        rate = Some(r);
+                    }
                 }
             }
+        }
+        if let Some(r) = rate {
+            self.rate_track(track.id, r);
         }
         if save {
             self.save_config();
@@ -1114,6 +1379,147 @@ impl PlexifyApp {
         if st.state == PlayState::Playing {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         }
+    }
+
+    /// The queue side panel: play order, current track, drag to reorder, remove, clear upcoming.
+    fn queue_panel(&mut self, ui: &mut egui::Ui) {
+        let st = self.playback.clone();
+        let mut cmds: Vec<QueueCmd> = Vec::new();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Queue").strong().size(16.0).color(theme::TEXT));
+            ui.label(
+                RichText::new(format!("{} {}", st.queue_len, if st.queue_len == 1 { "track" } else { "tracks" }))
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icons::button(ui, Icon::Close, 16.0, false).on_hover_text("Close the queue").clicked() {
+                    cmds.push(QueueCmd::Close);
+                }
+            });
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let has_upcoming = st.queue.iter().any(|e| !e.current) && st.queue.len() > 1;
+            if ui
+                .add_enabled(
+                    has_upcoming,
+                    egui::Button::new(RichText::new("Clear upcoming").small())
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::new(1.0, theme::CARD_HOVER)),
+                )
+                .clicked()
+            {
+                cmds.push(QueueCmd::ClearUpcoming);
+            }
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        if st.queue.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new("The queue is empty. Play something to fill it.").color(theme::TEXT_DIM));
+        }
+        let mut rows: Vec<(egui::Rect, usize)> = Vec::new();
+        let mut drag_started = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (ord, entry) in st.queue.iter().enumerate() {
+                let width = ui.available_width();
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 44.0), egui::Sense::click_and_drag());
+                rows.push((rect, ord));
+                let dragging_over = self.queue_drag.is_some_and(|from| from != ord)
+                    && ui.ctx().pointer_latest_pos().is_some_and(|p| rect.contains(p));
+                if entry.current {
+                    ui.painter().rect_filled(rect, 6.0, theme::CARD);
+                    let bar = egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + 2.0, rect.top() + 8.0),
+                        egui::vec2(3.0, rect.height() - 16.0),
+                    );
+                    ui.painter().rect_filled(bar, 1.5, theme::ACCENT);
+                } else if dragging_over {
+                    ui.painter().rect_filled(rect, 6.0, theme::CARD_HOVER);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect, 6.0, theme::CARD);
+                }
+                if resp.drag_started() {
+                    drag_started = Some(ord);
+                }
+                let text_left = rect.left() + 12.0;
+                let clip = egui::Rect::from_min_max(
+                    egui::pos2(text_left, rect.top()),
+                    egui::pos2(rect.right() - 34.0, rect.bottom()),
+                );
+                let p = ui.painter().with_clip_rect(clip);
+                p.text(
+                    egui::pos2(text_left, rect.top() + 7.0),
+                    egui::Align2::LEFT_TOP,
+                    &entry.info.title,
+                    egui::FontId::proportional(13.5),
+                    if entry.current { theme::ACCENT } else { theme::TEXT },
+                );
+                p.text(
+                    egui::pos2(text_left, rect.top() + 25.0),
+                    egui::Align2::LEFT_TOP,
+                    &entry.info.artist,
+                    egui::FontId::proportional(11.0),
+                    theme::TEXT_DIM,
+                );
+                if !entry.current && self.queue_drag.is_none() {
+                    let del_rect = egui::Rect::from_center_size(
+                        egui::pos2(rect.right() - 16.0, rect.center().y),
+                        egui::vec2(24.0, 24.0),
+                    );
+                    let del = ui.interact(del_rect, ui.scope_id().with(("qdel", ord)), egui::Sense::click());
+                    icons::paint(ui.painter(), del_rect.shrink(7.0), Icon::Close, if del.hovered() { theme::TEXT } else { theme::TEXT_DIM });
+                    if del.clicked() {
+                        cmds.push(QueueCmd::Remove(ord));
+                    }
+                }
+            }
+        });
+        if let Some(from) = drag_started {
+            self.queue_drag = Some(from);
+        }
+        // Finish a drag: find the row under the pointer when the button was released.
+        if self.queue_drag.is_some() && ui.ctx().input(|i| i.pointer.any_released()) {
+            if let (Some(from), Some(pos)) = (self.queue_drag, ui.ctx().pointer_latest_pos()) {
+                if let Some((_, to)) = rows.iter().find(|(r, _)| r.contains(pos)) {
+                    if *to != from {
+                        cmds.push(QueueCmd::Move(from, *to));
+                    }
+                }
+            }
+            self.queue_drag = None;
+        } else if let (Some(_), Some(pos)) = (self.queue_drag, ui.ctx().pointer_latest_pos()) {
+            // Show where the row would land while it is being dragged.
+            let target = rows.iter().find(|(r, _)| r.contains(pos)).map(|(r, _)| *r);
+            if let Some(rect) = target {
+                let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("queue_drag_marker")));
+                p.line_segment(
+                    [egui::pos2(rect.left(), rect.top()), egui::pos2(rect.right(), rect.top())],
+                    egui::Stroke::new(2.0, theme::ACCENT),
+                );
+            }
+        }
+        let Some(eng) = &self.engine else { return };
+        for c in cmds {
+            match c {
+                QueueCmd::Remove(o) => {
+                    log::info!("queue: remove {o}");
+                    eng.remove_at(o);
+                }
+                QueueCmd::Move(from, to) => {
+                    log::info!("queue: move {from} to {to}");
+                    eng.move_in_order(from, to);
+                }
+                QueueCmd::ClearUpcoming => {
+                    log::info!("queue: clear upcoming");
+                    eng.clear_upcoming();
+                }
+                QueueCmd::Close => self.queue_open = false,
+            }
+        }
+        self.poll_playback();
     }
 
     fn content(&mut self, ui: &mut egui::Ui) {
@@ -1304,6 +1710,13 @@ impl UiApp for PlexifyApp {
                     .resizable(false)
                     .frame(egui::Frame::new().fill(theme::SIDEBAR).inner_margin(egui::Margin::symmetric(10, 6)))
                     .show(ui, |ui| self.sidebar(ui));
+                if self.queue_open {
+                    egui::Panel::right("queue_panel")
+                        .exact_size(320.0)
+                        .resizable(false)
+                        .frame(egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(10, 6)))
+                        .show(ui, |ui| self.queue_panel(ui));
+                }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(24, 8)))
                     .show(ui, |ui| self.content(ui));
@@ -1314,5 +1727,7 @@ impl UiApp for PlexifyApp {
 
     fn on_exit(&mut self) {
         self.cancel_login();
+        self.poll_playback();
+        self.maybe_save_session(true);
     }
 }

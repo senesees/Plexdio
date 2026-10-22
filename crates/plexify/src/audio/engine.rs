@@ -8,6 +8,7 @@ use super::decode::TrackDecoder;
 use super::gain::{limit, track_gain};
 use super::sink::{open_default, NullSink, Sink};
 use super::source::{AudioCache, SourceSpec};
+use crate::config::RepeatMode;
 use crate::plex::http::Http;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -36,6 +37,8 @@ pub struct TrackSpec {
     /// Plex `gain` (dB) and `albumGain`; `None` means no loudness data.
     pub gain_db: Option<f32>,
     pub album_gain_db: Option<f32>,
+    /// Relative likelihood of being picked by smart shuffle (rating and play count).
+    pub weight: f32,
     pub source: SourceSpec,
 }
 
@@ -48,15 +51,34 @@ impl TrackSpec {
             SourceSpec::Http { key, .. } => key.rsplit_once('.').map(|(_, ext)| ext),
         }
     }
+
+    fn info(&self) -> TrackInfo {
+        TrackInfo {
+            id: self.id,
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            album: self.album.clone(),
+            duration_ms: self.duration_ms,
+        }
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackInfo {
     pub id: i64,
     pub title: String,
     pub artist: String,
     pub album: String,
     pub duration_ms: u64,
+}
+
+/// One entry of the queue as shown to the UI: the queue slot (`index`) and whether it is the
+/// track playing right now.
+#[derive(Clone, Debug)]
+pub struct QueueEntry {
+    pub index: usize,
+    pub current: bool,
+    pub info: TrackInfo,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +94,11 @@ pub struct PlaybackStatus {
     pub muted: bool,
     pub sink: String,
     pub sink_real: bool,
+    pub shuffle: bool,
+    pub repeat: RepeatMode,
+    /// Queue snapshot in play order, rebuilt only when the queue changes.
+    pub queue: Arc<Vec<QueueEntry>>,
+    pub queue_gen: u64,
     pub error: Option<String>,
 }
 
@@ -88,6 +115,10 @@ impl Default for PlaybackStatus {
             muted: false,
             sink: "—".into(),
             sink_real: false,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            queue: Arc::new(Vec::new()),
+            queue_gen: 0,
             error: None,
         }
     }
@@ -109,6 +140,18 @@ impl Default for EngineConfig {
 
 pub enum Command {
     PlayPlaylist(Vec<TrackSpec>, usize),
+    /// Append tracks to the end of the queue.
+    Enqueue(Vec<TrackSpec>),
+    /// Insert tracks right after the current one.
+    InsertNext(Vec<TrackSpec>),
+    /// Remove the entry at this position of the play order (the current one is never removed).
+    RemoveAt(usize),
+    /// Move an entry within the play order.
+    MoveInOrder(usize, usize),
+    /// Drop everything after the current track.
+    ClearUpcoming,
+    SetShuffle(bool),
+    SetRepeat(RepeatMode),
     PlayPause,
     Pause,
     Resume,
@@ -119,6 +162,8 @@ pub enum Command {
     SetMuted(bool),
     SetCrossfade(u32),
     SetNormalization(bool),
+    /// Replace the queue and load the given queue slot at `position_ms`, paused (session resume).
+    Restore(Vec<TrackSpec>, usize, u64),
     Stop,
     Shutdown,
 }
@@ -150,13 +195,7 @@ impl Active {
     }
 
     fn info(&self) -> TrackInfo {
-        TrackInfo {
-            id: self.spec.id,
-            title: self.spec.title.clone(),
-            artist: self.spec.artist.clone(),
-            album: self.spec.album.clone(),
-            duration_ms: self.spec.duration_ms,
-        }
+        self.spec.info()
     }
 }
 
@@ -181,9 +220,21 @@ pub struct PlayerCore {
     cache: AudioCache,
     http: Http,
     queue: Vec<TrackSpec>,
-    index: usize,
+    /// Play order: a permutation of queue slots. Identity when shuffle is off.
+    order: Vec<usize>,
+    /// Position within `order` of the track playing (or about to play).
+    pos: usize,
+    shuffle: bool,
+    repeat: RepeatMode,
+    rng: Rng,
+    /// Queue cache for the UI; rebuilt only when something changes.
+    snapshot: Arc<Vec<QueueEntry>>,
+    snapshot_gen: u64,
+    snapshot_dirty: bool,
     current: Option<Active>,
+    /// Prefetched next track and the play-order position it belongs to.
     next: Option<Active>,
+    next_pos: Option<usize>,
     prefetch: Option<(usize, Receiver<Result<Active, String>>)>,
     crossfade_ms: u32,
     normalization: bool,
@@ -207,9 +258,17 @@ impl PlayerCore {
             cache,
             http,
             queue: Vec::new(),
-            index: 0,
+            order: Vec::new(),
+            pos: 0,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            rng: Rng(seed()),
+            snapshot: Arc::new(Vec::new()),
+            snapshot_gen: 0,
+            snapshot_dirty: false,
             current: None,
             next: None,
+            next_pos: None,
             prefetch: None,
             crossfade_ms: cfg.crossfade_ms,
             normalization: cfg.normalization,
@@ -237,28 +296,32 @@ impl PlayerCore {
     pub fn handle(&mut self, cmd: Command) {
         match cmd {
             Command::PlayPlaylist(tracks, index) => self.play_playlist(tracks, index),
+            Command::Enqueue(tracks) => self.enqueue(tracks),
+            Command::InsertNext(tracks) => self.insert_next(tracks),
+            Command::RemoveAt(order_pos) => self.remove_at(order_pos),
+            Command::MoveInOrder(from, to) => self.move_in_order(from, to),
+            Command::ClearUpcoming => self.clear_upcoming(),
+            Command::SetShuffle(on) => self.set_shuffle(on),
+            Command::SetRepeat(mode) => self.set_repeat(mode),
+            Command::Restore(tracks, index, position_ms) => self.restore(tracks, index, position_ms),
             Command::PlayPause => match self.state {
                 PlayState::Playing => self.pause(),
                 PlayState::Paused => self.resume(),
                 PlayState::Idle => {
-                    if !self.queue.is_empty() {
-                        self.start_index(self.index.min(self.queue.len() - 1));
+                    if !self.order.is_empty() {
+                        self.start_pos(self.pos.min(self.order.len() - 1));
                     }
                 }
             },
             Command::Pause => self.pause(),
             Command::Resume => self.resume(),
-            Command::Next => {
-                if self.index + 1 < self.queue.len() {
-                    self.next = None;
-                    self.start_index(self.index + 1);
-                } else {
-                    self.finish_queue();
-                }
-            }
+            Command::Next => match self.manual_next_pos() {
+                Some(p) => self.start_pos(p),
+                None => self.finish_queue(),
+            },
             Command::Prev => {
                 // Within the first seconds, go to the previous track; otherwise restart this one.
-                if self.position_ms() > 3_000 || self.index == 0 {
+                if self.position_ms() > 3_000 || self.pos == 0 {
                     if let Some(cur) = self.current.as_mut() {
                         let _ = cur.decoder.seek(0);
                         cur.frames_left = cur.total_frames;
@@ -267,7 +330,7 @@ impl PlayerCore {
                         self.sink.flush();
                     }
                 } else {
-                    self.start_index(self.index - 1);
+                    self.start_pos(self.pos - 1);
                 }
             }
             Command::Seek(ms) => self.seek(ms),
@@ -309,29 +372,240 @@ impl PlayerCore {
 
     fn play_playlist(&mut self, tracks: Vec<TrackSpec>, index: usize) {
         self.queue = tracks;
-        self.index = index.min(self.queue.len().saturating_sub(1));
+        self.order = (0..self.queue.len()).collect();
+        self.pos = index.min(self.queue.len().saturating_sub(1));
+        if self.shuffle && !self.order.is_empty() {
+            // Keep the requested track first, then shuffle the rest.
+            let mut rest = self.order.clone();
+            let start = rest.remove(self.pos);
+            weighted_shuffle(&mut rest, &self.queue, &mut self.rng);
+            rest.insert(0, start);
+            self.order = rest;
+            self.pos = 0;
+        }
+        self.reset_playback();
+        if self.queue.is_empty() {
+            self.state = PlayState::Idle;
+            self.snapshot_dirty = true;
+            return;
+        }
+        self.start_pos(self.pos);
+    }
+
+    /// Replace the queue and load a paused track at a saved position (session resume).
+    fn restore(&mut self, tracks: Vec<TrackSpec>, index: usize, position_ms: u64) {
+        self.play_playlist(tracks, index);
+        let Some(cur) = self.current.as_mut() else { return };
+        if let Err(e) = cur.decoder.seek(position_ms) {
+            log::warn!("cannot resume at {position_ms} ms: {e}");
+            return;
+        }
+        let frames = position_ms.saturating_mul(self.rate as u64) / 1000;
+        cur.frames_left = cur.total_frames.map(|t| t.saturating_sub(frames));
+        cur.fade_pos = 0;
+        self.frames_played = frames;
+        self.sink.flush();
+        self.pause();
+    }
+
+    fn reset_playback(&mut self) {
         self.next = None;
+        self.next_pos = None;
         self.prefetch = None;
         self.current = None;
         self.error = None;
         self.sink.flush();
-        if self.queue.is_empty() {
-            self.state = PlayState::Idle;
-            return;
-        }
-        self.start_index(self.index);
+        self.snapshot_dirty = true;
     }
 
-    fn start_index(&mut self, index: usize) {
-        if index >= self.queue.len() {
+    fn enqueue(&mut self, tracks: Vec<TrackSpec>) {
+        if tracks.is_empty() {
+            return;
+        }
+        let base = self.queue.len();
+        // Adding to an idle player (nothing loaded or the queue ran out) starts playing.
+        let start = (self.current.is_none() && self.state == PlayState::Idle).then_some(base);
+        self.queue.extend(tracks);
+        self.order.extend(base..self.queue.len());
+        self.snapshot_dirty = true;
+        if let Some(pos) = start {
+            self.start_pos(pos);
+        } else {
+            self.spawn_prefetch();
+        }
+    }
+
+    fn insert_next(&mut self, tracks: Vec<TrackSpec>) {
+        if tracks.is_empty() {
+            return;
+        }
+        let base = self.queue.len();
+        let idle = self.current.is_none() && self.state == PlayState::Idle;
+        self.queue.extend(tracks);
+        let at = if self.order.is_empty() { 0 } else { self.pos + 1 };
+        let inserted: Vec<usize> = (base..self.queue.len()).collect();
+        self.order.splice(at..at, inserted);
+        // The prefetched track is no longer next in line.
+        self.next = None;
+        self.next_pos = None;
+        self.prefetch = None;
+        self.snapshot_dirty = true;
+        if idle {
+            self.start_pos(at);
+        } else {
+            self.spawn_prefetch();
+        }
+    }
+
+    fn remove_at(&mut self, order_pos: usize) {
+        if order_pos >= self.order.len() || order_pos == self.pos {
+            return;
+        }
+        let slot = self.order.remove(order_pos);
+        self.queue.remove(slot);
+        for q in &mut self.order {
+            if *q > slot {
+                *q -= 1;
+            }
+        }
+        if order_pos < self.pos {
+            self.pos -= 1;
+        }
+        self.snapshot_dirty = true;
+        // A removal can invalidate the prefetched track.
+        self.next = None;
+        self.next_pos = None;
+        self.prefetch = None;
+        if self.state == PlayState::Playing {
+            self.spawn_prefetch();
+        }
+    }
+
+    fn move_in_order(&mut self, from: usize, to: usize) {
+        if from >= self.order.len() || to >= self.order.len() || from == to || from == self.pos || to == self.pos {
+            return;
+        }
+        let item = self.order.remove(from);
+        self.order.insert(to, item);
+        // Keep `pos` on the same slot.
+        if from < self.pos && to >= self.pos {
+            self.pos -= 1;
+        } else if from > self.pos && to <= self.pos {
+            self.pos += 1;
+        }
+        self.snapshot_dirty = true;
+        self.next = None;
+        self.next_pos = None;
+        self.prefetch = None;
+        if self.state == PlayState::Playing {
+            self.spawn_prefetch();
+        }
+    }
+
+    fn clear_upcoming(&mut self) {
+        if self.pos + 1 >= self.order.len() {
+            return;
+        }
+        let drop_from = self.pos + 1;
+        let dropped: std::collections::HashSet<usize> = self.order.drain(drop_from..).collect();
+        self.queue = std::mem::take(&mut self.queue)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !dropped.contains(i))
+            .map(|(_, s)| s)
+            .collect();
+        // Reindex the remaining slots (they are all before the dropped ones in play order).
+        let mut remap = std::collections::HashMap::new();
+        let mut next = 0usize;
+        for i in 0..self.order.len() + dropped.len() {
+            if !dropped.contains(&i) {
+                remap.insert(i, next);
+                next += 1;
+            }
+        }
+        for q in &mut self.order {
+            *q = remap[&*q];
+        }
+        self.next = None;
+        self.next_pos = None;
+        self.prefetch = None;
+        self.snapshot_dirty = true;
+    }
+
+    fn set_shuffle(&mut self, on: bool) {
+        if self.shuffle == on {
+            return;
+        }
+        self.shuffle = on;
+        let cur = self.cur_slot();
+        if on {
+            let mut rest: Vec<usize> = (0..self.queue.len()).filter(|i| Some(*i) != cur).collect();
+            weighted_shuffle(&mut rest, &self.queue, &mut self.rng);
+            let mut order = Vec::with_capacity(self.queue.len());
+            if let Some(c) = cur {
+                order.push(c);
+            }
+            order.extend(rest);
+            self.order = order;
+            self.pos = 0;
+        } else {
+            self.order = (0..self.queue.len()).collect();
+            self.pos = cur.unwrap_or(0);
+        }
+        self.snapshot_dirty = true;
+        self.next = None;
+        self.next_pos = None;
+        self.prefetch = None;
+        self.spawn_prefetch();
+    }
+
+    fn set_repeat(&mut self, mode: RepeatMode) {
+        self.repeat = mode;
+    }
+
+    /// Queue slot of the current track.
+    fn cur_slot(&self) -> Option<usize> {
+        self.order.get(self.pos).copied()
+    }
+
+    /// Next position when the current track ends by itself (repeat-aware).
+    fn auto_next_pos(&self) -> Option<usize> {
+        if self.repeat == RepeatMode::One {
+            return Some(self.pos);
+        }
+        if self.pos + 1 < self.order.len() {
+            Some(self.pos + 1)
+        } else if self.repeat == RepeatMode::All && !self.order.is_empty() {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    /// Next position for the Next button: repeat-one does not trap the user on one track.
+    fn manual_next_pos(&self) -> Option<usize> {
+        if self.pos + 1 < self.order.len() {
+            Some(self.pos + 1)
+        } else if self.repeat != RepeatMode::Off && !self.order.is_empty() {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    fn start_pos(&mut self, pos: usize) {
+        if pos >= self.order.len() {
             self.finish_queue();
             return;
         }
-        self.index = index;
+        self.pos = pos;
         self.next = None;
+        self.next_pos = None;
         self.prefetch = None;
         self.error = None;
-        let spec = self.queue[index].clone();
+        self.snapshot_dirty = true;
+        let slot = self.order[pos];
+        let spec = self.queue[slot].clone();
         match open_active(&self.cache, &self.http, &spec, self.rate, self.normalization, self.crossfade_ms) {
             Ok(active) => {
                 log::info!("playing {} — {} ({})", active.spec.title, active.spec.artist, source_kind(&spec.source));
@@ -349,39 +623,41 @@ impl PlayerCore {
     }
 
     fn spawn_prefetch(&mut self) {
-        if self.prefetch.is_some() || self.next.is_some() {
+        if self.prefetch.is_some() || self.next.is_some() || self.state != PlayState::Playing {
             return;
         }
-        let Some(spec) = self.queue.get(self.index + 1).cloned() else { return };
+        let Some(next_pos) = self.auto_next_pos() else { return };
+        let Some(slot) = self.order.get(next_pos).copied() else { return };
+        let spec = self.queue[slot].clone();
         let (tx, rx) = mpsc::channel();
         let cache = self.cache.clone();
         let http = self.http.clone();
         let rate = self.rate;
         let normalization = self.normalization;
         let crossfade = self.crossfade_ms;
-        let idx = self.index + 1;
-        log::debug!("prefetching #{} {}", idx, spec.title);
+        log::debug!("prefetching #{} {}", next_pos, spec.title);
         let spawned = std::thread::Builder::new().name("audio-prefetch".into()).spawn(move || {
             let _ = tx.send(open_active(&cache, &http, &spec, rate, normalization, crossfade));
         });
         if spawned.is_ok() {
-            self.prefetch = Some((idx, rx));
+            self.prefetch = Some((next_pos, rx));
         }
     }
 
     fn poll_prefetch(&mut self) {
-        let Some((idx, rx)) = self.prefetch.take() else { return };
+        let Some((next_pos, rx)) = self.prefetch.take() else { return };
         match rx.try_recv() {
             Ok(Ok(active)) => {
-                if idx == self.index + 1 && self.next.is_none() {
-                    log::debug!("prefetch ready #{} {}", idx, active.spec.title);
+                if Some(next_pos) == self.auto_next_pos() && self.next.is_none() {
+                    log::debug!("prefetch ready #{} {}", next_pos, active.spec.title);
                     self.next = Some(active);
+                    self.next_pos = Some(next_pos);
                 } else {
-                    log::debug!("dropping stale prefetch #{} (now #{})", idx, self.index);
+                    log::debug!("dropping stale prefetch #{} (now #{})", next_pos, self.pos);
                 }
             }
             Ok(Err(e)) => log::warn!("prefetch failed: {e}"),
-            Err(TryRecvError::Empty) => self.prefetch = Some((idx, rx)),
+            Err(TryRecvError::Empty) => self.prefetch = Some((next_pos, rx)),
             Err(TryRecvError::Disconnected) => {}
         }
     }
@@ -470,35 +746,36 @@ impl PlayerCore {
     /// Called when the current track reached its end.
     fn finish_track(&mut self, next_played: u64) -> Result<(), String> {
         self.frames_played = next_played;
-        if self.next.is_some() {
-            self.current = self.next.take();
-            self.index += 1;
+        if let (Some(next), Some(next_pos)) = (self.next.take(), self.next_pos.take()) {
+            self.current = Some(next);
+            self.pos = next_pos;
+            self.snapshot_dirty = true;
             if let Some(cur) = self.current.as_ref() {
                 log::debug!("gapless/crossfade into {} — {}", cur.spec.title, cur.spec.artist);
             }
             self.spawn_prefetch();
             return Ok(());
         }
-        if self.index + 1 < self.queue.len() {
-            let idx = self.index + 1;
-            let spec = self.queue[idx].clone();
-            match open_active(&self.cache, &self.http, &spec, self.rate, self.normalization, self.crossfade_ms) {
-                Ok(active) => {
-                    log::info!("playing {} — {}", active.spec.title, active.spec.artist);
-                    self.current = Some(active);
-                    self.index = idx;
-                    self.frames_played = 0;
-                    self.spawn_prefetch();
-                    Ok(())
-                }
-                Err(e) => {
-                    self.fail(format!("Cannot play “{}”: {e}", spec.title));
-                    Ok(())
-                }
-            }
-        } else {
+        let Some(next_pos) = self.auto_next_pos() else {
             self.finish_queue();
-            Ok(())
+            return Ok(());
+        };
+        self.pos = next_pos;
+        let slot = self.order[next_pos];
+        let spec = self.queue[slot].clone();
+        match open_active(&self.cache, &self.http, &spec, self.rate, self.normalization, self.crossfade_ms) {
+            Ok(active) => {
+                log::info!("playing {} — {}", active.spec.title, active.spec.artist);
+                self.current = Some(active);
+                self.frames_played = 0;
+                self.snapshot_dirty = true;
+                self.spawn_prefetch();
+                Ok(())
+            }
+            Err(e) => {
+                self.fail(format!("Cannot play “{}”: {e}", spec.title));
+                Ok(())
+            }
         }
     }
 
@@ -506,9 +783,11 @@ impl PlayerCore {
         log::info!("queue finished");
         self.current = None;
         self.next = None;
+        self.next_pos = None;
         self.prefetch = None;
         self.state = PlayState::Idle;
         self.frames_played = 0;
+        self.snapshot_dirty = true;
     }
 
     fn fail(&mut self, message: String) {
@@ -516,8 +795,10 @@ impl PlayerCore {
         self.error = Some(message);
         self.current = None;
         self.next = None;
+        self.next_pos = None;
         self.prefetch = None;
         self.state = PlayState::Idle;
+        self.snapshot_dirty = true;
     }
 
     fn pause(&mut self) {
@@ -533,6 +814,7 @@ impl PlayerCore {
             self.sink.resume();
             self.state = PlayState::Playing;
             log::info!("resumed at {} ms", self.position_ms());
+            self.spawn_prefetch();
         }
     }
 
@@ -585,13 +867,34 @@ impl PlayerCore {
         }
     }
 
-    pub fn status(&self) -> PlaybackStatus {
+    /// Rebuild the queue snapshot when something changed.
+    fn refresh_snapshot(&mut self) {
+        if !self.snapshot_dirty {
+            return;
+        }
+        self.snapshot_dirty = false;
+        let current = self.cur_slot();
+        let entries: Vec<QueueEntry> = self
+            .order
+            .iter()
+            .map(|&slot| QueueEntry {
+                index: slot,
+                current: Some(slot) == current,
+                info: self.queue[slot].info(),
+            })
+            .collect();
+        self.snapshot = Arc::new(entries);
+        self.snapshot_gen += 1;
+    }
+
+    pub fn status(&mut self) -> PlaybackStatus {
+        self.refresh_snapshot();
         let track = self.current.as_ref().map(Active::info);
         let duration_ms = track.as_ref().map_or(0, |t| t.duration_ms);
         PlaybackStatus {
             state: self.state,
             track,
-            index: self.index,
+            index: self.cur_slot().unwrap_or(0),
             queue_len: self.queue.len(),
             position_ms: if self.state == PlayState::Idle && self.current.is_none() {
                 if self.frames_played == 0 { 0 } else { self.position_ms() }
@@ -603,6 +906,10 @@ impl PlayerCore {
             muted: self.muted,
             sink: self.sink_name.clone(),
             sink_real: self.sink_real,
+            shuffle: self.shuffle,
+            repeat: self.repeat,
+            queue: self.snapshot.clone(),
+            queue_gen: self.snapshot_gen,
             error: self.error.clone(),
         }
     }
@@ -627,6 +934,66 @@ impl PlayerCore {
             self.poll_prefetch();
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+}
+
+/// xorshift64* seed: time-based so successive sessions differ.
+fn seed() -> u64 {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x2545_f491_4f6c_dd1d);
+    t ^ 0x9e37_79b9_7f4a_7c15
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// Uniform in [0, total).
+    fn below(&mut self, total: f64) -> f64 {
+        (self.next() as f64 / u64::MAX as f64) * total
+    }
+}
+
+/// Weighted shuffle without replacement: tracks rated higher or played often are more likely to
+/// come next, but a track by the same artist as the previous pick is strongly deweighted so the
+/// mix stays varied. `items` holds queue slots and is permuted in place.
+fn weighted_shuffle(items: &mut [usize], specs: &[TrackSpec], rng: &mut Rng) {
+    let mut last_artist: Option<String> = None;
+    for i in 0..items.len() {
+        let mut total = 0.0f64;
+        let mut weights = Vec::with_capacity(items.len() - i);
+        for &slot in &items[i..] {
+            let s = &specs[slot];
+            let mut w = (s.weight.max(0.05)) as f64;
+            if last_artist.as_deref() == Some(s.artist.as_str()) {
+                w *= 0.2;
+            }
+            weights.push(w);
+            total += w;
+        }
+        let mut pick = i;
+        if total > 0.0 {
+            let mut target = rng.below(total);
+            for (k, w) in weights.iter().enumerate() {
+                target -= w;
+                if target < 0.0 {
+                    pick = i + k;
+                    break;
+                }
+            }
+        }
+        items.swap(i, pick);
+        last_artist = Some(specs[items[i]].artist.clone());
     }
 }
 
@@ -690,6 +1057,38 @@ impl Engine {
 
     pub fn play_playlist(&self, tracks: Vec<TrackSpec>, index: usize) {
         self.send(Command::PlayPlaylist(tracks, index));
+    }
+
+    pub fn enqueue(&self, tracks: Vec<TrackSpec>) {
+        self.send(Command::Enqueue(tracks));
+    }
+
+    pub fn insert_next(&self, tracks: Vec<TrackSpec>) {
+        self.send(Command::InsertNext(tracks));
+    }
+
+    pub fn remove_at(&self, order_pos: usize) {
+        self.send(Command::RemoveAt(order_pos));
+    }
+
+    pub fn move_in_order(&self, from: usize, to: usize) {
+        self.send(Command::MoveInOrder(from, to));
+    }
+
+    pub fn clear_upcoming(&self) {
+        self.send(Command::ClearUpcoming);
+    }
+
+    pub fn set_shuffle(&self, on: bool) {
+        self.send(Command::SetShuffle(on));
+    }
+
+    pub fn set_repeat(&self, mode: RepeatMode) {
+        self.send(Command::SetRepeat(mode));
+    }
+
+    pub fn restore(&self, tracks: Vec<TrackSpec>, index: usize, position_ms: u64) {
+        self.send(Command::Restore(tracks, index, position_ms));
     }
 
     pub fn play_pause(&self) {
@@ -761,7 +1160,11 @@ mod tests {
     }
 
     fn cache() -> AudioCache {
-        AudioCache::new(std::env::temp_dir().join("plexify-engine-test"), 64 << 20, false)
+        // Unique per run so parallel test binaries never share a cache directory. Nothing here is
+        // a security decision: it only holds decoded audio written by this test process.
+        // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        let dir = std::env::temp_dir().join(format!("plexify-engine-test-{}", std::process::id()));
+        AudioCache::new(dir, 64 << 20, false)
     }
 
     fn spec(file: &str, gain_db: Option<f32>) -> TrackSpec {
@@ -773,6 +1176,7 @@ mod tests {
             duration_ms: 0,
             gain_db,
             album_gain_db: None,
+            weight: 1.0,
             source: SourceSpec::Local(fixtures().join(file)),
         }
     }
@@ -902,6 +1306,115 @@ mod tests {
         assert_eq!(core.state, PlayState::Playing);
         core.pump();
         assert!(core.collected().len() > before, "resume continues");
+    }
+
+    fn many_specs(n: usize) -> Vec<TrackSpec> {
+        (0..n)
+            .map(|i| {
+                let mut s = spec("gapless_a.flac", None);
+                s.id = i as i64 + 1;
+                s.title = format!("track {i}");
+                s.artist = format!("artist {}", i % 3);
+                s.weight = 1.0 + i as f32 % 4.0;
+                s
+            })
+            .collect()
+    }
+
+    /// Queue snapshot as (slot, title), in play order.
+    fn order_of(core: &mut PlayerCore) -> Vec<(usize, String)> {
+        core.status().queue.iter().map(|e| (e.index, e.info.title.clone())).collect()
+    }
+
+    #[test]
+    fn queue_editing_changes_the_play_order() {
+        let mut core = PlayerCore::new(Box::new(crate::audio::sink::CollectSink::new(44_100)), cache(), http(), EngineConfig::default());
+        core.handle(Command::PlayPlaylist(many_specs(3), 0));
+        core.handle(Command::Enqueue(many_specs(1).into_iter().map(|mut s| { s.title = "appended".into(); s }).collect()));
+        core.handle(Command::InsertNext(vec![{
+            let mut s = spec("gapless_a.flac", None);
+            s.title = "next".into();
+            s
+        }]));
+        let titles: Vec<String> = order_of(&mut core).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(titles.iter().map(String::as_str).collect::<Vec<_>>(), ["track 0", "next", "track 1", "track 2", "appended"]);
+
+        // Remove the inserted track (position 1 in play order).
+        core.handle(Command::RemoveAt(1));
+        assert_eq!(order_of(&mut core).len(), 4, "removed one");
+        assert!(order_of(&mut core).iter().all(|(_, t)| t != "next"));
+
+        // Moving an upcoming track must not disturb the current one.
+        let before = order_of(&mut core);
+        core.handle(Command::MoveInOrder(3, 1));
+        let after = order_of(&mut core);
+        assert_eq!(after[0].1, before[0].1, "current stayed first");
+        assert_eq!(after[1].1, before[3].1, "moved up");
+        assert_eq!(after.len(), before.len());
+
+        core.handle(Command::ClearUpcoming);
+        let titles: Vec<String> = order_of(&mut core).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(titles, ["track 0"], "only the current track remains");
+    }
+
+    #[test]
+    fn queueing_into_an_idle_engine_starts_playback() {
+        let mut core = PlayerCore::new(Box::new(crate::audio::sink::CollectSink::new(44_100)), cache(), http(), EngineConfig::default());
+        core.handle(Command::InsertNext(vec![spec("gapless_a.flac", None)]));
+        assert_eq!(core.state, PlayState::Playing, "play next with nothing loaded starts");
+        assert_eq!(core.cur_slot(), Some(0));
+
+        let mut core = PlayerCore::new(Box::new(crate::audio::sink::CollectSink::new(44_100)), cache(), http(), EngineConfig::default());
+        core.handle(Command::Enqueue(many_specs(2)));
+        assert_eq!(core.state, PlayState::Playing, "adding to an empty queue starts");
+        assert_eq!(core.queue.len(), 2);
+        assert_eq!(core.cur_slot(), Some(0));
+    }
+
+    #[test]
+    fn repeat_all_wraps_and_repeat_one_repeats() {
+        let mut core = PlayerCore::new(Box::new(crate::audio::sink::CollectSink::new(44_100)), cache(), http(), EngineConfig::default());
+        core.handle(Command::PlayPlaylist(many_specs(2), 1));
+        assert_eq!(core.auto_next_pos(), None, "end of queue, repeat off");
+        assert_eq!(core.manual_next_pos(), None);
+        core.handle(Command::SetRepeat(RepeatMode::All));
+        assert_eq!(core.auto_next_pos(), Some(0), "wraps around");
+        core.handle(Command::SetRepeat(RepeatMode::One));
+        assert_eq!(core.auto_next_pos(), Some(1), "auto repeats the same track");
+        assert_eq!(core.manual_next_pos(), Some(0), "manual next still moves on");
+        core.handle(Command::SetRepeat(RepeatMode::Off));
+    }
+
+    #[test]
+    fn shuffle_keeps_the_current_track_first_and_loses_nothing() {
+        let mut core = PlayerCore::new(Box::new(crate::audio::sink::CollectSink::new(44_100)), cache(), http(), EngineConfig::default());
+        core.handle(Command::PlayPlaylist(many_specs(12), 0));
+        core.handle(Command::SetShuffle(true));
+        let order = order_of(&mut core);
+        assert_eq!(order.len(), 12);
+        assert_eq!(order[0].1, "track 0", "the playing track stays first");
+        let mut slots: Vec<usize> = order.iter().map(|(s, _)| *s).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..12).collect::<Vec<_>>(), "every track appears exactly once");
+        assert!(core.status().shuffle);
+
+        // Going back to sequential order restores the original sequence.
+        core.handle(Command::SetShuffle(false));
+        let titles: Vec<String> = order_of(&mut core).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(titles.iter().map(String::as_str).collect::<Vec<_>>(), (0..12).map(|i| format!("track {i}")).collect::<Vec<_>>());
+        assert_eq!(order_of(&mut core)[0].0, 0, "position follows the current slot");
+    }
+
+    #[test]
+    fn restore_loads_the_saved_position_paused() {
+        let mut core = PlayerCore::new(Box::new(crate::audio::sink::CollectSink::new(44_100)), cache(), http(), EngineConfig::default());
+        core.handle(Command::Restore(many_specs(3), 1, 2_000));
+        assert_eq!(core.state, PlayState::Paused, "resume starts paused");
+        assert_eq!(core.status().track.map(|t| t.title), Some("track 1".into()));
+        assert!((core.position_ms() as i64 - 2_000).abs() < 100, "position {}", core.position_ms());
+        core.handle(Command::Resume);
+        core.pump();
+        assert!(!core.collected().is_empty(), "resume plays from the saved position");
     }
 
     #[test]
