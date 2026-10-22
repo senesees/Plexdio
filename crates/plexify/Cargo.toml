@@ -29,6 +29,7 @@ raw-window-handle = "0.6"
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 urlencoding = "2"
 thiserror = "2"
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [target.'cfg(not(windows))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }

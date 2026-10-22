@@ -1,7 +1,10 @@
 //! Root application state: sign-in, server/library selection and the main shell
 //! (sidebar, content, bottom now-playing bar).
 
+use crate::cache::db::{self as cachedb, LibraryDb};
+use crate::cache::sync::{sync_library, SyncProgress, SyncReport};
 use crate::config::Config;
+use crate::library_model::LibraryModel;
 use crate::plex::auth::PlexTv;
 use crate::plex::models::{Directory, Pin, PlexUser, Resource};
 use crate::plex::resources::{pick_best, ServerConnection};
@@ -65,6 +68,18 @@ pub enum Msg {
     Servers(Result<Vec<Resource>, PlexError>),
     Probed(String, Result<ServerConnection, PlexError>),
     Sections(String, Result<Vec<Directory>, PlexError>),
+    LibraryLoaded(u64, Result<Box<LibraryModel>, String>),
+    SyncProgress(u64, SyncProgress),
+    SyncDone(u64, Result<SyncReport, String>),
+}
+
+/// Background sync status shown in the sidebar.
+#[derive(Default)]
+pub struct SyncState {
+    pub running: bool,
+    pub progress: Option<SyncProgress>,
+    pub error: Option<String>,
+    pub last_report: Option<SyncReport>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +135,15 @@ pub struct PlexifyApp {
     pub section: Option<Directory>,
     /// Transient notice shown at the top of the content area: (text, is_error).
     pub banner: Option<(String, bool)>,
+    /// Cached library of the open section (shown immediately, refreshed after sync).
+    pub library: Option<LibraryModel>,
+    pub library_gen: u64,
+    pub db_path: Option<std::path::PathBuf>,
+    pub sync: SyncState,
+    /// Running from the cache without a server connection.
+    pub offline: bool,
+    /// Server name shown in the sidebar (also known offline, from the cache).
+    pub server_label: String,
 }
 
 impl PlexifyApp {
@@ -146,6 +170,12 @@ impl PlexifyApp {
             pms: None,
             section: None,
             banner: None,
+            library: None,
+            library_gen: 0,
+            db_path: None,
+            sync: SyncState::default(),
+            offline: false,
+            server_label: String::new(),
         };
         app.token = app.store.get();
         if app.token.is_some() {
@@ -200,6 +230,10 @@ impl PlexifyApp {
         self.servers.clear();
         self.pms = None;
         self.section = None;
+        self.library = None;
+        self.db_path = None;
+        self.library_gen += 1;
+        self.offline = false;
         self.selected_server = None;
         self.config.last_server_id = None;
         self.config.last_section_key = None;
@@ -255,10 +289,137 @@ impl PlexifyApp {
         self.config.last_section_key = section.key.clone();
         self.config.last_connection_uri = Some(conn.uri.clone());
         self.save_config();
+        let server_name = conn.server_name.clone();
+        self.server_label = server_name.clone();
         self.pms = Some(PmsClient::new(self.http.clone(), conn.clone()));
-        self.section = Some(section);
+        self.offline = false;
+        let same = self.db_path.as_ref() == Some(&cachedb::db_path(server_id, section.key.as_deref().unwrap_or("")));
+        self.section = Some(section.clone());
         self.screen = Screen::Main;
         self.nav = Nav::Home;
+        if !same || self.library.is_none() {
+            // Sync starts once the cache is loaded (see Msg::LibraryLoaded).
+            self.load_cached_library(server_id, &section, &server_name);
+        } else {
+            self.start_sync(false);
+        }
+    }
+
+    /// Open the cache for a server/section and load it into memory on a worker thread.
+    pub fn load_cached_library(&mut self, server_id: &str, section: &Directory, server_name: &str) {
+        let key = section.key.clone().unwrap_or_default();
+        let path = cachedb::db_path(server_id, &key);
+        self.library_gen += 1;
+        self.library = None;
+        self.sync = SyncState::default();
+        self.db_path = Some(path.clone());
+        let gen = self.library_gen;
+        let title = section.title.clone().unwrap_or_else(|| "Music".into());
+        let server_name = server_name.to_string();
+        self.jobs.spawn("load-cache", move || {
+            let res = LibraryDb::open(&path).and_then(|db| {
+                db.set_meta("section_title", &title)?;
+                if !server_name.is_empty() {
+                    db.set_meta("server_name", &server_name)?;
+                }
+                LibraryModel::load(&db).map(Box::new)
+            });
+            Msg::LibraryLoaded(gen, res.map_err(|e| e.to_string()))
+        });
+    }
+
+    /// Sync the open library in the background (delta unless `full`).
+    pub fn start_sync(&mut self, full: bool) {
+        if self.sync.running {
+            return;
+        }
+        let (Some(pms), Some(section), Some(path)) = (self.pms.clone(), self.section.clone(), self.db_path.clone()) else {
+            return;
+        };
+        self.sync.running = true;
+        self.sync.error = None;
+        self.sync.progress = None;
+        let gen = self.library_gen;
+        let (tx, ctx) = self.jobs.sender();
+        let key = section.key.unwrap_or_default();
+        self.jobs.spawn("sync", move || {
+            let mut last_sent = std::time::Instant::now();
+            let res = LibraryDb::open(&path).map_err(|e| e.to_string()).and_then(|mut db| {
+                sync_library(&pms, &mut db, &key, full, &mut |p| {
+                    if last_sent.elapsed() > std::time::Duration::from_millis(150) {
+                        last_sent = std::time::Instant::now();
+                        let _ = tx.send(Msg::SyncProgress(gen, p));
+                        ctx.request_repaint();
+                    }
+                })
+                .map_err(|e| match e {
+                    crate::cache::sync::SyncError::Plex(p) => p.user_message(),
+                    other => other.to_string(),
+                })
+            });
+            Msg::SyncDone(gen, res)
+        });
+    }
+
+    /// Start without a server: show the cached library of the remembered server/section.
+    pub fn enter_offline(&mut self, reason: &str) -> bool {
+        let (Some(server_id), Some(key)) = (self.config.last_server_id.clone(), self.config.last_section_key.clone()) else {
+            return false;
+        };
+        let path = cachedb::db_path(&server_id, &key);
+        if !path.exists() {
+            return false;
+        }
+        let (title, server_name) = LibraryDb::open(&path)
+            .ok()
+            .map(|db| (db.meta("section_title").ok().flatten(), db.meta("server_name").ok().flatten()))
+            .unwrap_or((None, None));
+        log::warn!("entering offline mode ({reason}); using cache {}", path.display());
+        let section = Directory { key: Some(key), title: title.or(Some("Music".into())), kind: Some("artist".into()), ..Default::default() };
+        self.offline = true;
+        self.server_label = server_name.clone().unwrap_or_default();
+        self.pms = None;
+        self.section = Some(section.clone());
+        self.screen = Screen::Main;
+        self.banner = Some((format!("Offline — showing your cached library. {reason}"), true));
+        self.load_cached_library(&server_id, &section, server_name.as_deref().unwrap_or(""));
+        true
+    }
+
+    /// Try to reconnect after an offline start.
+    pub fn reconnect(&mut self) {
+        self.banner = None;
+        self.auto_select = true;
+        if self.user.is_some() {
+            self.screen = Screen::Busy("Connecting to your server…".into());
+            self.refresh_servers();
+        } else {
+            self.validate_token();
+        }
+    }
+
+    /// Wipe the cached library of the open section and re-sync if online.
+    pub fn clear_library_cache(&mut self) {
+        let Some(path) = self.db_path.clone() else { return };
+        match LibraryDb::open(&path).and_then(|db| db.clear()) {
+            Ok(()) => {
+                log::info!("library cache cleared");
+                self.library = Some(LibraryModel::default());
+                self.banner = Some(("Library cache cleared.".into(), false));
+                self.start_sync(true);
+            }
+            Err(e) => self.banner = Some((format!("Could not clear the cache: {e}"), true)),
+        }
+    }
+
+    /// Re-read the cache into memory (after a sync changed it).
+    pub fn reload_library(&mut self) {
+        let Some(path) = self.db_path.clone() else { return };
+        let gen = self.library_gen;
+        self.jobs.spawn("reload-cache", move || {
+            let res = LibraryDb::open(&path).and_then(|db| LibraryModel::load(&db).map(Box::new));
+            Msg::LibraryLoaded(gen, res.map_err(|e| e.to_string()))
+        });
     }
 
     pub fn save_config(&self) {
@@ -325,8 +486,10 @@ impl PlexifyApp {
                 }
                 Err(e) => {
                     log::warn!("cannot validate token: {e}");
-                    self.servers_error = Some(format!("Offline: {}", e.user_message()));
-                    self.screen = Screen::ServerSelect;
+                    if !self.enter_offline(&e.user_message()) {
+                        self.servers_error = Some(format!("Offline: {}", e.user_message()));
+                        self.screen = Screen::ServerSelect;
+                    }
                 }
             },
             Msg::Servers(res) => match res {
@@ -359,8 +522,10 @@ impl PlexifyApp {
                     self.screen = Screen::Login;
                 }
                 Err(e) => {
-                    self.servers_error = Some(e.user_message());
-                    self.screen = Screen::ServerSelect;
+                    if !(self.auto_select && self.enter_offline(&e.user_message())) {
+                        self.servers_error = Some(e.user_message());
+                        self.screen = Screen::ServerSelect;
+                    }
                 }
             },
             Msg::Probed(id, res) => {
@@ -372,14 +537,52 @@ impl PlexifyApp {
                 if self.selected_server.as_deref() == Some(&id) {
                     match &self.servers[idx].status {
                         ProbeStatus::Ok(_) => self.select_server(&id),
-                        ProbeStatus::Failed(_) if self.auto_select => {
+                        ProbeStatus::Failed(e) if self.auto_select => {
                             self.auto_select = false;
-                            self.screen = Screen::ServerSelect;
+                            let e = e.clone();
+                            if !self.enter_offline(&e) {
+                                self.screen = Screen::ServerSelect;
+                            }
                         }
                         _ => {}
                     }
                 }
             }
+            Msg::LibraryLoaded(gen, res) if gen == self.library_gen => {
+                let first_load = self.library.is_none();
+                match res {
+                    Ok(m) => self.library = Some(*m),
+                    Err(e) => {
+                        log::error!("cannot load cache: {e}");
+                        self.banner = Some((format!("Could not read the library cache: {e}"), true));
+                        self.library = Some(LibraryModel::default());
+                    }
+                }
+                if first_load && !self.offline {
+                    self.start_sync(false);
+                }
+            }
+            Msg::SyncProgress(gen, p) if gen == self.library_gen => self.sync.progress = Some(p),
+            Msg::SyncDone(gen, res) if gen == self.library_gen => {
+                self.sync.running = false;
+                self.sync.progress = None;
+                match res {
+                    Ok(report) => {
+                        let changed = report.upserted > 0 || report.deleted > 0 || report.playlists_refreshed > 0 || report.full;
+                        self.sync.last_report = Some(report);
+                        if changed {
+                            self.reload_library();
+                        } else if let Some(l) = &mut self.library {
+                            l.last_sync_at = Some(crate::logging::unix_now());
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("sync failed: {e}");
+                        self.sync.error = Some(e);
+                    }
+                }
+            }
+            Msg::LibraryLoaded(..) | Msg::SyncProgress(..) | Msg::SyncDone(..) => {}
             Msg::Sections(id, res) => {
                 let Some(idx) = self.servers.iter().position(|s| s.res.client_identifier == id) else { return };
                 let res = res.map_err(|e| e.user_message());
@@ -412,7 +615,7 @@ impl PlexifyApp {
         });
         ui.add_space(12.0);
         // Server / library switcher.
-        let server = self.pms.as_ref().map(|p| p.conn.server_name.clone()).unwrap_or_default();
+        let server = self.server_label.clone();
         let lib = self.section.as_ref().and_then(|s| s.title.clone()).unwrap_or_default();
         let resp = ui.add_sized(
             [ui.available_width(), 44.0],
@@ -422,9 +625,19 @@ impl PlexifyApp {
         );
         if resp.on_hover_text("Switch server or library").clicked() {
             self.auto_select = false;
-            self.screen = Screen::ServerSelect;
+            if self.offline {
+                self.reconnect();
+            } else {
+                self.screen = Screen::ServerSelect;
+            }
         }
-        ui.add_space(10.0);
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            let (text, color) = self.sync_status_text();
+            ui.label(RichText::new(text).size(11.5).color(color));
+        });
+        ui.add_space(8.0);
         for (nav, icon, label) in [
             (Nav::Home, Icon::Home, "Home"),
             (Nav::Search, Icon::Search, "Search"),
@@ -442,6 +655,63 @@ impl PlexifyApp {
         });
     }
 
+    /// One-line sync/connection status for the sidebar.
+    pub fn sync_status_text(&self) -> (String, egui::Color32) {
+        if self.offline {
+            return ("Offline (cached library)".into(), theme::ERROR);
+        }
+        if self.sync.running {
+            return match &self.sync.progress {
+                Some(p) => match p.total {
+                    Some(t) if t > 0 => (format!("Syncing {} {}/{}", p.stage, p.done, t), theme::ACCENT),
+                    _ => (format!("Syncing {}…", p.stage), theme::ACCENT),
+                },
+                None => ("Syncing…".into(), theme::ACCENT),
+            };
+        }
+        if let Some(e) = &self.sync.error {
+            return (format!("Sync failed: {e}"), theme::ERROR);
+        }
+        match self.library.as_ref().and_then(|l| l.last_sync_at) {
+            Some(ts) => (format!("Synced {}", crate::logging::ago(ts)), theme::TEXT_DIM),
+            None => ("Not synced yet".into(), theme::TEXT_DIM),
+        }
+    }
+
+    fn home_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Home");
+        ui.add_space(8.0);
+        let Some(lib) = &self.library else {
+            ui.horizontal(|ui| {
+                theme::spinner(ui, 16.0);
+                ui.label(RichText::new("Loading your library…").color(theme::TEXT_DIM));
+            });
+            return;
+        };
+        if lib.is_empty() {
+            let msg = if self.sync.running { "Fetching your library for the first time…" } else { "This library is empty." };
+            ui.label(RichText::new(msg).color(theme::TEXT_DIM));
+            return;
+        }
+        ui.label(
+            RichText::new(format!(
+                "{} artists · {} albums · {} tracks · {} playlists",
+                lib.artists.len(),
+                lib.albums.len(),
+                lib.tracks.len(),
+                lib.playlists.len()
+            ))
+            .color(theme::TEXT_DIM),
+        );
+        ui.add_space(14.0);
+        ui.label(RichText::new("Recently added").size(18.0).strong());
+        ui.add_space(6.0);
+        for i in lib.recently_added_albums(8) {
+            let a = &lib.albums[i];
+            ui.label(format!("{} — {} ({})", a.title, a.artist, a.year));
+        }
+    }
+
     fn now_playing_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal_centered(|ui| {
@@ -454,16 +724,21 @@ impl PlexifyApp {
         if let Some((text, is_error)) = self.banner.clone() {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(text).color(if is_error { theme::ERROR } else { theme::TEXT_DIM }));
+                if self.offline && ui.link("Reconnect").clicked() {
+                    self.reconnect();
+                }
                 if icons::button(ui, Icon::Close, 16.0, false).clicked() {
                     self.banner = None;
                 }
             });
+            ui.add_space(6.0);
         }
         match self.nav {
             Nav::Settings => self.settings_view(ui),
+            Nav::Home => self.home_view(ui),
             nav => {
                 let title = match nav {
-                    Nav::Home => "Home",
+                    Nav::Home => unreachable!(),
                     Nav::Search => "Search",
                     Nav::Library => "Library",
                     Nav::Playlists => "Playlists",
@@ -478,6 +753,26 @@ impl PlexifyApp {
         ui.heading("Settings");
         ui.add_space(12.0);
         theme::card().show(ui, |ui| {
+            ui.label(RichText::new("Library cache").strong());
+            ui.label(format!("Database size: {}", human_bytes(crate::paths::dir_size(&crate::paths::db_dir()))));
+            let (status, _) = self.sync_status_text();
+            ui.label(RichText::new(status).small().color(theme::TEXT_DIM));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!self.offline && !self.sync.running, |ui| {
+                    if theme::secondary_button(ui, "Refresh library").on_hover_text("Re-download the whole library").clicked() {
+                        self.start_sync(true);
+                    }
+                });
+                ui.add_enabled_ui(!self.sync.running, |ui| {
+                    if theme::secondary_button(ui, "Clear cache").clicked() {
+                        self.clear_library_cache();
+                    }
+                });
+            });
+        });
+        ui.add_space(12.0);
+        theme::card().show(ui, |ui| {
             ui.label(RichText::new("Account").strong());
             if let Some(u) = &self.user {
                 ui.label(format!("Signed in as {}", u.display_name()));
@@ -488,6 +783,15 @@ impl PlexifyApp {
                 self.sign_out();
             }
         });
+    }
+}
+
+pub fn human_bytes(n: u64) -> String {
+    match n {
+        0..=1023 => format!("{n} B"),
+        1024..=1_048_575 => format!("{:.1} KB", n as f64 / 1024.0),
+        1_048_576..=1_073_741_823 => format!("{:.1} MB", n as f64 / 1_048_576.0),
+        _ => format!("{:.2} GB", n as f64 / 1_073_741_824.0),
     }
 }
 

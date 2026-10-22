@@ -1,4 +1,6 @@
+pub mod cache;
 pub mod config;
+pub mod library_model;
 pub mod logging;
 pub mod paths;
 pub mod plex;

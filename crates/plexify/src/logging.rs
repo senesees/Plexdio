@@ -91,6 +91,25 @@ impl log::Log for FileLogger {
     }
 }
 
+/// Current unix time in seconds.
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// "just now", "5 min ago", "3 h ago", "2 days ago".
+pub fn ago(ts: i64) -> String {
+    let d = (unix_now() - ts).max(0);
+    match d {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", d / 60),
+        3600..=86_399 => format!("{} h ago", d / 3600),
+        _ => format!("{} days ago", d / 86_400),
+    }
+}
+
 /// UTC timestamp "YYYY-MM-DD HH:MM:SS.mmm" without pulling in a date crate.
 pub fn timestamp() -> String {
     let now = std::time::SystemTime::now()
