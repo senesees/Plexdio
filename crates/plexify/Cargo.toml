@@ -26,6 +26,9 @@ egui_software_backend = { package = "hdrshot-egui-backend", version = "0.2" }
 dirs = "7"
 uuid = { version = "1", features = ["v4"] }
 raw-window-handle = "0.6"
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+urlencoding = "2"
+thiserror = "2"
 
 [target.'cfg(not(windows))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }
@@ -41,6 +44,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
 ] }
+
+[dev-dependencies]
+mockplex = { path = "../mockplex" }
 
 [build-dependencies]
 winresource = "0.1"

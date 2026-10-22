@@ -3,3 +3,17 @@ name = "mockplex"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Mock plex.tv + Plex Media Server for exercising Plexify without real credentials"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mockplex"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+tiny_http = "0.12"
+urlencoding = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
