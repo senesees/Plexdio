@@ -26,6 +26,7 @@ use std::time::Duration;
 use super::art::ArtCache;
 use super::icons::{self, Icon};
 use super::runner::WindowCmd;
+use crate::win::smtc::{NowPlaying, Smtc, SmtcButton, SmtcEvents};
 use crate::win::tray::{TrayEvent, TrayHandle};
 use super::views::common::{fmt_duration, LibTab, RadioSeed, Route, UiAction, ViewCtx};
 use super::views::library::BrowseState;
@@ -256,6 +257,10 @@ pub struct PlexifyApp {
     mini_geometry: bool,
     /// Tray icon and media keys (Windows).
     tray: Option<TrayHandle>,
+    /// Windows media overlay (SMTC); absent when the OS does not offer it.
+    smtc: Option<Smtc>,
+    /// Buttons pressed on the media overlay, delivered on the next frame.
+    smtc_events: SmtcEvents,
     /// A quit was requested from the tray menu.
     quitting: bool,
     /// The window title last sent to the window manager.
@@ -328,6 +333,8 @@ impl PlexifyApp {
             mini: false,
             mini_geometry: false,
             tray: None,
+            smtc: None,
+            smtc_events: SmtcEvents::default(),
             quitting: false,
             window_title: String::new(),
             hide_window: false,
@@ -2241,6 +2248,7 @@ impl UiApp for PlexifyApp {
     fn on_window_created(&mut self, _ctx: &egui::Context, window: &winit::window::Window) {
         if let Some(hwnd) = crate::win::hwnd_of(window) {
             crate::win::single_instance::publish_window(hwnd);
+            self.smtc = crate::win::smtc::init(hwnd, self.smtc_events.clone());
         }
         crate::win::fix_wine_event_target();
         self.tray = crate::win::tray::start();
@@ -2323,6 +2331,7 @@ impl UiApp for PlexifyApp {
         self.maybe_save_session(true);
         self.save_window_size();
         self.tray = None; // removes the icon and stops the tray thread
+        self.smtc = None; // releases the media overlay session
     }
 
     /// Keep the window title in step with playback, handle tray/media-key events, and tell the
@@ -2333,6 +2342,13 @@ impl UiApp for PlexifyApp {
         if let Some(tray) = &self.tray {
             while let Some(e) = tray.try_recv() {
                 events.push(e);
+            }
+        }
+        for b in self.smtc_events.drain() {
+            match b {
+                SmtcButton::PlayPause => self.toggle_playback(),
+                SmtcButton::Next => self.skip_track(1),
+                SmtcButton::Prev => self.skip_track(-1),
             }
         }
         for e in events {
@@ -2361,6 +2377,27 @@ impl UiApp for PlexifyApp {
                 cmds.push(WindowCmd::AlwaysOnTop(false));
                 cmds.push(WindowCmd::Resizable(true));
                 cmds.push(WindowCmd::Size(w as u32, h as u32));
+            }
+        }
+        if let Some(smtc) = &mut self.smtc {
+            let playing = self.playback.state == PlayState::Playing;
+            match &self.playback.track {
+                Some(t) => smtc.update(&NowPlaying {
+                    title: &t.title,
+                    artist: &t.artist,
+                    album: &t.album,
+                    position_ms: self.playback.position_ms,
+                    duration_ms: self.playback.duration_ms,
+                    playing,
+                }),
+                None => smtc.update(&NowPlaying {
+                    title: "Plexify",
+                    artist: "",
+                    album: "",
+                    position_ms: 0,
+                    duration_ms: 0,
+                    playing: false,
+                }),
             }
         }
         let title = match (&self.playback.track, self.playback.state) {

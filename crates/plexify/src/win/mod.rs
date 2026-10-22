@@ -2,6 +2,7 @@
 //! app (and its tests) also build and run natively on Linux.
 
 pub mod autostart;
+pub mod smtc;
 pub mod single_instance;
 pub mod tray;
 
