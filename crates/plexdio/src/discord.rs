@@ -10,10 +10,12 @@ use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-/// Application ID from the Discord Developer Portal (the app's name is what Discord shows as
-/// "Listening to …"; upload an art asset named `plexdio` for the large image). Empty disables
-/// the feature unless `PLEXDIO_DISCORD_CLIENT_ID` is set.
+/// Built-in application ID from the Discord Developer Portal. Empty: users enter their own in
+/// Settings (or set `PLEXDIO_DISCORD_CLIENT_ID`).
 const CLIENT_ID: &str = "";
+
+/// Step-by-step setup instructions (README on GitHub), linked from Settings.
+pub const SETUP_URL: &str = "https://github.com/senesees/plexmusicplayer#discord-setup";
 
 /// Minimum gap between activity updates (Discord allows 5 per 20 seconds).
 const MIN_UPDATE_GAP: Duration = Duration::from_secs(4);
@@ -24,12 +26,23 @@ const OP_HANDSHAKE: u32 = 0;
 const OP_FRAME: u32 = 1;
 const OP_CLOSE: u32 = 2;
 
-/// The Discord application ID to use, if one is configured.
-pub fn client_id() -> Option<String> {
+/// Discord application IDs are snowflakes: 17 to 20 digits.
+pub fn valid_client_id(id: &str) -> bool {
+    (17..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The application ID to use: the one entered in Settings, else `PLEXDIO_DISCORD_CLIENT_ID`,
+/// else the built-in one.
+pub fn client_id(from_settings: &str) -> Option<String> {
+    let user = from_settings.trim();
+    if valid_client_id(user) {
+        return Some(user.to_string());
+    }
     std::env::var("PLEXDIO_DISCORD_CLIENT_ID")
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| (!CLIENT_ID.is_empty()).then(|| CLIENT_ID.to_string()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| valid_client_id(s))
+        .or_else(|| valid_client_id(CLIENT_ID).then(|| CLIENT_ID.to_string()))
 }
 
 /// What to show: the playing track and where it is (unix milliseconds).
@@ -282,6 +295,14 @@ fn worker(client_id: &str, rx: Receiver<Msg>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_ids_are_validated_and_settings_win() {
+        assert!(valid_client_id("123456789012345678"));
+        assert!(!valid_client_id("1234"), "too short");
+        assert!(!valid_client_id("12345678901234567x"), "digits only");
+        assert_eq!(client_id(" 123456789012345678 ").as_deref(), Some("123456789012345678"));
+    }
 
     #[test]
     fn activity_has_listening_type_and_valid_fields() {

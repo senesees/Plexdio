@@ -78,20 +78,33 @@ With the equaliser off or flat it is bypassed completely (bit-exact output).
 
 ### Discord setup
 
-Discord requires every app to have its own application ID; the app's name is what Discord
-shows as "Listening to …".
+Plexdio can show what you are listening to on your Discord profile ("Listening to Plexdio",
+with the song, artist, album and a progress bar). Discord needs an *application* for that,
+which you create once for free; it takes about two minutes.
 
-1. Create an application named **Plexdio** at <https://discord.com/developers/applications>.
-2. Put its **Application ID** into `CLIENT_ID` in `crates/plexdio/src/discord.rs` and rebuild
-   (or set `PLEXDIO_DISCORD_CLIENT_ID` for a quick test without rebuilding).
-3. Optional: under *Rich Presence → Art Assets*, upload the Plexdio icon named `plexdio`; it
-   becomes the large image.
-4. In the app: *Settings → Discord → Show what I'm listening to*. It is off by default because
-   it shares your listening activity.
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications) and sign in
+   with your Discord account.
+2. Click **New Application**, name it **Plexdio** (this name is what your status shows after
+   "Listening to"), accept the terms and click **Create**.
+3. On the **General Information** page, click **Copy** under **Application ID**.
+4. *Optional, for the picture on your status:* open **Rich Presence → Art Assets**, click
+   **Add Image(s)**, upload [`assets/discord-icon.png`](assets/discord-icon.png) (or any square
+   image of at least 512×512), set its name to `plexdio` exactly, and click **Save Changes**.
+   New images can take a few minutes to show up.
+5. In Plexdio open **Settings → Discord**, paste the ID into **Application ID**, and switch on
+   **Show what I'm listening to**.
+6. Keep the Discord desktop app running and play a song; your status appears within a few
+   seconds. Pausing or stopping clears it.
 
-Without an ID the setting is greyed out. Plexdio talks to the Discord desktop app over its
-local IPC pipe, retries every 15 s while Discord is closed, and stays within Discord's rate
-limit (5 updates per 20 s).
+If nothing shows up, check that *Discord → User Settings → Activity Privacy → Share your
+detected activities with others* is on, and that you use the desktop app (the browser version
+cannot see other apps).
+
+The setting is off by default because it shares your listening activity. Plexdio talks to the
+Discord desktop app over its local IPC pipe, retries every 15 s while Discord is closed, and
+stays within Discord's rate limit (5 updates per 20 s). For a build with a built-in ID, put
+it into `CLIENT_ID` in `crates/plexdio/src/discord.rs`; `PLEXDIO_DISCORD_CLIENT_ID` also
+works for testing. An ID entered in Settings always wins.
 
 ## Status
 
@@ -266,7 +279,8 @@ socket.
 - **Real audio output.** Neither Wine nor the Windows VM has an audio device, so playback ran
   through the null sink. Decoding, mixing, the equaliser and caching are covered by tests and
   the engine logs, but nobody has heard it yet.
-- **Discord with a real Discord client**, and the application ID (none is set in this build).
+- **Discord with a real Discord client and a real application ID** (none is built in; users
+  enter their own in Settings).
 - **Windows desktop behaviour of the custom frame**: live redraw while dragging an edge,
   Aero Snap, and the 760×480 minimum size coming back after the mini-player were only seen
   under Wine.
@@ -305,7 +319,7 @@ socket.
 10. Search (`Ctrl+F`) for an artist with accents; check the results match the server.
 11. Start a radio from a track and from an artist (the Radio page opens); let a queue run out
     with autoplay on. Open an artist page and check *Fans also like*.
-12. With a Discord application ID set and Discord running, enable *Show what I'm listening to*
-    and check your Discord status; pause and confirm it clears.
+12. Follow [Discord setup](#discord-setup) (the link in *Settings → Discord* opens it), then play a
+    song and check your Discord status; pause and confirm it clears.
 13. Rate a track 5 stars and check it appears in Most played after a while; sign out and back in
     to confirm the token is cleared and re-stored.

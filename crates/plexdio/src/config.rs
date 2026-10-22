@@ -55,6 +55,8 @@ pub struct Config {
     pub start_with_windows: bool,
     /// Show the playing track on Discord (Rich Presence). Off by default: it shares activity.
     pub discord_presence: bool,
+    /// The user's own Discord application ID (Developer Portal); empty uses the built-in one.
+    pub discord_client_id: String,
     /// Equaliser on/off and gain per band in dB (see `audio::eq::BANDS`).
     pub eq_enabled: bool,
     pub eq_gains: [f32; crate::audio::eq::BAND_COUNT],
@@ -84,6 +86,7 @@ impl Default for Config {
             close_to_tray: false,
             start_with_windows: false,
             discord_presence: false,
+            discord_client_id: String::new(),
             eq_enabled: false,
             eq_gains: [0.0; crate::audio::eq::BAND_COUNT],
             window_size: None,

@@ -274,6 +274,8 @@ pub struct PlexdioApp {
     discord: Option<crate::discord::DiscordPresence>,
     /// Last presence sent: (track id, start time in unix ms); `None` when cleared.
     discord_last: Option<(i64, i64)>,
+    /// Application ID the running presence worker was started with.
+    discord_client: Option<String>,
     /// Buttons pressed on the media overlay, delivered on the next frame.
     smtc_events: SmtcEvents,
     /// A quit was requested from the tray menu.
@@ -355,6 +357,7 @@ impl PlexdioApp {
             smtc: None,
             discord: None,
             discord_last: None,
+            discord_client: None,
             smtc_events: SmtcEvents::default(),
             quitting: false,
             window_title: String::new(),
@@ -2174,18 +2177,20 @@ impl PlexdioApp {
     /// Keep the Discord status in step with playback (setting on, a track playing). Paused or
     /// stopped clears it, like Spotify. Sends only on a new track, play/pause, or a seek.
     fn update_discord(&mut self) {
-        let client = if self.config.discord_presence { crate::discord::client_id() } else { None };
-        match (&self.discord, client) {
-            (None, Some(id)) => {
-                self.discord = crate::discord::DiscordPresence::start(id);
+        let client =
+            if self.config.discord_presence { crate::discord::client_id(&self.config.discord_client_id) } else { None };
+        if self.discord.is_some() && client != self.discord_client {
+            // Turned off, or a different application ID: dropping the worker clears the status.
+            self.discord = None;
+            self.discord_last = None;
+            self.discord_client = None;
+        }
+        if self.discord.is_none() {
+            if let Some(id) = client {
+                self.discord = crate::discord::DiscordPresence::start(id.clone());
+                self.discord_client = self.discord.is_some().then_some(id);
                 self.discord_last = None;
             }
-            (Some(_), None) => {
-                // Dropping the worker clears the status.
-                self.discord = None;
-                self.discord_last = None;
-            }
-            _ => {}
         }
         let Some(discord) = &self.discord else { return };
         let now_ms = std::time::SystemTime::now()
@@ -2390,8 +2395,34 @@ impl PlexdioApp {
     }
 
     fn settings_discord(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
-        let ok = crate::discord::client_id().is_some();
-        let desc = if ok { "Your Discord status shows the song while it plays" } else { "Needs a Discord application ID in this build" };
+        let typed = self.config.discord_client_id.trim().to_string();
+        let typed_ok = crate::discord::valid_client_id(&typed);
+        let ok = crate::discord::client_id(&typed).is_some();
+        let id_desc = if !typed.is_empty() && !typed_ok {
+            "Should be 17–20 digits"
+        } else if typed.is_empty() && ok {
+            "Using the built-in ID; enter your own to show your app's name"
+        } else {
+            "From your Discord application (Developer Portal > General Information)"
+        };
+        let mut id_text = self.config.discord_client_id.clone();
+        setting_row(ui, "Application ID", Some(id_desc), |ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut id_text)
+                    .hint_text("Paste your ID")
+                    .char_limit(20)
+                    .desired_width(190.0),
+            );
+            if resp.changed() {
+                // Only digits make sense here; drop anything else (spaces from a paste, etc.).
+                id_text.retain(|c| c.is_ascii_digit());
+            }
+        });
+        if id_text != self.config.discord_client_id {
+            self.config.discord_client_id = id_text;
+            *changed = true;
+        }
+        let desc = if ok { "Your Discord status shows the song while it plays" } else { "Enter an application ID above first" };
         setting_row(ui, "Show what I'm listening to", Some(desc), |ui| {
             let mut v = self.config.discord_presence;
             if ui.add_enabled_ui(ok, |ui| theme::toggle(ui, &mut v)).inner.changed() {
@@ -2399,6 +2430,12 @@ impl PlexdioApp {
                 *changed = true;
             }
         });
+        ui.add_space(4.0);
+        if ui.link("How to set up Discord status").on_hover_text(crate::discord::SETUP_URL).clicked()
+            && !crate::win::open_url(crate::discord::SETUP_URL)
+        {
+            self.banner = Some((format!("Open {} in your browser.", crate::discord::SETUP_URL), false));
+        }
     }
 
     fn settings_storage(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
