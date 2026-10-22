@@ -55,3 +55,39 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_style_of(egui::Theme::Dark, style);
 }
+
+/// Accent-filled pill button.
+pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let label = egui::RichText::new(text).size(15.0).strong().color(Color32::BLACK);
+    ui.add(
+        egui::Button::new(label)
+            .fill(ACCENT)
+            .corner_radius(CornerRadius::same(20))
+            .min_size(egui::vec2(160.0, 38.0)),
+    )
+}
+
+/// Subtle outlined pill button.
+pub fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let label = egui::RichText::new(text).size(14.0).color(TEXT);
+    ui.add(
+        egui::Button::new(label)
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0, Color32::from_rgb(110, 110, 110)))
+            .corner_radius(CornerRadius::same(20))
+            .min_size(egui::vec2(120.0, 34.0)),
+    )
+}
+
+/// Rounded card frame.
+pub fn card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(CARD)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(24))
+}
+
+/// Small rotating arc used as a busy indicator.
+pub fn spinner(ui: &mut egui::Ui, size: f32) {
+    ui.add(egui::Spinner::new().size(size).color(ACCENT));
+}

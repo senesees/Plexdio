@@ -55,3 +55,20 @@ pub fn fix_wine_event_target() {
         EnumThreadWindows(GetCurrentThreadId(), Some(cb), 0);
     }
 }
+
+/// Open a URL in the default browser.
+pub fn open_url(url: &str) -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let op: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let u: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+        let r = ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), u.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+        r as isize > 32
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn().is_ok()
+    }
+}
