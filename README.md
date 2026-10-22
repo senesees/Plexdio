@@ -214,7 +214,7 @@ Data locations: `%APPDATA%\Plexdio\config.json` (settings, resume queue),
 
 ## Footprint
 
-Release exe: **10 012 672 bytes (9.55 MiB)**, PE32+ x86-64, system DLLs only.
+Release exe: **10 022 400 bytes (9.56 MiB)**, PE32+ x86-64, system DLLs only.
 
 | Environment | Library | Idle working set | Idle CPU | Playing CPU |
 |---|---|---|---|---|
