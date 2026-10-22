@@ -1,0 +1,19 @@
+# Build outputs (dist/ holds final deliverables: excluded from git, included in "Everything" downloads)
+target/
+build/
+out/
+bin/
+obj/
+dist/
+node_modules/
+.gradle/
+.vs/
+.idea/
+*.o
+*.obj
+*.pdb
+*.ilk
+__pycache__/
+*.pyc
+# Tool caches
+.serena/
