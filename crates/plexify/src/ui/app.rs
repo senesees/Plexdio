@@ -10,6 +10,9 @@ use crate::library_model::LibraryModel;
 use crate::plex::auth::PlexTv;
 use crate::plex::models::{Directory, Hub, Pin, PlexUser, Resource};
 use crate::plex::resources::{pick_best, ServerConnection};
+use crate::library_model::Id;
+use crate::player::mixes::Mixes;
+use crate::player::radio;
 use crate::player::report::{Reporter, ReportState};
 use crate::player::session::Session;
 use crate::plex::server::{PlayState as ServerPlayState, PmsClient};
@@ -22,7 +25,7 @@ use std::time::Duration;
 
 use super::art::ArtCache;
 use super::icons::{self, Icon};
-use super::views::common::{fmt_duration, LibTab, Route, UiAction, ViewCtx};
+use super::views::common::{fmt_duration, LibTab, RadioSeed, Route, UiAction, ViewCtx};
 use super::views::library::BrowseState;
 use super::views::search::SearchState;
 use super::jobs::Jobs;
@@ -125,6 +128,32 @@ enum QueueCmd {
     Close,
 }
 
+/// What a finished radio fetch should do with its station.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadioMode {
+    /// Replace the queue and start listening (the user asked for a station).
+    Play,
+    /// Append to the finished queue and keep playing (autoplay).
+    Autoplay,
+}
+
+/// A sonic-similarity lookup running on a worker thread.
+struct RadioJob {
+    rx: std::sync::mpsc::Receiver<Vec<Id>>,
+    mode: RadioMode,
+    seed: Id,
+    /// Tracks queued before the station (album or artist seed) — they play first.
+    base: Vec<Id>,
+}
+
+/// Fresh salt for a station's weighted shuffle.
+fn radio_salt() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9)
+}
+
 /// File extension for a codec name, used as the decoder hint and cache suffix.
 fn codec_extension(codec: &str) -> &'static str {
     match codec {
@@ -207,6 +236,18 @@ pub struct PlexifyApp {
     pub queue_open: bool,
     /// Play-order position of the queue row being dragged.
     pub queue_drag: Option<usize>,
+    /// Home mixes (Most played, Recently played, Rediscover).
+    pub mixes: Mixes,
+    /// A play was recorded since the mixes were last built.
+    mixes_dirty: bool,
+    /// Sonic-similarity lookup in flight for a new radio station or autoplay.
+    radio_job: Option<RadioJob>,
+    /// Last track the engine actually played (the seed for autoplay).
+    last_playing: Option<Id>,
+    /// Set when a station was enqueued behind a finished queue. The engine reports its first
+    /// Playing event a moment later, and the app only repaints while it knows it is playing, so
+    /// keep drawing until that event has been seen (or the deadline passes).
+    wake_poll: Option<std::time::Instant>,
 }
 
 impl PlexifyApp {
@@ -263,6 +304,11 @@ impl PlexifyApp {
             last_played_id: None,
             queue_open: false,
             queue_drag: None,
+            mixes: Mixes::default(),
+            mixes_dirty: true,
+            radio_job: None,
+            last_playing: None,
+            wake_poll: None,
         };
         app.token = app.store.get();
         if app.token.is_some() {
@@ -325,6 +371,9 @@ impl PlexifyApp {
         self.selected_server = None;
         self.reporter = None;
         self.report_base = None;
+        self.mixes = Mixes::default();
+        self.radio_job = None;
+        self.wake_poll = None;
         Session::clear();
         self.saved_session = Session::default();
         self.config.last_server_id = None;
@@ -507,6 +556,8 @@ impl PlexifyApp {
             Ok(()) => {
                 log::info!("library cache cleared");
                 self.library = Some(LibraryModel::default());
+                self.mixes = Mixes::default();
+                self.mixes_dirty = true;
                 self.banner = Some(("Library cache cleared.".into(), false));
                 self.start_sync(true);
             }
@@ -701,6 +752,7 @@ impl PlexifyApp {
                     self.start_sync(false);
                 }
                 self.maybe_restore_session();
+                self.refresh_mixes();
             }
             Msg::SearchHubs(seq, gen, query, res) => {
                 if seq != self.search.server_seq {
@@ -901,11 +953,122 @@ impl PlexifyApp {
                 self.banner = Some((format!("Added {n} {} to the queue.", if n == 1 { "track" } else { "tracks" }), false));
                 self.poll_playback();
             }
-            UiAction::Radio(seed) => {
-                self.banner = Some((format!("Radio from {seed:?} is not available yet."), false));
-            }
+            UiAction::Radio(seed) => self.start_radio(seed),
             _ => {}
         }
+    }
+
+    /// Start a station from a track, album or artist. Album and artist seeds play their tracks
+    /// first, then the similar ones. The sonic lookup runs off the UI thread; without a server
+    /// (or without Plex Pass) the local artist/genre fallback answers immediately.
+    fn start_radio(&mut self, seed: RadioSeed) {
+        let Some(lib) = self.library.as_ref() else {
+            self.banner = Some(("Open a library first.".into(), true));
+            return;
+        };
+        let (seed_id, base) = match &seed {
+            RadioSeed::Track(id) => (*id, vec![*id]),
+            RadioSeed::Album(id) => {
+                let tracks = lib.album_track_ids(*id);
+                match tracks.first() {
+                    Some(&first) => (first, tracks),
+                    None => {
+                        self.banner = Some(("This album has no tracks.".into(), true));
+                        return;
+                    }
+                }
+            }
+            RadioSeed::Artist(id) => {
+                let tracks = lib.artist_track_ids(*id);
+                match tracks.first() {
+                    Some(&first) => (first, tracks),
+                    None => {
+                        self.banner = Some(("This artist has no tracks.".into(), true));
+                        return;
+                    }
+                }
+            }
+        };
+        self.start_station(seed_id, base, RadioMode::Play);
+    }
+
+    /// Ask the server for similar tracks (worker thread) and then build the station. With no
+    /// server the local fallback is used directly.
+    fn start_station(&mut self, seed: Id, base: Vec<Id>, mode: RadioMode) {
+        let online = !self.offline && self.pms.is_some();
+        if !online {
+            self.finish_station(mode, seed, base, Vec::new());
+            return;
+        }
+        let pms = self.pms.clone().expect("online implies a server");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("radio".into())
+            .spawn(move || {
+                let ids = radio::sonic_ids(&pms, seed, radio::STATION_LEN);
+                let _ = tx.send(ids);
+            });
+        if spawned.is_err() {
+            log::warn!("cannot start the radio thread; using the local fallback");
+            self.finish_station(mode, seed, base, Vec::new());
+            return;
+        }
+        self.banner = Some(("Finding similar tracks…".into(), false));
+        self.radio_job = Some(RadioJob { rx, mode, seed, base });
+    }
+
+    /// Build and apply a station once the server answer (possibly empty) is in.
+    fn finish_station(&mut self, mode: RadioMode, seed: Id, base: Vec<Id>, from_server: Vec<Id>) {
+        let Some(lib) = self.library.as_ref() else { return };
+        let exclude: std::collections::HashSet<Id> = base.iter().copied().collect();
+        let rest = radio::station(lib, seed, &from_server, &exclude, radio::STATION_LEN, radio_salt());
+        let mut ids = base;
+        ids.extend(rest);
+        if ids.is_empty() {
+            self.banner = Some(("No tracks available for this station.".into(), true));
+            return;
+        }
+        match mode {
+            RadioMode::Play => {
+                self.banner = Some((format!("Radio: {} tracks.", ids.len()), false));
+                self.play_ids(&ids, 0);
+            }
+            RadioMode::Autoplay => {
+                if self.playback.state != PlayState::Idle {
+                    log::debug!("dropping autoplay station: playback resumed meanwhile");
+                    return;
+                }
+                let specs = self.queue_specs(&ids);
+                if specs.is_empty() {
+                    return;
+                }
+                let n = specs.len();
+                self.ensure_engine().enqueue(specs);
+                self.banner = Some((format!("Autoplay: added {n} tracks."), false));
+                self.wake_poll = Some(std::time::Instant::now() + Duration::from_secs(3));
+                self.poll_playback();
+            }
+        }
+    }
+
+    /// Apply a finished sonic lookup, if there is one.
+    fn poll_radio(&mut self) {
+        let Some(job) = &self.radio_job else { return };
+        let from_server = match job.rx.try_recv() {
+            Ok(ids) => ids,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Vec::new(),
+        };
+        let job = self.radio_job.take().expect("checked above");
+        self.finish_station(job.mode, job.seed, job.base, from_server);
+    }
+
+    /// Rebuild the Home mixes from the library and the local play history.
+    fn refresh_mixes(&mut self) {
+        let Some(lib) = &self.library else { return };
+        let db = self.db_path.as_ref().and_then(|p| LibraryDb::open(p).ok());
+        self.mixes = Mixes::load(lib, db.as_ref(), crate::logging::unix_now());
+        self.mixes_dirty = false;
     }
 
     /// Start playback of `ids` at `start`, building stream sources for the current server.
@@ -1005,15 +1168,35 @@ impl PlexifyApp {
 
     fn poll_playback(&mut self) {
         let Some(e) = &self.engine else { return };
+        let prev_state = self.playback.state;
         let st = e.status();
+        let state = st.state;
+        let track = st.track.as_ref().map(|t| t.id);
         if st.error.is_some() && st.error != self.playback.error {
             if let Some(msg) = st.error.clone() {
                 self.banner = Some((msg, true));
             }
         }
         self.playback = st;
+        if state == PlayState::Playing {
+            if let Some(id) = track {
+                self.last_playing = Some(id);
+            }
+        }
         self.report_playback();
         self.maybe_save_session(false);
+        // The queue ran out: keep the music going with a station seeded by the last track.
+        if prev_state == PlayState::Playing
+            && state == PlayState::Idle
+            && self.playback.error.is_none()
+            && self.config.autoplay
+            && self.radio_job.is_none()
+        {
+            if let Some(seed) = self.last_playing {
+                log::info!("queue finished; starting autoplay from {seed}");
+                self.start_station(seed, Vec::new(), RadioMode::Autoplay);
+            }
+        }
     }
 
     /// Report progress to the server and count plays locally. Called after every status poll.
@@ -1039,6 +1222,7 @@ impl PlexifyApp {
         // Local play history (Most played mixes and shuffle weights read this).
         if playing && track != self.last_played_id {
             self.last_played_id = track;
+            self.mixes_dirty = true;
             if let (Some(id), Some(path)) = (track, self.db_path.clone()) {
                 let at = crate::logging::unix_now();
                 std::thread::spawn(move || {
@@ -1575,7 +1759,7 @@ impl PlexifyApp {
         let greeting = greeting();
         let now_playing = self.playback.track.as_ref().map(|t| t.id);
         {
-            let mut vc = ViewCtx { lib, art: &mut self.art, actions: &mut actions, now_playing };
+            let mut vc = ViewCtx { lib, art: &mut self.art, actions: &mut actions, now_playing, mixes: &self.mixes };
             use super::views::{detail, library, search};
             match &route {
                 Route::Home => detail::home_view(ui, &mut vc, &greeting),
@@ -1688,6 +1872,20 @@ impl UiApp for PlexifyApp {
             self.handle(msg);
         }
         self.poll_playback();
+        self.poll_radio();
+        if self.radio_job.is_some() {
+            // No playback is running while the lookup is in flight, so keep polling for the
+            // worker's answer even though the app is otherwise idle.
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+        if let Some(deadline) = self.wake_poll {
+            if self.playback.state == PlayState::Idle && std::time::Instant::now() < deadline {
+                // An autoplay station was just queued; wait for the engine's first Playing event.
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            } else {
+                self.wake_poll = None;
+            }
+        }
         self.art.begin_frame(ui.ctx());
         if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) && self.screen == Screen::Main {
             self.navigate(Route::Search);
@@ -1701,6 +1899,9 @@ impl UiApp for PlexifyApp {
             Screen::Login => self.login_screen(ui),
             Screen::ServerSelect => self.server_screen(ui),
             Screen::Main => {
+                if self.mixes_dirty && self.route == Route::Home {
+                    self.refresh_mixes();
+                }
                 egui::Panel::bottom("now_playing")
                     .exact_size(84.0)
                     .frame(egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(12, 6)))

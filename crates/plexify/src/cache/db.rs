@@ -292,6 +292,20 @@ impl LibraryDb {
         Ok(())
     }
 
+    /// Locally played track ids, newest first (the same track may repeat).
+    pub fn recent_play_ids(&self, limit: usize) -> rusqlite::Result<Vec<i64>> {
+        let mut st = self.conn.prepare("SELECT track_id FROM play_history ORDER BY played_at DESC LIMIT ?1")?;
+        let rows = st.query_map([limit as i64], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// Local play count per track.
+    pub fn play_counts(&self) -> rusqlite::Result<Vec<(i64, u64)>> {
+        let mut st = self.conn.prepare("SELECT track_id, COUNT(*) FROM play_history GROUP BY track_id")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?;
+        rows.collect()
+    }
+
     pub fn set_track_rating(&self, track_id: i64, rating: Option<f64>) -> rusqlite::Result<()> {
         self.conn.execute("UPDATE tracks SET user_rating=?2 WHERE id=?1", params![track_id, rating])?;
         Ok(())

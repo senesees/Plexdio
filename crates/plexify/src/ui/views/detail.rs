@@ -190,6 +190,35 @@ pub fn home_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, greeting: &str) {
             },
         );
 
+        // One card per mix; clicking one starts it shuffled.
+        let mixes: [(&str, &Vec<Id>, &str); 3] = [
+            ("Most played", &ctx.mixes.most_played, "home-mix-most"),
+            ("Recently played", &ctx.mixes.recently_played, "home-mix-recent"),
+            ("Rediscover", &ctx.mixes.rediscover, "home-mix-rediscover"),
+        ];
+        if mixes.iter().any(|(_, ids, _)| !ids.is_empty()) {
+            section(ui, "Made for you");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                for (title, ids, salt) in mixes {
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    let first = lib.track(ids[0]);
+                    let sub = plural(ids.len(), "track", "tracks");
+                    let item = CardItem {
+                        thumb: first.and_then(|t| t.thumb.as_deref()),
+                        title,
+                        subtitle: &sub,
+                        seed: first.map_or(salt, |t| &t.title),
+                    };
+                    if card(ui, ctx.art, item, false, 160.0).clicked() {
+                        ctx.actions.push(UiAction::PlayShuffled(ids.clone()));
+                    }
+                }
+            });
+        }
+
         if !lib.playlists.is_empty() {
             section(ui, "Your playlists");
             card_row(

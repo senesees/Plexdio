@@ -57,6 +57,8 @@ pub struct ViewCtx<'a> {
     pub art: &'a mut ArtCache,
     pub actions: &'a mut Vec<UiAction>,
     pub now_playing: Option<Id>,
+    /// Home mixes, refreshed after syncs and plays.
+    pub mixes: &'a crate::player::mixes::Mixes,
 }
 
 pub fn fmt_duration(ms: u64) -> String {
