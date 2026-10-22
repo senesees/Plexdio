@@ -54,6 +54,8 @@ pub struct Presence {
     /// When the track (virtually) started, so Discord's progress bar lines up with the player.
     pub start_ms: i64,
     pub end_ms: Option<i64>,
+    /// Look up a public album cover for the large image (see `cover_art`).
+    pub cover: bool,
 }
 
 enum Msg {
@@ -130,9 +132,9 @@ impl Conn {
         }
     }
 
-    fn set_activity(&mut self, p: Option<&Presence>) -> Result<(), String> {
+    fn set_activity(&mut self, p: Option<&Presence>, cover_url: Option<&str>) -> Result<(), String> {
         self.nonce += 1;
-        let activity = p.map(activity_json).unwrap_or(Value::Null);
+        let activity = p.map(|p| activity_json(p, cover_url)).unwrap_or(Value::Null);
         let cmd = json!({
             "cmd": "SET_ACTIVITY",
             "args": { "pid": std::process::id(), "activity": activity },
@@ -183,12 +185,17 @@ fn field(s: &str) -> String {
     s
 }
 
-fn activity_json(p: &Presence) -> Value {
+/// `cover_url`: a public https album cover; the Plexdio logo (art asset `plexdio`) then moves
+/// to the small badge, like Spotify's presence.
+fn activity_json(p: &Presence, cover_url: Option<&str>) -> Value {
     let mut timestamps = json!({ "start": p.start_ms });
     if let Some(end) = p.end_ms {
         timestamps["end"] = json!(end);
     }
-    let mut assets = json!({ "large_image": "plexdio" });
+    let mut assets = match cover_url {
+        Some(url) => json!({ "large_image": url, "small_image": "plexdio", "small_text": "Plexdio" }),
+        None => json!({ "large_image": "plexdio" }),
+    };
     if !p.album.trim().is_empty() {
         assets["large_text"] = json!(field(&p.album));
     }
@@ -230,6 +237,8 @@ fn worker(client_id: &str, rx: Receiver<Msg>) {
     let mut last_send = Instant::now() - MIN_UPDATE_GAP;
     let mut next_connect = Instant::now();
     let mut warned = false;
+    // Cover lookups by (artist, album); `None` = nothing public found, don't ask again.
+    let mut covers: std::collections::HashMap<(String, String), Option<String>> = std::collections::HashMap::new();
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Msg::Set(p)) => want = p,
@@ -242,7 +251,7 @@ fn worker(client_id: &str, rx: Receiver<Msg>) {
                 Ok(Msg::Set(p)) => want = p,
                 Ok(Msg::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
                     if let Some(c) = conn.as_mut() {
-                        let _ = c.set_activity(None);
+                        let _ = c.set_activity(None, None);
                     }
                     return;
                 }
@@ -275,9 +284,20 @@ fn worker(client_id: &str, rx: Receiver<Msg>) {
         if last_send.elapsed() < MIN_UPDATE_GAP {
             continue;
         }
+        let cover_url = match want.as_ref().filter(|p| p.cover) {
+            Some(p) => covers
+                .entry((p.artist.clone(), p.album.clone()))
+                .or_insert_with(|| {
+                    let found = crate::cover_art::lookup(&p.artist, &p.album);
+                    log::debug!("album cover for {} — {}: {}", p.artist, p.album, found.as_deref().unwrap_or("none"));
+                    found
+                })
+                .clone(),
+            None => None,
+        };
         let Some(c) = conn.as_mut() else { continue };
         last_send = Instant::now();
-        match c.set_activity(want.as_ref()) {
+        match c.set_activity(want.as_ref(), cover_url.as_deref()) {
             Ok(()) => shown = Some(want.clone()),
             Err(e) => {
                 log::info!("Discord presence lost ({e}); reconnecting");
@@ -288,7 +308,7 @@ fn worker(client_id: &str, rx: Receiver<Msg>) {
         }
     }
     if let Some(c) = conn.as_mut() {
-        let _ = c.set_activity(None);
+        let _ = c.set_activity(None, None);
     }
 }
 
@@ -306,8 +326,10 @@ mod tests {
 
     #[test]
     fn activity_has_listening_type_and_valid_fields() {
-        let p = Presence { title: "X".into(), artist: "Band".into(), album: "".into(), start_ms: 1_000, end_ms: Some(181_000) };
-        let a = activity_json(&p);
+        let p = Presence { title: "X".into(), artist: "Band".into(), album: "".into(), start_ms: 1_000, end_ms: Some(181_000), cover: false };
+        let a = activity_json(&p, None);
+        assert_eq!(a["assets"]["large_image"], "plexdio");
+        assert!(a["assets"].get("small_image").is_none());
         assert_eq!(a["type"], 2);
         assert_eq!(a["details"], "X ", "padded to Discord's 2-character minimum");
         assert_eq!(a["state"], "by Band");
@@ -315,6 +337,10 @@ mod tests {
         assert!(a["assets"].get("large_text").is_none(), "no empty album tooltip");
         let long = "a".repeat(300);
         assert_eq!(field(&long).chars().count(), 128);
+        // With a cover, the cover is the large image and the logo becomes the badge.
+        let a = activity_json(&p, Some("https://e/c.jpg"));
+        assert_eq!(a["assets"]["large_image"], "https://e/c.jpg");
+        assert_eq!(a["assets"]["small_image"], "plexdio");
     }
 
     #[cfg(unix)]
@@ -348,8 +374,8 @@ mod tests {
         });
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
         let mut conn = Conn::open("123").expect("connects to the fake socket");
-        let p = Presence { title: "Song".into(), artist: "Band".into(), album: "LP".into(), start_ms: 5, end_ms: None };
-        conn.set_activity(Some(&p)).unwrap();
+        let p = Presence { title: "Song".into(), artist: "Band".into(), album: "LP".into(), start_ms: 5, end_ms: None, cover: false };
+        conn.set_activity(Some(&p), None).unwrap();
         let frames = server.join().unwrap();
         assert_eq!(frames[0].0, OP_HANDSHAKE);
         assert_eq!(frames[0].1["client_id"], "123");

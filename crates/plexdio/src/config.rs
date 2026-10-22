@@ -57,6 +57,8 @@ pub struct Config {
     pub discord_presence: bool,
     /// The user's own Discord application ID (Developer Portal); empty uses the built-in one.
     pub discord_client_id: String,
+    /// Show the album cover (looked up on Deezer/iTunes) instead of the app logo.
+    pub discord_covers: bool,
     /// Equaliser on/off and gain per band in dB (see `audio::eq::BANDS`).
     pub eq_enabled: bool,
     pub eq_gains: [f32; crate::audio::eq::BAND_COUNT],
@@ -87,6 +89,7 @@ impl Default for Config {
             start_with_windows: false,
             discord_presence: false,
             discord_client_id: String::new(),
+            discord_covers: true,
             eq_enabled: false,
             eq_gains: [0.0; crate::audio::eq::BAND_COUNT],
             window_size: None,

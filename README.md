@@ -54,7 +54,7 @@ Mini-player:
 - **Reporting**: `/:/timeline` while playing (every 10 s and on state changes), `/:/scrobble`
   at 90 %, and star ratings through `/:/rate`.
 - **Discord Rich Presence** (optional): your Discord status shows "Listening to Plexdio" with
-  the song, artist, album and a progress bar while music plays; pausing clears it. See
+  the song, artist, album cover and a progress bar while music plays; pausing clears it. See
   [Discord setup](#discord-setup).
 - **Windows integration**: a themed title bar (drag, double-click to maximise, resize from any
   edge, live redraw while resizing), tray icon with menu, minimise/close to tray, media keys
@@ -87,10 +87,11 @@ which you create once for free; it takes about two minutes.
 2. Click **New Application**, name it **Plexdio** (this name is what your status shows after
    "Listening to"), accept the terms and click **Create**.
 3. On the **General Information** page, click **Copy** under **Application ID**.
-4. *Optional, for the picture on your status:* open **Rich Presence → Art Assets**, click
+4. *Optional, for the Plexdio logo:* open **Rich Presence → Art Assets**, click
    **Add Image(s)**, upload [`assets/discord-icon.png`](assets/discord-icon.png) (or any square
    image of at least 512×512), set its name to `plexdio` exactly, and click **Save Changes**.
-   New images can take a few minutes to show up.
+   New images can take a few minutes to show up. The logo appears as a small badge on the
+   album cover, or on its own when no cover is found.
 5. In Plexdio open **Settings → Discord**, paste the ID into **Application ID**, and switch on
    **Show what I'm listening to**.
 6. Keep the Discord desktop app running and play a song; your status appears within a few
@@ -99,6 +100,13 @@ which you create once for free; it takes about two minutes.
 If nothing shows up, check that *Discord → User Settings → Activity Privacy → Share your
 detected activities with others* is on, and that you use the desktop app (the browser version
 cannot see other apps).
+
+**Album covers.** Discord can only show pictures from the public internet, and your Plex
+artwork lives on your own server behind your Plex token, which Plexdio never shares. So the
+cover is looked up by artist and album name on [Deezer](https://www.deezer.com) and, if that
+finds nothing, Apple's iTunes Search; only an exact artist and album match is used, so you see
+the logo rather than a wrong cover. This sends the artist and album names (nothing else) to
+those services; turn off **Settings → Discord → Album covers** to keep them local.
 
 The setting is off by default because it shares your listening activity. Plexdio talks to the
 Discord desktop app over its local IPC pipe, retries every 15 s while Discord is closed, and
@@ -181,6 +189,7 @@ crates/plexdio
   secure_store.rs    Credential Manager -> DPAPI file fallback
   logging.rs         rotating file log (1 MB x 3)
   discord.rs         Discord Rich Presence over the local IPC pipe
+  cover_art.rs       public album-cover lookup (Deezer, iTunes) for Rich Presence
   plex/              HTTP client, PIN auth, resource/connection racing, models, endpoints
   cache/             SQLite schema/db, full+delta sync, artwork disk cache, audio cache
   library_model.rs   compact in-memory indexes (interned Arc<str>) for lists and search
@@ -214,7 +223,7 @@ Data locations: `%APPDATA%\Plexdio\config.json` (settings, resume queue),
 
 ## Footprint
 
-Release exe: **10 022 400 bytes (9.56 MiB)**, PE32+ x86-64, system DLLs only.
+Release exe: **10 034 176 bytes (9.57 MiB)**, PE32+ x86-64, system DLLs only.
 
 | Environment | Library | Idle working set | Idle CPU | Playing CPU |
 |---|---|---|---|---|
@@ -257,7 +266,7 @@ memory under Wine.
 ## Testing
 
 ```sh
-cargo test --workspace                                  # 93 tests: parsing, sync, audio, EQ, queue, ...
+cargo test --workspace                                  # 97 tests: parsing, sync, audio, EQ, queue, ...
 cargo test --workspace --target x86_64-pc-windows-gnu   # same suite under Wine
 semgrep scan --config p/default --metrics off crates     # 0 findings
 cargo clippy --workspace --all-targets -- -D warnings

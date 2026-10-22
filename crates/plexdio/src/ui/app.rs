@@ -272,8 +272,8 @@ pub struct PlexdioApp {
     smtc: Option<Smtc>,
     /// Discord Rich Presence worker, running while the setting is on.
     discord: Option<crate::discord::DiscordPresence>,
-    /// Last presence sent: (track id, start time in unix ms); `None` when cleared.
-    discord_last: Option<(i64, i64)>,
+    /// Last presence sent: (track id, start time in unix ms, covers on); `None` when cleared.
+    discord_last: Option<(i64, i64, bool)>,
     /// Application ID the running presence worker was started with.
     discord_client: Option<String>,
     /// Buttons pressed on the media overlay, delivered on the next frame.
@@ -2208,7 +2208,9 @@ impl PlexdioApp {
         };
         let changed = match (&wanted, self.discord_last) {
             (None, None) => false,
-            (Some((t, start, _)), Some((id, last_start))) => t.id != id || (start - last_start).abs() > 2_000,
+            (Some((t, start, _)), Some((id, last_start, covers))) => {
+                t.id != id || (start - last_start).abs() > 2_000 || covers != self.config.discord_covers
+            }
             _ => true,
         };
         if !changed {
@@ -2222,8 +2224,9 @@ impl PlexdioApp {
                     album: t.album.clone(),
                     start_ms,
                     end_ms,
+                    cover: self.config.discord_covers,
                 }));
-                self.discord_last = Some((t.id, start_ms));
+                self.discord_last = Some((t.id, start_ms, self.config.discord_covers));
             }
             None => {
                 discord.set(None);
@@ -2430,6 +2433,18 @@ impl PlexdioApp {
                 *changed = true;
             }
         });
+        setting_row(
+            ui,
+            "Album covers",
+            Some("Found on Deezer or iTunes by artist and album name, since Discord can't see your Plex server"),
+            |ui| {
+                let mut v = self.config.discord_covers;
+                if ui.add_enabled_ui(ok, |ui| theme::toggle(ui, &mut v)).inner.changed() {
+                    self.config.discord_covers = v;
+                    *changed = true;
+                }
+            },
+        );
         ui.add_space(4.0);
         if ui.link("How to set up Discord status").on_hover_text(crate::discord::SETUP_URL).clicked()
             && !crate::win::open_url(crate::discord::SETUP_URL)
