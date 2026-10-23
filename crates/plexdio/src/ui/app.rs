@@ -1804,7 +1804,9 @@ impl PlexdioApp {
             ui.scope_builder(
                 egui::UiBuilder::new().max_rect(center_rect).layout(egui::Layout::top_down(egui::Align::LEFT)),
                 |ui| {
-                    ui.horizontal(|ui| {
+                    // Full play-button height from the start: `horizontal` begins at the 18 pt
+                    // interact height, which would center shuffle/prev higher than the rest.
+                    ui.allocate_ui_with_layout(egui::vec2(center_w, 24.0), Layout::left_to_right(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
                         // shuffle, prev, play, next, repeat
                         let transport_w = 18.0 * 4.0 + 24.0 + 12.0 * 4.0;
