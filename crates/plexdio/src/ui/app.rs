@@ -2693,8 +2693,10 @@ impl UiApp for PlexdioApp {
         // close button.
         if !self.mini {
             let title = self.window_title.clone();
-            if super::titlebar::show(ui, &title, true) == super::titlebar::TitleAction::Close {
-                self.close_window(ui.ctx());
+            match super::titlebar::show(ui, &title, true) {
+                super::titlebar::TitleAction::Close => self.close_window(ui.ctx()),
+                super::titlebar::TitleAction::MiniPlayer => self.toggle_mini(),
+                super::titlebar::TitleAction::None => {}
             }
         }
         match self.screen.clone() {

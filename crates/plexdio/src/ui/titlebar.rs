@@ -1,5 +1,5 @@
 //! Custom window title bar (the native one is turned off with `with_decorations(false)`):
-//! drag to move, double-click to maximize, themed minimize/maximize/close buttons, and
+//! drag to move, double-click to maximize, themed mini-player/minimize/maximize/close buttons, and
 //! resize handles along the window edges.
 
 use crate::ui::icons::{self, Icon};
@@ -18,10 +18,13 @@ pub enum TitleAction {
     None,
     /// Close button (the app decides between closing to the tray and quitting).
     Close,
+    /// Mini-player button.
+    MiniPlayer,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Glyph {
+    MiniPlayer,
     Minimize,
     Maximize,
     Restore,
@@ -39,7 +42,7 @@ pub fn show(ui: &mut egui::Ui, title: &str, can_maximize: bool) -> TitleAction {
         .frame(egui::Frame::new().fill(theme::SIDEBAR))
         .show(ui, |ui| {
             let bar = ui.max_rect();
-            let buttons = if can_maximize { 3.0 } else { 2.0 };
+            let buttons = if can_maximize { 4.0 } else { 3.0 };
             let drag_rect = Rect::from_min_max(bar.min, egui::pos2(bar.right() - BUTTON_W * buttons, bar.bottom()));
             // Leave the resize bands along the top/left edges to `resize_edges`.
             let inset = if maximized || !can_maximize { 0.0 } else { EDGE };
@@ -105,6 +108,9 @@ pub fn show(ui: &mut egui::Ui, title: &str, can_maximize: bool) -> TitleAction {
             if button(ui, Glyph::Minimize, "Minimize") {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
             }
+            if button(ui, Glyph::MiniPlayer, "Mini-player (Ctrl+M)") {
+                action = TitleAction::MiniPlayer;
+            }
         });
     action
 }
@@ -114,6 +120,9 @@ fn paint_glyph(p: &egui::Painter, c: egui::Pos2, glyph: Glyph, color: Color32) {
     let s = Stroke::new(1.0, color);
     let h = 5.0;
     match glyph {
+        Glyph::MiniPlayer => {
+            icons::paint(p, Rect::from_center_size(c, egui::vec2(16.0, 16.0)), Icon::MiniPlayer, color);
+        }
         Glyph::Minimize => {
             p.line_segment([egui::pos2(c.x - h, c.y), egui::pos2(c.x + h, c.y)], s);
         }
