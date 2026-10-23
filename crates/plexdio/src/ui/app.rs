@@ -37,7 +37,7 @@ use super::theme;
 
 pub const TOKEN_NAME: &str = "plex-token";
 /// Client size of the mini-player window (logical points).
-const MINI_SIZE: [u32; 2] = [420, 84];
+const MINI_SIZE: [u32; 2] = [520, 84];
 
 /// Command-line options.
 #[derive(Debug, Clone, Default)]
@@ -750,13 +750,15 @@ impl PlexdioApp {
         }
     }
 
-    /// Compact always-on-top layout: art, title, basic transport and a seek bar.
+    /// Compact always-on-top layout: art, title, basic transport, a seek bar and volume.
     fn mini_player(&mut self, ui: &mut egui::Ui) {
         enum Cmd {
             Toggle,
             Next,
             Prev,
             Seek(u64),
+            Volume(f32),
+            Mute(bool),
             Expand,
             Close,
         }
@@ -828,6 +830,18 @@ impl PlexdioApp {
                 if icons::button(ui, Icon::MiniPlayer, 18.0, false).on_hover_text("Back to the full window").clicked() {
                     cmds.push(Cmd::Expand);
                 }
+                ui.add_space(4.0);
+                let mut vol = st.volume as f64;
+                ui.spacing_mut().slider_width = 64.0;
+                if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false)).changed() {
+                    cmds.push(Cmd::Volume(vol as f32));
+                }
+                if icons::button(ui, if st.muted { Icon::Mute } else { Icon::Volume }, 15.0, false)
+                    .on_hover_text(if st.muted { "Unmute" } else { "Mute" })
+                    .clicked()
+                {
+                    cmds.push(Cmd::Mute(!st.muted));
+                }
             });
         });
         for c in cmds {
@@ -842,6 +856,15 @@ impl PlexdioApp {
                     self.poll_playback();
                     // Keep polling while the seek lands.
                     self.wake_poll = Some(std::time::Instant::now() + Duration::from_secs(1));
+                }
+                Cmd::Volume(v) => self.nudge_volume(v - self.config.volume),
+                Cmd::Mute(m) => {
+                    if let Some(eng) = &self.engine {
+                        eng.set_muted(m);
+                    }
+                    self.config.muted = m;
+                    self.save_config();
+                    self.poll_playback();
                 }
                 Cmd::Expand => self.toggle_mini(),
                 Cmd::Close => self.close_window(ui.ctx()),
