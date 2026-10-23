@@ -1799,6 +1799,8 @@ impl PlexdioApp {
             // Center column: transport row, then elapsed / seek bar / duration.
             ui.add_space(gap);
             let (center_rect, _) = ui.allocate_exact_size(egui::vec2(center_w, 56.0), egui::Sense::hover());
+            // The seek row's rect, so the right column can line up with it.
+            let mut seek_row = center_rect;
             ui.scope_builder(
                 egui::UiBuilder::new().max_rect(center_rect).layout(egui::Layout::top_down(egui::Align::LEFT)),
                 |ui| {
@@ -1806,7 +1808,9 @@ impl PlexdioApp {
                         ui.spacing_mut().item_spacing.x = 12.0;
                         // shuffle, prev, play, next, repeat
                         let transport_w = 18.0 * 4.0 + 24.0 + 12.0 * 4.0;
-                        ui.add_space(((center_w - transport_w) / 2.0 - 12.0).max(0.0));
+                        // Center over the seek slider, which sits 2 pt left of the column center
+                        // (its width leaves 4 pt spare on the right).
+                        ui.add_space(((center_w - transport_w) / 2.0 - 2.0).max(0.0));
                         if icons::button(ui, Icon::Shuffle, 18.0, st.shuffle)
                             .on_hover_text(if st.shuffle { "Shuffle is on" } else { "Shuffle the queue" })
                             .clicked()
@@ -1838,7 +1842,7 @@ impl PlexdioApp {
                             cmds.push(BarCmd::Repeat);
                         }
                     });
-                    ui.horizontal(|ui| {
+                    seek_row = ui.horizontal(|ui| {
                         // Fixed-width time labels: "0:08" and "1:02:03" would otherwise move the bar.
                         const TIME_W: f32 = 44.0;
                         let dur_ms = track.duration_ms.max(st.duration_ms);
@@ -1857,12 +1861,20 @@ impl PlexdioApp {
                             cmds.push(BarCmd::Seek((pos * 1000.0) as u64));
                         }
                         time(ui, dur_ms, egui::Align::LEFT);
-                    });
+                    })
+                    .response
+                    .rect;
                 },
             );
 
-            // Right column, laid out from the window edge inwards.
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // Right column, laid out from the window edge inwards, on the same line as the seek
+            // bar so the volume slider lines up with it.
+            let avail = ui.available_rect_before_wrap();
+            let right_rect = egui::Rect::from_min_max(
+                egui::pos2(avail.left(), seek_row.top()),
+                egui::pos2(avail.right(), seek_row.bottom()),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
                 let mut vol = st.volume as f64;
                 ui.spacing_mut().slider_width = vol_w;
                 if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false)).changed() {
