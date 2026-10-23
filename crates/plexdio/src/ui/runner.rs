@@ -88,6 +88,10 @@ struct Gfx {
     state: egui_winit::State,
     renderer: EguiSoftwareRender,
     viewport_info: egui::ViewportInfo,
+    /// Texture (font atlas) updates not yet handed to the renderer. Frames run while the window
+    /// is minimized or hidden still add glyphs to the atlas; dropping those deltas leaves holes
+    /// in the text after restore, so they are kept until the next frame that actually renders.
+    pending_textures: egui::TexturesDelta,
 }
 
 struct Runner<A: UiApp> {
@@ -173,6 +177,7 @@ impl<A: UiApp> Runner<A> {
             state,
             renderer: EguiSoftwareRender::new(ColorFieldOrder::Bgra),
             viewport_info,
+            pending_textures: egui::TexturesDelta::default(),
         })
     }
 
@@ -189,6 +194,7 @@ impl<A: UiApp> Runner<A> {
 
         let app = &mut self.app;
         let mut full_output = self.ctx.run_ui(raw_input, |ui| app.ui(ui));
+        gfx.pending_textures.append(std::mem::take(&mut full_output.textures_delta));
 
         gfx.state
             .handle_platform_output_with_event_loop(&gfx.window, event_loop, full_output.platform_output);
@@ -238,25 +244,22 @@ impl<A: UiApp> Runner<A> {
 
         let size = gfx.window.inner_size();
         let visible = gfx.window.is_visible().unwrap_or(true) && gfx.window.is_minimized() != Some(true);
+        // Skipped frames keep their texture deltas in `pending_textures` for the next render.
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
-            full_output.textures_delta.clear();
             return;
         };
         if !visible {
-            full_output.textures_delta.clear();
             return;
         }
         let primitives = self.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         if let Err(e) = gfx.surface.resize(w, h) {
             log::error!("surface resize failed: {e}");
-            full_output.textures_delta.clear();
             return;
         }
         let mut buffer = match gfx.surface.buffer_mut() {
             Ok(b) => b,
             Err(e) => {
                 log::error!("surface buffer unavailable: {e}");
-                full_output.textures_delta.clear();
                 return;
             }
         };
@@ -269,9 +272,9 @@ impl<A: UiApp> Runner<A> {
         let bytes: &mut [[u8; 4]] =
             unsafe { std::slice::from_raw_parts_mut(px.as_mut_ptr().cast::<[u8; 4]>(), px.len()) };
         let mut target = BufferMutRef::new(bytes, w.get() as usize, h.get() as usize);
-        gfx.renderer.render(&mut target, &primitives, &full_output.textures_delta, full_output.pixels_per_point);
+        gfx.renderer.render(&mut target, &primitives, &gfx.pending_textures, full_output.pixels_per_point);
         // The renderer applies the deltas by reference; epaint panics if they are dropped unapplied.
-        full_output.textures_delta.clear();
+        gfx.pending_textures.clear();
         if let Err(e) = buffer.present() {
             log::error!("present failed: {e}");
         }
@@ -367,6 +370,10 @@ impl<A: UiApp> ApplicationHandler<RunnerEvent> for Runner<A> {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(gfx) = self.gfx.as_mut() {
+            // Quitting while minimized can leave deltas queued; epaint asserts on dropping them.
+            gfx.pending_textures.clear();
+        }
         self.app.on_exit();
     }
 }
