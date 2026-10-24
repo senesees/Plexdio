@@ -80,6 +80,8 @@ pub enum Msg {
     LibraryLoaded(u64, Result<Box<LibraryModel>, String>),
     SyncProgress(u64, SyncProgress),
     SyncDone(u64, Result<SyncReport, String>),
+    /// Output device names and the Windows default, listed off the UI thread.
+    OutputDevices(Vec<String>, Option<String>),
 }
 
 /// Background sync status shown in the sidebar.
@@ -286,8 +288,10 @@ pub struct PlexdioApp {
     hide_window: bool,
     /// Client area size seen in the last frame, saved on exit so the window reopens as it was.
     last_window_size: Option<[f32; 2]>,
-    /// Output devices and the Windows default shown in settings: (names, default, listed at).
-    output_devices: Option<(Vec<String>, Option<String>, std::time::Instant)>,
+    /// Output devices and the Windows default shown in settings: (names, default).
+    output_devices: Option<(Vec<String>, Option<String>)>,
+    /// When the last device listing was started; `None` while one is still running.
+    output_devices_at: Option<std::time::Instant>,
 }
 
 impl PlexdioApp {
@@ -365,6 +369,7 @@ impl PlexdioApp {
             window_title: String::new(),
             hide_window: false,
             output_devices: None,
+            output_devices_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             last_window_size: None,
         };
         app.token = app.store.get();
@@ -1091,6 +1096,10 @@ impl PlexdioApp {
                 }
             }
             Msg::LibraryLoaded(..) | Msg::SyncProgress(..) | Msg::SyncDone(..) => {}
+            Msg::OutputDevices(devices, default) => {
+                self.output_devices = Some((devices, default));
+                self.output_devices_at = Some(std::time::Instant::now());
+            }
             Msg::Sections(id, res) => {
                 let Some(idx) = self.servers.iter().position(|s| s.res.client_identifier == id) else { return };
                 let res = res.map_err(|e| e.user_message());
@@ -2326,16 +2335,16 @@ impl PlexdioApp {
             }
         });
         // Re-list devices every few seconds while settings are open, so plugged-in devices and a
-        // new Windows default show up.
-        if self.output_devices.as_ref().is_none_or(|(_, _, at)| at.elapsed() >= std::time::Duration::from_secs(3)) {
-            self.output_devices = Some((
-                crate::audio::sink::list_output_devices(),
-                crate::audio::sink::default_output_name(),
-                std::time::Instant::now(),
-            ));
+        // new Windows default show up. Listing is slow on Windows, so it runs on a worker thread.
+        if self.output_devices_at.is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(3)) {
+            self.output_devices_at = None;
+            self.jobs.spawn("list-output-devices", || {
+                Msg::OutputDevices(crate::audio::sink::list_output_devices(), crate::audio::sink::default_output_name())
+            });
         }
         setting_row(ui, "Output device", Some("Where music plays; the Windows default follows system changes"), |ui| {
-            let (devices, default, _) = self.output_devices.as_ref().expect("listed above");
+            let empty = (Vec::new(), None);
+            let (devices, default) = self.output_devices.as_ref().unwrap_or(&empty);
             let default_label = match default {
                 Some(name) => format!("Windows default ({name})"),
                 None => "Windows default".to_string(),
