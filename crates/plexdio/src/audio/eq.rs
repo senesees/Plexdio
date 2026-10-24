@@ -148,6 +148,13 @@ impl Equalizer {
         self.preamp = db_to_linear(-max_boost * 0.5);
     }
 
+    /// Rebuild the filters for a new output sample rate, keeping the settings.
+    pub fn set_rate(&mut self, rate: u32) {
+        self.rate = rate as f32;
+        self.filters.clear();
+        self.set(self.enabled, self.gains);
+    }
+
     pub fn is_active(&self) -> bool {
         !self.filters.is_empty()
     }

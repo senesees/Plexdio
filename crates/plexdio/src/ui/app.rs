@@ -286,6 +286,8 @@ pub struct PlexdioApp {
     hide_window: bool,
     /// Client area size seen in the last frame, saved on exit so the window reopens as it was.
     last_window_size: Option<[f32; 2]>,
+    /// Output devices and the Windows default shown in settings: (names, default, listed at).
+    output_devices: Option<(Vec<String>, Option<String>, std::time::Instant)>,
 }
 
 impl PlexdioApp {
@@ -362,6 +364,7 @@ impl PlexdioApp {
             quitting: false,
             window_title: String::new(),
             hide_window: false,
+            output_devices: None,
             last_window_size: None,
         };
         app.token = app.store.get();
@@ -1480,6 +1483,7 @@ impl PlexdioApp {
                 normalization: self.config.normalization,
                 eq_enabled: self.config.eq_enabled,
                 eq_gains: self.config.eq_gains,
+                output_device: self.config.output_device.clone(),
             };
             log::info!("starting playback engine (crossfade {} ms, normalization {})", cfg.crossfade_ms, cfg.normalization);
             let eng = Engine::start(cache, self.http.clone(), cfg);
@@ -2318,6 +2322,41 @@ impl PlexdioApp {
             });
             if q != self.config.quality {
                 self.config.quality = q;
+                *changed = true;
+            }
+        });
+        // Re-list devices every few seconds while settings are open, so plugged-in devices and a
+        // new Windows default show up.
+        if self.output_devices.as_ref().is_none_or(|(_, _, at)| at.elapsed() >= std::time::Duration::from_secs(3)) {
+            self.output_devices = Some((
+                crate::audio::sink::list_output_devices(),
+                crate::audio::sink::default_output_name(),
+                std::time::Instant::now(),
+            ));
+        }
+        setting_row(ui, "Output device", Some("Where music plays; the Windows default follows system changes"), |ui| {
+            let (devices, default, _) = self.output_devices.as_ref().expect("listed above");
+            let default_label = match default {
+                Some(name) => format!("Windows default ({name})"),
+                None => "Windows default".to_string(),
+            };
+            let mut device = self.config.output_device.clone();
+            let selected = match &device {
+                None => default_label.clone(),
+                Some(name) if devices.contains(name) => name.clone(),
+                Some(name) => format!("{name} (unavailable)"),
+            };
+            egui::ComboBox::from_id_salt("output-device").selected_text(selected).width(240.0).truncate().show_ui(ui, |ui| {
+                ui.selectable_value(&mut device, None, default_label);
+                for name in devices {
+                    ui.selectable_value(&mut device, Some(name.clone()), name);
+                }
+            });
+            if device != self.config.output_device {
+                self.config.output_device = device.clone();
+                if let Some(e) = &self.engine {
+                    e.set_output_device(device);
+                }
                 *changed = true;
             }
         });

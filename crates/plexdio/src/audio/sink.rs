@@ -20,6 +20,10 @@ pub trait Sink {
     fn resume(&mut self);
     fn set_volume(&mut self, volume: f32);
     fn flush(&mut self);
+    /// True once the device went away (unplugged, disabled); the engine then reopens output.
+    fn lost(&self) -> bool {
+        false
+    }
 }
 
 /// Discards audio, but keeps a real-time paced virtual ring so the engine behaves exactly as it
@@ -173,10 +177,11 @@ impl Sink for CollectSink {
     }
 }
 
-/// Open the default Windows audio endpoint, falling back to a silent sink.
-pub fn open_default() -> Box<dyn Sink> {
+/// Open an output device by name, or the Windows default endpoint for `None` (or when the named
+/// device is gone), falling back to a silent sink.
+pub fn open_output(device: Option<&str>) -> Box<dyn Sink> {
     #[cfg(windows)]
-    match cpal_sink::CpalSink::open() {
+    match cpal_sink::CpalSink::open(device) {
         Ok(s) => {
             log::info!("audio output: {} @ {} Hz", s.name(), s.sample_rate());
             return Box::new(s);
@@ -185,7 +190,33 @@ pub fn open_default() -> Box<dyn Sink> {
             log::warn!("no audio output device ({e}); continuing silently");
         }
     }
+    #[cfg(not(windows))]
+    let _ = device;
     Box::new(NullSink::new(44_100))
+}
+
+/// Names of every output device, for the settings list.
+pub fn list_output_devices() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        match cpal::default_host().output_devices() {
+            Ok(devices) => return devices.filter_map(|d| d.name().ok()).collect(),
+            Err(e) => log::warn!("cannot list output devices: {e}"),
+        }
+    }
+    Vec::new()
+}
+
+/// Name of the current Windows default output device.
+pub fn default_output_name() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        return cpal::default_host().default_output_device().and_then(|d| d.name().ok());
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 #[cfg(windows)]
@@ -204,6 +235,8 @@ mod cpal_sink {
         paused: AtomicBool,
         /// Set by `flush`; the callback drains queued audio before it plays anything new.
         flush: AtomicBool,
+        /// Set by the error callback when the device is no longer available.
+        lost: AtomicBool,
     }
 
     pub struct CpalSink {
@@ -216,9 +249,19 @@ mod cpal_sink {
     }
 
     impl CpalSink {
-        pub fn open() -> Result<Self, String> {
+        pub fn open(wanted: Option<&str>) -> Result<Self, String> {
             let host = cpal::default_host();
-            let device = host.default_output_device().ok_or("no default output device")?;
+            let named = wanted.and_then(|w| {
+                let found = host.output_devices().ok()?.find(|d| d.name().is_ok_and(|n| n == w));
+                if found.is_none() {
+                    log::warn!("output device \"{w}\" not found; using the Windows default");
+                }
+                found
+            });
+            let device = match named {
+                Some(d) => d,
+                None => host.default_output_device().ok_or("no default output device")?,
+            };
             let name = device.name().unwrap_or_else(|_| "audio output".into());
             let supported = device.default_output_config().map_err(|e| format!("default output config: {e}"))?;
             let format = supported.sample_format();
@@ -228,6 +271,7 @@ mod cpal_sink {
                 volume: AtomicU32::new(1.0f32.to_bits()),
                 paused: AtomicBool::new(false),
                 flush: AtomicBool::new(false),
+                lost: AtomicBool::new(false),
             });
             let (producer, consumer) = RingBuffer::<f32>::new(RING_FRAMES * 2);
             let stream = match format {
@@ -251,7 +295,13 @@ mod cpal_sink {
         T: SizedSample + FromSample<f32>,
     {
         let channels = config.channels as usize;
-        let err_fn = |e| log::warn!("audio stream error: {e}");
+        let err_shared = shared.clone();
+        let err_fn = move |e: cpal::StreamError| {
+            log::warn!("audio stream error: {e}");
+            if matches!(e, cpal::StreamError::DeviceNotAvailable) {
+                err_shared.lost.store(true, Ordering::Relaxed);
+            }
+        };
         device
             .build_output_stream(
                 config,
@@ -351,6 +401,10 @@ mod cpal_sink {
 
         fn flush(&mut self) {
             self.shared.flush.store(true, Ordering::Relaxed);
+        }
+
+        fn lost(&self) -> bool {
+            self.shared.lost.load(Ordering::Relaxed)
         }
     }
 }

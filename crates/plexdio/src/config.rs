@@ -62,6 +62,8 @@ pub struct Config {
     /// Equaliser on/off and gain per band in dB (see `audio::eq::BANDS`).
     pub eq_enabled: bool,
     pub eq_gains: [f32; crate::audio::eq::BAND_COUNT],
+    /// Output device name; `None` follows the Windows default device.
+    pub output_device: Option<String>,
     pub window_size: Option<[f32; 2]>,
 }
 
@@ -92,6 +94,7 @@ impl Default for Config {
             discord_covers: true,
             eq_enabled: false,
             eq_gains: [0.0; crate::audio::eq::BAND_COUNT],
+            output_device: None,
             window_size: None,
         }
     }

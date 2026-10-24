@@ -7,7 +7,7 @@
 use super::decode::TrackDecoder;
 use super::eq::{Equalizer, BAND_COUNT};
 use super::gain::{limit, track_gain};
-use super::sink::{open_default, NullSink, Sink};
+use super::sink::{default_output_name, open_output, NullSink, Sink};
 use super::source::{AudioCache, SourceSpec};
 use crate::config::RepeatMode;
 use crate::plex::http::Http;
@@ -134,11 +134,13 @@ pub struct EngineConfig {
     pub eq_enabled: bool,
     /// Gain per equaliser band in dB (see [`super::eq::BANDS`]).
     pub eq_gains: [f32; BAND_COUNT],
+    /// Output device name; `None` follows the Windows default.
+    pub output_device: Option<String>,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { volume: 1.0, muted: false, crossfade_ms: 0, normalization: true, eq_enabled: false, eq_gains: [0.0; BAND_COUNT] }
+        Self { volume: 1.0, muted: false, crossfade_ms: 0, normalization: true, eq_enabled: false, eq_gains: [0.0; BAND_COUNT], output_device: None }
     }
 }
 
@@ -168,6 +170,8 @@ pub enum Command {
     SetNormalization(bool),
     /// Equaliser on/off and band gains in dB.
     SetEq(bool, [f32; BAND_COUNT]),
+    /// Switch output to the named device; `None` follows the Windows default.
+    SetOutputDevice(Option<String>),
     /// Replace the queue and load the given queue slot at `position_ms`, paused (session resume).
     Restore(Vec<TrackSpec>, usize, u64),
     Stop,
@@ -297,6 +301,51 @@ impl PlayerCore {
         self.rate
     }
 
+    /// True when the output device went away and should be reopened.
+    pub fn sink_lost(&self) -> bool {
+        self.sink.lost()
+    }
+
+    /// Move playback to another output. Audio still queued on the old device is dropped; when
+    /// the sample rate differs the current track is reopened at the position heard last.
+    pub fn replace_sink(&mut self, sink: Box<dyn Sink>) {
+        let position_ms = self.position_ms();
+        self.sink.flush();
+        self.sink = sink;
+        self.sink_name = self.sink.name();
+        self.sink_real = self.sink.is_real();
+        let rate = self.sink.sample_rate();
+        if rate != self.rate {
+            self.rate = rate;
+            self.eq.set_rate(rate);
+            self.next = None;
+            self.next_pos = None;
+            self.prefetch = None;
+            if let Some(cur) = self.current.take() {
+                match open_active(&self.cache, &self.http, &cur.spec, rate, self.normalization, self.crossfade_ms) {
+                    Ok(mut active) => {
+                        let frames = position_ms.saturating_mul(rate as u64) / 1000;
+                        if let Err(e) = active.decoder.seek(position_ms) {
+                            log::warn!("cannot restore position after output change: {e}");
+                        } else {
+                            active.frames_left = active.total_frames.map(|t| t.saturating_sub(frames));
+                        }
+                        self.current = Some(active);
+                        self.frames_played = frames;
+                    }
+                    Err(e) => {
+                        self.fail(format!("Cannot play “{}”: {e}", cur.spec.title));
+                    }
+                }
+            }
+        }
+        self.apply_volume();
+        if self.state == PlayState::Paused {
+            self.sink.pause();
+        }
+        self.spawn_prefetch();
+    }
+
     fn apply_volume(&mut self) {
         let v = if self.muted { 0.0 } else { self.volume };
         self.sink.set_volume(v);
@@ -368,6 +417,8 @@ impl PlayerCore {
                 }
             }
             Command::SetEq(on, gains) => self.eq.set(on, gains),
+            // Opening devices happens on the engine thread loop, which owns the output stream.
+            Command::SetOutputDevice(_) => {}
             Command::Stop => {
                 self.sink.flush();
                 self.current = None;
@@ -1032,20 +1083,44 @@ impl Engine {
             .spawn(move || {
                 // The output stream is created on this thread and never moves: cpal streams are
                 // deliberately not `Send` on all platforms.
-                let sink = open_default();
+                let mut output = cfg.output_device.clone();
+                let mut default_name = default_output_name();
+                let sink = open_output(output.as_deref());
                 let mut core = PlayerCore::new(sink, cache, http, cfg);
                 let shared = Arc::new(Mutex::new(core.status()));
                 let _ = ready_tx.send(shared.clone());
                 let mut last_publish = Instant::now();
+                let mut last_device_check = Instant::now();
                 loop {
                     let idle = core.state != PlayState::Playing;
                     match rx.recv_timeout(if idle { Duration::from_millis(100) } else { Duration::from_millis(10) }) {
                         Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Ok(Command::SetOutputDevice(device)) => {
+                            log::info!("output device set to {}", device.as_deref().unwrap_or("Windows default"));
+                            output = device;
+                            default_name = default_output_name();
+                            core.replace_sink(open_output(output.as_deref()));
+                            last_publish = Instant::now() - Duration::from_secs(1);
+                        }
                         Ok(cmd) => {
                             core.handle(cmd);
                             last_publish = Instant::now() - Duration::from_secs(1);
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    // cpal stays on the device it opened, so follow Windows default changes and
+                    // recover from unplugged devices here.
+                    if last_device_check.elapsed() >= Duration::from_secs(1) {
+                        last_device_check = Instant::now();
+                        let lost = core.sink_lost();
+                        let current_default = if output.is_none() || lost { default_output_name() } else { default_name.clone() };
+                        let default_changed = output.is_none() && current_default != default_name;
+                        if lost || default_changed {
+                            log::info!("audio output changed (default now {}); reopening", current_default.as_deref().unwrap_or("none"));
+                            default_name = current_default;
+                            core.replace_sink(open_output(output.as_deref()));
+                            last_publish = Instant::now() - Duration::from_secs(1);
+                        }
                     }
                     core.pump();
                     if last_publish.elapsed() >= Duration::from_millis(100) {
@@ -1136,6 +1211,10 @@ impl Engine {
 
     pub fn set_eq(&self, on: bool, gains: [f32; BAND_COUNT]) {
         self.send(Command::SetEq(on, gains));
+    }
+
+    pub fn set_output_device(&self, device: Option<String>) {
+        self.send(Command::SetOutputDevice(device));
     }
 
     pub fn stop(&self) {
