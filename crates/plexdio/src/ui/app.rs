@@ -794,42 +794,8 @@ impl PlexdioApp {
                 }
             }
             ui.add_space(10.0);
-            ui.vertical(|ui| {
-                let (title, sub) = match &track {
-                    Some(t) => (t.title.clone(), format!("{} · {}", t.artist, t.album)),
-                    None => ("Nothing playing".to_string(), "Pick a track in the full window".to_string()),
-                };
-                ui.add(egui::Label::new(RichText::new(title).strong().size(15.0)).truncate());
-                ui.add(egui::Label::new(RichText::new(sub).small().color(theme::TEXT_DIM)).truncate());
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    if icons::button(ui, Icon::Prev, 15.0, false).on_hover_text("Previous").clicked() {
-                        cmds.push(Cmd::Prev);
-                    }
-                    let playing = st.state == PlayState::Playing;
-                    if icons::button(ui, if playing { Icon::Pause } else { Icon::Play }, 20.0, false)
-                        .on_hover_text(if playing { "Pause" } else { "Play" })
-                        .clicked()
-                    {
-                        cmds.push(Cmd::Toggle);
-                    }
-                    if icons::button(ui, Icon::Next, 15.0, false).on_hover_text("Next").clicked() {
-                        cmds.push(Cmd::Next);
-                    }
-                    ui.add_space(6.0);
-                    let mut pos = st.position_ms as f64 / 1000.0;
-                    let dur = (st.duration_ms as f64 / 1000.0).max(0.001);
-                    ui.spacing_mut().slider_width = 110.0;
-                    if ui.add(egui::Slider::new(&mut pos, 0.0..=dur).show_value(false)).changed() {
-                        cmds.push(Cmd::Seek((pos * 1000.0) as u64));
-                    }
-                    ui.label(
-                        RichText::new(format!("{} / {}", fmt_duration(st.position_ms), fmt_duration(st.duration_ms)))
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                });
-            });
+            // Buttons and volume first, from the right edge; the title block then gets only the
+            // width that is left, so long titles truncate instead of running under the volume.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(4.0);
                 if icons::button(ui, Icon::Close, 16.0, false).on_hover_text("Close").clicked() {
@@ -850,6 +816,43 @@ impl PlexdioApp {
                 {
                     cmds.push(Cmd::Mute(!st.muted));
                 }
+                ui.add_space(8.0);
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 64.0), Layout::top_down(Align::LEFT), |ui| {
+                    let (title, sub) = match &track {
+                        Some(t) => (t.title.clone(), format!("{} · {}", t.artist, t.album)),
+                        None => ("Nothing playing".to_string(), "Pick a track in the full window".to_string()),
+                    };
+                    ui.add(egui::Label::new(RichText::new(title).strong().size(15.0)).truncate());
+                    ui.add(egui::Label::new(RichText::new(sub).small().color(theme::TEXT_DIM)).truncate());
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if icons::button(ui, Icon::Prev, 15.0, false).on_hover_text("Previous").clicked() {
+                            cmds.push(Cmd::Prev);
+                        }
+                        let playing = st.state == PlayState::Playing;
+                        if icons::button(ui, if playing { Icon::Pause } else { Icon::Play }, 20.0, false)
+                            .on_hover_text(if playing { "Pause" } else { "Play" })
+                            .clicked()
+                        {
+                            cmds.push(Cmd::Toggle);
+                        }
+                        if icons::button(ui, Icon::Next, 15.0, false).on_hover_text("Next").clicked() {
+                            cmds.push(Cmd::Next);
+                        }
+                        ui.add_space(6.0);
+                        let mut pos = st.position_ms as f64 / 1000.0;
+                        let dur = (st.duration_ms as f64 / 1000.0).max(0.001);
+                        ui.spacing_mut().slider_width = 110.0;
+                        if ui.add(egui::Slider::new(&mut pos, 0.0..=dur).show_value(false)).changed() {
+                            cmds.push(Cmd::Seek((pos * 1000.0) as u64));
+                        }
+                        ui.label(
+                            RichText::new(format!("{} / {}", fmt_duration(st.position_ms), fmt_duration(st.duration_ms)))
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+                });
             });
         });
         for c in cmds {
