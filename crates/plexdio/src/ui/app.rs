@@ -1812,9 +1812,13 @@ impl PlexdioApp {
             // sideways when the track changes.
             ui.add_space(10.0);
             let (info_rect, _) = ui.allocate_exact_size(egui::vec2(info_w, 48.0), egui::Sense::hover());
-            ui.scope_builder(
-                egui::UiBuilder::new().max_rect(info_rect).layout(egui::Layout::top_down(egui::Align::LEFT)),
-                |ui| {
+            // A detached child (not `scope_builder`): its content never advances the bar's
+            // cursor, and anything wider than the slot is clipped instead of pushing the
+            // transport and seek bar sideways.
+            {
+                let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(info_rect).layout(egui::Layout::top_down(egui::Align::LEFT)));
+                ui.set_clip_rect(info_rect.intersect(ui.clip_rect()));
+                {
                     ui.add_space(4.0);
                     if bar_link(ui, RichText::new(&track.title).strong().color(theme::TEXT).size(14.0), album_route.is_some()) {
                         cmds.extend(album_route.clone().map(BarCmd::Go));
@@ -1829,17 +1833,17 @@ impl PlexdioApp {
                             cmds.extend(album_route.clone().map(BarCmd::Go));
                         }
                     });
-                },
-            );
+                }
+            }
 
             // Center column: transport row, then elapsed / seek bar / duration.
             ui.add_space(gap);
             let (center_rect, _) = ui.allocate_exact_size(egui::vec2(center_w, 56.0), egui::Sense::hover());
             // The seek row's rect, so the right column can line up with it.
             let mut seek_row = center_rect;
-            ui.scope_builder(
-                egui::UiBuilder::new().max_rect(center_rect).layout(egui::Layout::top_down(egui::Align::LEFT)),
-                |ui| {
+            {
+                let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(center_rect).layout(egui::Layout::top_down(egui::Align::LEFT)));
+                {
                     // Full play-button height from the start: `horizontal` begins at the 18 pt
                     // interact height, which would center shuffle/prev higher than the rest.
                     ui.allocate_ui_with_layout(egui::vec2(center_w, 24.0), Layout::left_to_right(Align::Center), |ui| {
@@ -1902,8 +1906,8 @@ impl PlexdioApp {
                     })
                     .response
                     .rect;
-                },
-            );
+                }
+            }
 
             // Right column, laid out from the window edge inwards, on the same line as the seek
             // bar so the volume slider lines up with it.
@@ -2633,19 +2637,42 @@ fn slider_value(ui: &mut egui::Ui, text: String) {
 
 /// One setting: name and an optional description on the left, the control on the right.
 /// Controls are laid out right to left, so add them in reverse visual order.
+/// When the card is too narrow for the text and the control side by side, the control goes on
+/// its own line below the text so it is never pushed off the card.
 fn setting_row(ui: &mut egui::Ui, label: &str, desc: Option<&str>, control: impl FnOnce(&mut egui::Ui)) {
+    // Minimum width for the name/description column before the row stacks.
+    const MIN_TEXT_W: f32 = 160.0;
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        let text_w = (ui.available_width() * 0.55).max(140.0);
-        ui.vertical(|ui| {
-            ui.set_max_width(text_w);
-            ui.label(RichText::new(label).size(14.0));
-            if let Some(d) = desc {
-                ui.add(egui::Label::new(RichText::new(d).small().color(theme::TEXT_DIM)).wrap());
-            }
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), control);
-    });
+    // The control's width from the last frame decides between side-by-side and stacked.
+    let id = ui.id().with(("setting-row", label));
+    let ctrl_w: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let gap = ui.spacing().item_spacing.x;
+    let stacked = ui.available_width() - ctrl_w - gap < MIN_TEXT_W;
+    let text = |ui: &mut egui::Ui| {
+        ui.label(RichText::new(label).size(14.0));
+        if let Some(d) = desc {
+            ui.add(egui::Label::new(RichText::new(d).small().color(theme::TEXT_DIM)).wrap());
+        }
+    };
+    let measured = if stacked {
+        ui.vertical(|ui| text(ui));
+        ui.add_space(2.0);
+        ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), control).response.rect.width()).inner
+    } else {
+        ui.horizontal(|ui| {
+            let text_w = (ui.available_width() - ctrl_w - gap).max(MIN_TEXT_W);
+            ui.vertical(|ui| {
+                ui.set_max_width(text_w);
+                text(ui);
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), control).response.rect.width()
+        })
+        .inner
+    };
+    if (measured - ctrl_w).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(id, measured));
+        ui.ctx().request_repaint();
+    }
     ui.add_space(6.0);
 }
 
