@@ -216,6 +216,9 @@ pub struct PlexdioApp {
     pub section: Option<Directory>,
     /// Transient notice shown at the top of the content area: (text, is_error).
     pub banner: Option<(String, bool)>,
+    /// The playback error currently shown in `banner`, so it can be cleared once playback
+    /// recovers (e.g. the connection comes back).
+    playback_error_banner: Option<String>,
     /// Cached library of the open section (shown immediately, refreshed after sync).
     pub library: Option<LibraryModel>,
     pub library_gen: u64,
@@ -331,6 +334,7 @@ impl PlexdioApp {
             pms: None,
             section: None,
             banner: None,
+            playback_error_banner: None,
             library: None,
             library_gen: 0,
             db_path: None,
@@ -1556,7 +1560,17 @@ impl PlexdioApp {
         let track = st.track.as_ref().map(|t| t.id);
         if st.error.is_some() && st.error != self.playback.error {
             if let Some(msg) = st.error.clone() {
-                self.banner = Some((msg, true));
+                self.banner = Some((msg.clone(), true));
+                self.playback_error_banner = Some(msg);
+            }
+        }
+        // Playing again without an error: drop the stale failure notice, unless something else
+        // has replaced the banner since.
+        if st.error.is_none() && state == PlayState::Playing {
+            if let Some(msg) = self.playback_error_banner.take() {
+                if self.banner.as_ref().is_some_and(|(text, err)| *err && *text == msg) {
+                    self.banner = None;
+                }
             }
         }
         self.playback = st;
