@@ -153,8 +153,8 @@ impl ArtCache {
                     let r = rect.width().min(rect.height()) / 2.0;
                     let mut mesh = egui::Mesh::with_texture(id);
                     let n = 48;
-                    mesh.colored_vertex(c, Color32::WHITE);
-                    mesh.vertices[0].uv = egui::pos2(0.5, 0.5);
+                    // Pushed directly: `colored_vertex` asserts the mesh has no texture.
+                    mesh.vertices.push(egui::epaint::Vertex { pos: c, uv: egui::pos2(0.5, 0.5), color: Color32::WHITE });
                     for i in 0..=n {
                         let a = i as f32 / n as f32 * std::f32::consts::TAU;
                         let d = egui::vec2(a.cos(), a.sin());

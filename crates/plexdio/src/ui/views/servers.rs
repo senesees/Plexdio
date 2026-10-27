@@ -141,8 +141,17 @@ fn row(ui: &mut egui::Ui, selected: bool, title: &str, sub: &str, sub_color: Col
         ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())), 2.0, theme::ACCENT);
     }
     let p = ui.painter();
-    p.text(rect.min + egui::vec2(16.0, 18.0), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(16.0), theme::TEXT);
-    p.text(rect.min + egui::vec2(16.0, 40.0), egui::Align2::LEFT_CENTER, sub, egui::FontId::proportional(12.5), sub_color);
+    // Truncated to the row so long text (e.g. an "Unavailable: …" error) can't run into the
+    // other column.
+    let text_w = (rect.width() - 24.0).max(0.0);
+    let line = |text: &str, size: f32, color: Color32, y: f32| {
+        let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), egui::FontId::proportional(size), color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(text_w);
+        let galley = p.layout_job(job);
+        p.galley(rect.min + egui::vec2(16.0, y - galley.size().y / 2.0), galley, color);
+    };
+    line(title, 16.0, theme::TEXT, 18.0);
+    line(sub, 12.5, sub_color, 40.0);
     ui.add_space(4.0);
     resp
 }

@@ -1857,7 +1857,7 @@ impl PlexdioApp {
             ui.add_space(gap);
             let (center_rect, _) = ui.allocate_exact_size(egui::vec2(center_w, 56.0), egui::Sense::hover());
             // The seek row's rect, so the right column can line up with it.
-            let mut seek_row = center_rect;
+            let seek_row;
             {
                 let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(center_rect).layout(egui::Layout::top_down(egui::Align::LEFT)));
                 {
@@ -2663,7 +2663,7 @@ fn setting_row(ui: &mut egui::Ui, label: &str, desc: Option<&str>, control: impl
     const MIN_TEXT_W: f32 = 160.0;
     ui.add_space(6.0);
     // The control's width from the last frame decides between side-by-side and stacked.
-    let id = ui.id().with(("setting-row", label));
+    let id = ui.scope_id().with(("setting-row", label));
     let ctrl_w: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
     let gap = ui.spacing().item_spacing.x;
     let stacked = ui.available_width() - ctrl_w - gap < MIN_TEXT_W;
