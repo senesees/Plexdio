@@ -2322,7 +2322,9 @@ impl PlexdioApp {
                     settings_card(&mut cols[1], "Account", |ui| self.settings_account(ui));
                 });
             } else {
-                ui.set_max_width(720.0);
+                // `set_max_width` sets the width outright (it can widen the Ui), so cap it at
+                // what is actually available or narrow windows push the cards off-screen.
+                ui.set_max_width(ui.available_width().min(720.0));
                 settings_card(ui, "Playback", |ui| self.settings_playback(ui, &mut changed));
                 settings_card(ui, "Equalizer", |ui| self.settings_equalizer(ui, &mut changed));
                 settings_card(ui, "Window", |ui| self.settings_window(ui, &mut changed));
