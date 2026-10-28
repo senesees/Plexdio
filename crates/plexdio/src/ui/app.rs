@@ -1190,7 +1190,7 @@ impl PlexdioApp {
                 go = Some(Route::Settings);
             }
             if let Some(u) = &self.user {
-                ui.label(RichText::new(u.display_name()).small().color(theme::TEXT_DIM));
+                account_row(ui, &u.display_name());
             }
         });
         if let Some(r) = go {
@@ -2744,6 +2744,17 @@ fn bar_link(ui: &mut egui::Ui, text: RichText, enabled: bool) -> bool {
         ui.painter().line_segment([egui::pos2(r.left(), r.bottom()), egui::pos2(r.right(), r.bottom())], egui::Stroke::new(1.0, color));
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// Signed-in account above Settings: an initial avatar and the name, lined up with the nav items.
+fn account_row(ui: &mut egui::Ui, name: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
+    let center = egui::pos2(rect.left() + 22.0, rect.center().y);
+    ui.painter().circle_filled(center, 12.0, theme::ACCENT.linear_multiply(0.18));
+    let initial: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+    ui.painter().text(center, egui::Align2::CENTER_CENTER, initial, egui::FontId::proportional(12.5), theme::ACCENT);
+    let x = rect.left() + 44.0;
+    super::views::common::clipped(ui, egui::pos2(x, rect.center().y), name, 13.5, theme::TEXT_DIM, (rect.right() - x - 8.0).max(20.0), egui::Align2::LEFT_CENTER);
 }
 
 fn nav_button(ui: &mut egui::Ui, selected: bool, icon: Icon, label: &str) -> bool {
