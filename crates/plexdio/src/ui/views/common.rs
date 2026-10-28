@@ -26,6 +26,8 @@ pub enum Route {
     Album(Id),
     Playlist(Id),
     Genre(Arc<str>),
+    /// A "Made for you" mix, by [`crate::player::mixes::Mix::key`].
+    Mix(String),
     /// The station started last (kept in [`RadioStation`] on the app).
     Radio,
     Settings,

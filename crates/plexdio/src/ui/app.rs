@@ -248,7 +248,7 @@ pub struct PlexdioApp {
     pub queue_open: bool,
     /// Play-order position of the queue row being dragged.
     pub queue_drag: Option<usize>,
-    /// Home mixes (Most played, Recently played, Rediscover).
+    /// Home mixes ("Made for you").
     pub mixes: Mixes,
     /// A play was recorded since the mixes were last built.
     mixes_dirty: bool,
@@ -2191,7 +2191,7 @@ impl PlexdioApp {
             return;
         }
         if !self.history.is_empty()
-            && matches!(self.route, Route::Artist(_) | Route::Album(_) | Route::Playlist(_) | Route::Genre(_) | Route::Radio)
+            && matches!(self.route, Route::Artist(_) | Route::Album(_) | Route::Playlist(_) | Route::Genre(_) | Route::Mix(_) | Route::Radio)
             && icons::button(ui, Icon::Back, 26.0, false).on_hover_text("Back").clicked()
         {
             self.back();
@@ -2235,6 +2235,7 @@ impl PlexdioApp {
                 Route::Artist(id) => detail::artist_view(ui, &mut vc, *id),
                 Route::Playlist(id) => detail::playlist_view(ui, &mut vc, *id),
                 Route::Genre(g) => detail::genre_view(ui, &mut vc, g),
+                Route::Mix(key) => detail::mix_view(ui, &mut vc, key),
                 Route::Radio => detail::radio_view(ui, &mut vc, self.radio_station.as_ref()),
                 Route::Search => search::search_view(ui, &mut vc, &mut self.search, self.library_ver),
                 Route::Settings => {}
@@ -2719,7 +2720,7 @@ fn greeting() -> String {
 /// Sidebar group a route belongs to (0 home, 1 search, 2 library, 3 playlists, 4 settings).
 fn route_category(r: &Route) -> u8 {
     match r {
-        Route::Home => 0,
+        Route::Home | Route::Mix(_) => 0,
         Route::Search => 1,
         Route::Library(_) | Route::Artist(_) | Route::Album(_) | Route::Genre(_) => 2,
         Route::Playlists | Route::Playlist(_) => 3,

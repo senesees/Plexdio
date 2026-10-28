@@ -148,6 +148,22 @@ pub fn playlist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
     track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true }, "playlist-tracks");
 }
 
+pub fn mix_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, key: &str) {
+    let lib = ctx.lib;
+    let Some(m) = ctx.mixes.get(key) else {
+        ui.label(RichText::new("This mix is not available any more.").color(theme::TEXT_DIM));
+        return;
+    };
+    let ids: Vec<Id> = m.ids.iter().copied().filter(|t| lib.track(*t).is_some()).collect();
+    let total: u64 = ids.iter().filter_map(|t| lib.track(*t)).map(|t| t.duration_ms as u64).sum();
+    let sub = format!("{} · {} tracks · {}", m.description, ids.len(), fmt_long_duration(total));
+    let thumb = ids.first().and_then(|t| lib.track(*t)).and_then(|t| t.thumb.as_deref());
+    hero(ui, ctx, Hero { thumb, seed: &m.title, round: false, kind: "MIX", title: &m.title, sub: &sub });
+    play_buttons(ui, ctx, &ids, None);
+    ui.add_space(8.0);
+    track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true }, "mix-tracks");
+}
+
 pub fn radio_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, station: Option<&RadioStation>) {
     let Some(st) = station else {
         ui.label(RichText::new("No radio station yet. Start one from a track, album or artist.").color(theme::TEXT_DIM));
@@ -255,33 +271,28 @@ pub fn home_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, greeting: &str) {
             },
         );
 
-        // One card per mix; clicking one starts it shuffled.
-        let mixes: [(&str, &Vec<Id>, &str); 3] = [
-            ("Most played", &ctx.mixes.most_played, "home-mix-most"),
-            ("Recently played", &ctx.mixes.recently_played, "home-mix-recent"),
-            ("Rediscover", &ctx.mixes.rediscover, "home-mix-rediscover"),
-        ];
-        if mixes.iter().any(|(_, ids, _)| !ids.is_empty()) {
+        // One card per mix; clicking one opens it as a playlist-like page.
+        let mixes = &ctx.mixes.list;
+        if !mixes.is_empty() {
             section(ui, "Made for you");
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                for (title, ids, salt) in mixes {
-                    if ids.is_empty() {
-                        continue;
+            let subs: Vec<String> = mixes.iter().map(|m| plural(m.ids.len(), "track", "tracks")).collect();
+            card_row(
+                ui,
+                ctx.art,
+                mixes.len(),
+                false,
+                "home-mixes",
+                |i| {
+                    let m = &mixes[i];
+                    let first = lib.track(m.ids[0]);
+                    CardItem { thumb: first.and_then(|t| t.thumb.as_deref()), title: &m.title, subtitle: &subs[i], seed: &m.title }
+                },
+                |i, r| {
+                    if r.clicked() {
+                        open = Some(Route::Mix(mixes[i].key.clone()));
                     }
-                    let first = lib.track(ids[0]);
-                    let sub = plural(ids.len(), "track", "tracks");
-                    let item = CardItem {
-                        thumb: first.and_then(|t| t.thumb.as_deref()),
-                        title,
-                        subtitle: &sub,
-                        seed: first.map_or(salt, |t| &t.title),
-                    };
-                    if card(ui, ctx.art, item, false, 160.0).clicked() {
-                        ctx.actions.push(UiAction::PlayShuffled(ids.clone()));
-                    }
-                }
-            });
+                },
+            );
         }
 
         if !lib.playlists.is_empty() {

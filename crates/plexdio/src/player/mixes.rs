@@ -1,26 +1,53 @@
-//! Home mixes built from the cached library and the local play history: Most played, Recently
-//! played and Rediscover. All three are plain track-id lists, so the UI can start them without
-//! any server round trip (offline included).
+//! Home mixes ("Made for you") built from the cached library and the local play history: Most
+//! played, Recently played, Rediscover, favourites, new additions, deep cuts and genre/decade
+//! mixes. All of them are plain track-id lists, so the UI can show and start them without any
+//! server round trip (offline included).
 
 use crate::cache::db::LibraryDb;
-use crate::library_model::{Id, LibraryModel};
+use crate::library_model::{Id, LibraryModel, Track};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Longest mix shown on Home.
 pub const MIX_LEN: usize = 30;
+/// Longest genre / decade mix.
+const STYLE_MIX_LEN: usize = 50;
 /// Tracks played within this window never show up in Rediscover.
 const REDISCOVER_AFTER_SECS: i64 = 30 * 24 * 3600;
+/// Favourites not played for this long are "forgotten".
+const FORGOTTEN_AFTER_SECS: i64 = 60 * 24 * 3600;
+/// Tracks added within this window count as new.
+const NEW_WITHIN_SECS: i64 = 60 * 24 * 3600;
+/// At most this many tracks of one artist in a genre/decade mix.
+const PER_ARTIST: usize = 4;
+/// How many genre and decade mixes Home shows.
+const GENRE_MIXES: usize = 4;
+const DECADE_MIXES: usize = 2;
+
+/// One mix, shown on Home as a card and opened as its own playlist-like page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mix {
+    /// Stable key used by the route (`most-played`, `genre:Rock`, `decade:1990`, …).
+    pub key: String,
+    pub title: String,
+    /// One line shown under the title on the mix page.
+    pub description: String,
+    pub ids: Vec<Id>,
+}
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Mixes {
-    pub most_played: Vec<Id>,
-    pub recently_played: Vec<Id>,
-    pub rediscover: Vec<Id>,
+    /// Non-empty mixes in display order.
+    pub list: Vec<Mix>,
 }
 
 impl Mixes {
     pub fn is_empty(&self) -> bool {
-        self.most_played.is_empty() && self.recently_played.is_empty() && self.rediscover.is_empty()
+        self.list.is_empty()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Mix> {
+        self.list.iter().find(|m| m.key == key)
     }
 
     /// Build all mixes. `db` contributes the local play history; the server's view counts alone
@@ -32,11 +59,27 @@ impl Mixes {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        Self {
-            most_played: most_played(lib, &counts, MIX_LEN),
-            recently_played: recently_played(lib, &recent, MIX_LEN),
-            rediscover: rediscover(lib, now, MIX_LEN),
+        let mut list = Vec::new();
+        let mut push = |key: String, title: String, description: String, ids: Vec<Id>| {
+            if !ids.is_empty() {
+                list.push(Mix { key, title, description, ids });
+            }
+        };
+        let s = |x: &str| x.to_string();
+        push(s("most-played"), s("Most played"), s("The songs you keep coming back to"), most_played(lib, &counts, MIX_LEN));
+        push(s("recently-played"), s("Recently played"), s("What you listened to lately"), recently_played(lib, &recent, MIX_LEN));
+        push(s("favourites"), s("Your favourites"), s("Your best-rated songs"), favourites(lib, MIX_LEN));
+        push(s("rediscover"), s("Rediscover"), s("Songs you have not heard in a while"), rediscover(lib, now, MIX_LEN));
+        push(s("forgotten"), s("Forgotten favourites"), s("Songs you loved but have not played for months"), forgotten_favourites(lib, now, MIX_LEN));
+        push(s("new"), s("New additions"), s("The newest songs in your library"), new_additions(lib, now, MIX_LEN));
+        push(s("deep-cuts"), s("Deep cuts"), s("Unplayed songs by the artists you listen to most"), deep_cuts(lib, &counts, now, MIX_LEN));
+        for (genre, ids) in genre_mixes(lib, &counts, now, GENRE_MIXES, STYLE_MIX_LEN) {
+            push(format!("genre:{genre}"), format!("{genre} Mix"), format!("A mix of {genre} from your library"), ids);
         }
+        for (decade, ids) in decade_mixes(lib, &counts, now, DECADE_MIXES, STYLE_MIX_LEN) {
+            push(format!("decade:{decade}"), format!("{decade}s Mix"), format!("Songs from the {decade}s"), ids);
+        }
+        Self { list }
     }
 }
 
@@ -110,6 +153,154 @@ fn mix_hash(id: i64) -> f64 {
     x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^= x >> 31;
     (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Rated tracks, best first (at least 3 stars); ties go to the more played.
+pub fn favourites(lib: &LibraryModel, n: usize) -> Vec<Id> {
+    let mut rated: Vec<&Track> = lib.tracks.iter().filter(|t| t.user_rating >= 6.0).collect();
+    rated.sort_by(|a, b| b.user_rating.total_cmp(&a.user_rating).then(b.view_count.cmp(&a.view_count)).then(a.id.cmp(&b.id)));
+    rated.into_iter().take(n).map(|t| t.id).collect()
+}
+
+/// Well-rated or often-played tracks that have not been played for a couple of months.
+pub fn forgotten_favourites(lib: &LibraryModel, now: i64, n: usize) -> Vec<Id> {
+    let mut old: Vec<&Track> = lib
+        .tracks
+        .iter()
+        .filter(|t| t.last_viewed_at > 0 && now.saturating_sub(t.last_viewed_at) >= FORGOTTEN_AFTER_SECS)
+        .filter(|t| t.user_rating >= 6.0 || t.view_count >= 3)
+        .collect();
+    old.sort_by(|a, b| {
+        let sa = a.view_count as f32 + a.user_rating;
+        let sb = b.view_count as f32 + b.user_rating;
+        sb.total_cmp(&sa).then(a.id.cmp(&b.id))
+    });
+    old.into_iter().take(n).map(|t| t.id).collect()
+}
+
+/// Tracks added lately, newest first; unplayed ones before played ones. Falls back to the
+/// newest tracks when nothing was added within the window.
+pub fn new_additions(lib: &LibraryModel, now: i64, n: usize) -> Vec<Id> {
+    let mut fresh: Vec<&Track> = lib.tracks.iter().filter(|t| t.added_at > 0 && now.saturating_sub(t.added_at) <= NEW_WITHIN_SECS).collect();
+    if fresh.is_empty() {
+        fresh = lib.tracks.iter().filter(|t| t.added_at > 0).collect();
+    }
+    fresh.sort_by(|a, b| (a.view_count > 0).cmp(&(b.view_count > 0)).then(b.added_at.cmp(&a.added_at)).then(a.album_id.cmp(&b.album_id)).then(a.index.cmp(&b.index)));
+    fresh.into_iter().take(n).map(|t| t.id).collect()
+}
+
+/// Play score of every artist (server plays plus twice the local ones).
+fn artist_plays(lib: &LibraryModel, local: &HashMap<Id, u64>) -> HashMap<Id, u64> {
+    let mut plays: HashMap<Id, u64> = HashMap::new();
+    for t in &lib.tracks {
+        *plays.entry(t.artist_id).or_default() += t.view_count as u64 + local.get(&t.id).copied().unwrap_or(0) * 2;
+    }
+    plays
+}
+
+/// Never-played tracks by the ten most played artists, in a daily pseudo-random order with at
+/// most a few tracks per artist.
+pub fn deep_cuts(lib: &LibraryModel, local: &HashMap<Id, u64>, now: i64, n: usize) -> Vec<Id> {
+    let plays = artist_plays(lib, local);
+    let mut top: Vec<(Id, u64)> = plays.into_iter().filter(|p| p.1 > 0).collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let top: HashSet<Id> = top.into_iter().take(10).map(|p| p.0).collect();
+    let cands: Vec<&Track> =
+        lib.tracks.iter().filter(|t| top.contains(&t.artist_id) && t.view_count == 0 && local.get(&t.id).copied().unwrap_or(0) == 0).collect();
+    daily_pick(cands, now, n, local)
+}
+
+/// Genre of a track, falling back to its album's.
+fn track_genre<'a>(lib: &'a LibraryModel, t: &'a Track) -> Option<&'a Arc<str>> {
+    t.genre.as_ref().or_else(|| lib.album(t.album_id).and_then(|a| a.genre.as_ref()))
+}
+
+/// Year of a track, falling back to its album's.
+fn track_year(lib: &LibraryModel, t: &Track) -> i32 {
+    if t.year > 0 {
+        t.year
+    } else {
+        lib.album(t.album_id).map_or(0, |a| a.year)
+    }
+}
+
+/// Groups ranked by plays (then size), each turned into a daily pick. Groups with fewer than
+/// `min` tracks are skipped.
+fn group_mixes<K: Clone + Eq + std::hash::Hash + Ord>(
+    lib: &LibraryModel,
+    local: &HashMap<Id, u64>,
+    now: i64,
+    groups: usize,
+    n: usize,
+    key: impl Fn(&Track) -> Option<K>,
+) -> Vec<(K, Vec<Id>)> {
+    const MIN: usize = 8;
+    let mut by: HashMap<K, Vec<&Track>> = HashMap::new();
+    for t in &lib.tracks {
+        if let Some(k) = key(t) {
+            by.entry(k).or_default().push(t);
+        }
+    }
+    let mut ranked: Vec<(u64, usize, K)> = by
+        .iter()
+        .filter(|(_, ts)| ts.len() >= MIN)
+        .map(|(k, ts)| (ts.iter().map(|t| t.view_count as u64 + local.get(&t.id).copied().unwrap_or(0) * 2).sum(), ts.len(), k.clone()))
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    ranked
+        .into_iter()
+        .take(groups)
+        .map(|(_, _, k)| {
+            let ts = by.remove(&k).unwrap_or_default();
+            (k, daily_pick(ts, now, n, local))
+        })
+        .collect()
+}
+
+/// The most played genres as mixes.
+pub fn genre_mixes(lib: &LibraryModel, local: &HashMap<Id, u64>, now: i64, groups: usize, n: usize) -> Vec<(Arc<str>, Vec<Id>)> {
+    group_mixes(lib, local, now, groups, n, |t| track_genre(lib, t).cloned())
+}
+
+/// The most played decades as mixes (keyed by the decade's first year, e.g. 1990).
+pub fn decade_mixes(lib: &LibraryModel, local: &HashMap<Id, u64>, now: i64, groups: usize, n: usize) -> Vec<(i32, Vec<Id>)> {
+    group_mixes(lib, local, now, groups, n, |t| {
+        let y = track_year(lib, t);
+        (y >= 1900).then_some(y / 10 * 10)
+    })
+}
+
+/// Pick `n` tracks in a pseudo-random order that changes once a day, weighted towards rated and
+/// played tracks, with at most [`PER_ARTIST`] tracks per artist (relaxed when that leaves too
+/// few).
+fn daily_pick(cands: Vec<&Track>, now: i64, n: usize, local: &HashMap<Id, u64>) -> Vec<Id> {
+    let day = now.div_euclid(86_400);
+    let mut keyed: Vec<(f64, &Track)> = cands
+        .into_iter()
+        .map(|t| {
+            let plays = t.view_count as f64 + local.get(&t.id).copied().unwrap_or(0) as f64 * 2.0;
+            let weight = 1.0 + f64::from(t.user_rating) * 0.3 + (1.0 + plays).ln() * 0.5;
+            (mix_hash(t.id ^ day.wrapping_mul(0x5851_f42d)) / weight, t)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
+    let mut per: HashMap<Id, usize> = HashMap::new();
+    let mut out = Vec::new();
+    let mut rest = Vec::new();
+    for (_, t) in keyed {
+        let c = per.entry(t.artist_id).or_default();
+        if *c < PER_ARTIST {
+            *c += 1;
+            out.push(t.id);
+        } else {
+            rest.push(t.id);
+        }
+        if out.len() == n {
+            return out;
+        }
+    }
+    out.extend(rest.into_iter().take(n - out.len()));
+    out
 }
 
 #[cfg(test)]
@@ -205,7 +396,9 @@ mod tests {
     fn mixes_load_without_a_database() {
         let lib = library(vec![track(1, 1, 1, 2, 5, 0.0, 0)]);
         let m = Mixes::load(&lib, None, 100);
-        assert_eq!(m.most_played, vec![1]);
+        assert_eq!(m.get("most-played").map(|m| m.ids.clone()), Some(vec![1]));
         assert!(!m.is_empty());
+        // Empty mixes are left out.
+        assert!(m.get("favourites").is_none());
     }
 }
