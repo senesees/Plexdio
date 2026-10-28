@@ -1129,14 +1129,7 @@ impl PlexdioApp {
     // ------------------------------------------------------------------ main shell
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            ui.add_space(6.0);
-            let (r, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
-            ui.painter().circle_filled(r.center(), 13.0, theme::ACCENT);
-            icons::paint(ui.painter(), r.shrink(6.0), Icon::Play, egui::Color32::from_rgb(24, 24, 24));
-            ui.label(RichText::new("Plexdio").size(22.0).strong());
-        });
+        // The title bar already shows the logo and name, so the sidebar starts with the switcher.
         ui.add_space(12.0);
         // Server / library switcher.
         let server = self.server_label.clone();
