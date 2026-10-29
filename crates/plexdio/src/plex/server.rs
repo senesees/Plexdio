@@ -7,6 +7,8 @@ use super::Result;
 
 pub const PAGE_SIZE: usize = 1000;
 const LIBRARY_IDENTIFIER: &str = "com.plexapp.plugins.library";
+/// Items per playlist add request (keeps the `uri` parameter a sensible length).
+const PLAYLIST_CHUNK: usize = 200;
 
 #[derive(Clone)]
 pub struct PmsClient {
@@ -123,6 +125,17 @@ impl PmsClient {
         Ok(mc.metadata.into_iter().next())
     }
 
+    /// Track metadata including its lyrics stream (if any).
+    pub fn track_with_lyrics(&self, rating_key: &str) -> Result<Option<Metadata>> {
+        let mc = self.get(&format!("/library/metadata/{rating_key}"), &[("includeLyrics", "1"), ("includeLoudness", "1")])?;
+        Ok(mc.metadata.into_iter().next())
+    }
+
+    /// Raw content of a stream (`/library/streams/{id}`): the lyrics file text.
+    pub fn stream_content(&self, key: &str) -> Result<Vec<u8>> {
+        self.http.request(Method::Get, &self.url(key), Some(&self.conn.token), &[])
+    }
+
     pub fn children(&self, rating_key: &str) -> Result<Vec<Metadata>> {
         Ok(self.get(&format!("/library/metadata/{rating_key}/children"), &[])?.metadata)
     }
@@ -152,6 +165,69 @@ impl PmsClient {
             }
         }
         Ok(out)
+    }
+
+    /// `server://…/library/metadata/1,2,3` URI that playlist calls take for a list of items.
+    fn items_uri(&self, ids: &[i64]) -> String {
+        let ids: Vec<String> = ids.iter().map(i64::to_string).collect();
+        format!("server://{}/{LIBRARY_IDENTIFIER}/library/metadata/{}", self.conn.server_id, ids.join(","))
+    }
+
+    /// Playlist edits are not idempotent (a retried add would add twice), so they run once.
+    fn write(&self, method: Method, path: &str, query: &[(&str, &str)]) -> Result<Vec<u8>> {
+        self.http.clone().without_retries().request(method, &self.url(path), Some(&self.conn.token), query)
+    }
+
+    /// Create a regular audio playlist holding `ids` (may be empty). Returns its ratingKey.
+    pub fn create_playlist(&self, title: &str, ids: &[i64]) -> Result<i64> {
+        let first = &ids[..ids.len().min(PLAYLIST_CHUNK)];
+        let uri = self.items_uri(first);
+        let mut q: Vec<(&str, &str)> = vec![("type", "audio"), ("title", title), ("smart", "0")];
+        if !first.is_empty() {
+            q.push(("uri", &uri));
+        }
+        let body = self.write(Method::Post, "/playlists", &q)?;
+        let env: ContainerEnvelope = super::http::parse_json(&body)?;
+        let id = env
+            .media_container
+            .metadata
+            .first()
+            .and_then(|m| m.rating_key.as_deref())
+            .and_then(|k| k.parse().ok())
+            .ok_or_else(|| super::PlexError::Parse("create playlist: no ratingKey in the response".into()))?;
+        if ids.len() > first.len() {
+            self.add_to_playlist(id, &ids[first.len()..])?;
+        }
+        Ok(id)
+    }
+
+    /// Append `ids` to a playlist (in chunks, so the URI stays short).
+    pub fn add_to_playlist(&self, playlist: i64, ids: &[i64]) -> Result<()> {
+        for chunk in ids.chunks(PLAYLIST_CHUNK) {
+            let uri = self.items_uri(chunk);
+            self.write(Method::Put, &format!("/playlists/{playlist}/items"), &[("uri", &uri)])?;
+        }
+        Ok(())
+    }
+
+    /// Remove one entry by its `playlistItemID`.
+    pub fn remove_playlist_item(&self, playlist: i64, item_id: i64) -> Result<()> {
+        self.write(Method::Delete, &format!("/playlists/{playlist}/items/{item_id}"), &[]).map(|_| ())
+    }
+
+    /// Move an entry after another one (`None` moves it to the top).
+    pub fn move_playlist_item(&self, playlist: i64, item_id: i64, after: Option<i64>) -> Result<()> {
+        let after = after.map(|a| a.to_string());
+        let q: Vec<(&str, &str)> = after.as_deref().map(|a| vec![("after", a)]).unwrap_or_default();
+        self.write(Method::Put, &format!("/playlists/{playlist}/items/{item_id}/move"), &q).map(|_| ())
+    }
+
+    pub fn rename_playlist(&self, playlist: i64, title: &str) -> Result<()> {
+        self.write(Method::Put, &format!("/playlists/{playlist}"), &[("title", title)]).map(|_| ())
+    }
+
+    pub fn delete_playlist(&self, playlist: i64) -> Result<()> {
+        self.write(Method::Delete, &format!("/playlists/{playlist}"), &[]).map(|_| ())
     }
 
     /// Server-side search across the section.

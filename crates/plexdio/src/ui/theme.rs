@@ -7,6 +7,8 @@ pub const SIDEBAR: Color32 = Color32::from_rgb(0, 0, 0);
 pub const BAR: Color32 = Color32::from_rgb(24, 24, 24);
 pub const CARD: Color32 = Color32::from_rgb(28, 28, 28);
 pub const CARD_HOVER: Color32 = Color32::from_rgb(40, 40, 40);
+/// Selected rows in track lists.
+pub const SELECTED: Color32 = Color32::from_rgb(56, 56, 56);
 pub const ACCENT: Color32 = Color32::from_rgb(229, 160, 13);
 pub const TEXT: Color32 = Color32::from_rgb(235, 235, 235);
 pub const TEXT_DIM: Color32 = Color32::from_rgb(167, 167, 167);

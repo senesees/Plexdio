@@ -3,6 +3,7 @@
 use super::common::*;
 use crate::library_model::Id;
 use crate::ui::art::Shape;
+use crate::ui::icons::{self, Icon};
 use crate::ui::theme;
 use egui::RichText;
 use std::sync::Arc;
@@ -34,6 +35,31 @@ fn hero(ui: &mut egui::Ui, ctx: &mut ViewCtx, h: Hero) {
     ui.add_space(12.0);
 }
 
+/// A description (artist bio, album review) shortened to `rows` lines with a "Read more" link
+/// that expands it in place.
+fn about(ui: &mut egui::Ui, text: &str, rows: usize, salt: impl std::hash::Hash + std::fmt::Debug) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let id = ui.make_persistent_id(("about", salt));
+    let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let width = ui.available_width().min(760.0);
+    let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat::simple(egui::FontId::proportional(14.0), theme::TEXT_DIM));
+    job.wrap.max_width = width;
+    if !open {
+        job.wrap.max_rows = rows;
+        job.wrap.overflow_character = Some('…');
+    }
+    let galley = ui.painter().layout_job(job);
+    let elided = galley.elided;
+    ui.label(galley);
+    if (elided || open) && ui.link(RichText::new(if open { "Show less" } else { "Read more" }).size(13.0).strong()).clicked() {
+        open = !open;
+        ui.data_mut(|d| d.insert_temp(id, open));
+    }
+}
+
 pub fn album_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
     let lib = ctx.lib;
     let Some(a) = lib.album(id) else {
@@ -55,10 +81,14 @@ pub fn album_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
             ui.label(RichText::new(&*a.artist).size(15.0).strong());
         }
     });
+    if let Some(summary) = a.summary.as_deref() {
+        ui.add_space(4.0);
+        about(ui, summary, 2, ("album", id));
+    }
     ui.add_space(8.0);
     play_buttons(ui, ctx, &ids, Some(RadioSeed::Album(id)));
     ui.add_space(8.0);
-    track_table(ui, ctx, &ids, TableOpts { album: false, artist: true, track_numbers: true, art: false }, "album-tracks");
+    track_table(ui, ctx, &ids, TableOpts { album: false, artist: true, track_numbers: true, art: false, playlist: None }, "album-tracks");
 }
 
 pub fn artist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
@@ -83,7 +113,7 @@ pub fn artist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
         top.sort_by_key(|t| std::cmp::Reverse(lib.track(*t).map(|t| t.view_count).unwrap_or(0)));
         top.truncate(5);
         ui.label(RichText::new("Popular").size(18.0).strong());
-        track_list(ui, ctx, &top, TableOpts { album: true, artist: false, track_numbers: false, art: true }, top.len());
+        track_list(ui, ctx, &top, TableOpts { album: true, artist: false, track_numbers: false, art: true, playlist: None }, top.len(), "artist-popular");
         ui.add_space(10.0);
         ui.label(RichText::new("Discography").size(18.0).strong());
         ui.add_space(6.0);
@@ -124,6 +154,13 @@ pub fn artist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
                 },
             );
         }
+        if let Some(bio) = a.summary.as_deref().filter(|b| !b.trim().is_empty()) {
+            ui.add_space(10.0);
+            ui.label(RichText::new("About").size(18.0).strong());
+            ui.add_space(4.0);
+            about(ui, bio, 3, ("artist", id));
+            ui.add_space(10.0);
+        }
     });
     if let Some(a) = open_artist {
         ctx.actions.push(UiAction::Navigate(Route::Artist(a)));
@@ -139,13 +176,37 @@ pub fn playlist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
         ui.label(RichText::new("This playlist no longer exists.").color(theme::TEXT_DIM));
         return;
     };
-    let ids: Vec<Id> = p.items.iter().copied().filter(|t| lib.track(*t).is_some()).collect();
+    let ids: Vec<Id> = lib.playlist_rows(p).into_iter().map(|i| p.items[i]).collect();
     let total: u64 = ids.iter().filter_map(|t| lib.track(*t)).map(|t| t.duration_ms as u64).sum();
-    let sub = format!("{}{} tracks · {}", if p.smart { "Smart playlist · " } else { "" }, ids.len(), fmt_long_duration(total));
+    let sub = format!("{}{} · {}", if p.smart { "Smart playlist · " } else { "" }, plural(ids.len(), "track", "tracks"), fmt_long_duration(total));
     hero(ui, ctx, Hero { thumb: p.composite.as_deref(), seed: &p.title, round: false, kind: "PLAYLIST", title: &p.title, sub: &sub });
-    play_buttons(ui, ctx, &ids, None);
+    ui.horizontal(|ui| {
+        play_buttons(ui, ctx, &ids, None);
+        if !p.smart {
+            let more = icons::button(ui, Icon::More, 30.0, false).on_hover_text("More options");
+            egui::Popup::menu(&more).show(|ui| {
+                ui.set_min_width(160.0);
+                if ui.button("Rename…").clicked() {
+                    ctx.actions.push(UiAction::RenamePlaylist(id));
+                    ui.close();
+                }
+                if ui.button("Delete playlist…").clicked() {
+                    ctx.actions.push(UiAction::DeletePlaylist(id));
+                    ui.close();
+                }
+            });
+        }
+    });
     ui.add_space(8.0);
-    track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true }, "playlist-tracks");
+    if ids.is_empty() && !p.smart {
+        ui.label(RichText::new("This playlist is empty. Add songs with right-click → Add to playlist.").color(theme::TEXT_DIM));
+        return;
+    }
+    let playlist = (!p.smart).then_some(id);
+    track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true, playlist }, "playlist-tracks");
+    if let Some(pl) = playlist {
+        end_playlist_drag(ui, pl);
+    }
 }
 
 pub fn mix_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, key: &str) {
@@ -161,7 +222,7 @@ pub fn mix_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, key: &str) {
     hero(ui, ctx, Hero { thumb, seed: &m.title, round: false, kind: "MIX", title: &m.title, sub: &sub });
     play_buttons(ui, ctx, &ids, None);
     ui.add_space(8.0);
-    track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true }, "mix-tracks");
+    track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true, playlist: None }, "mix-tracks");
 }
 
 pub fn radio_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, station: Option<&RadioStation>) {
@@ -201,7 +262,7 @@ pub fn radio_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, station: Option<&RadioSt
     }
     play_buttons(ui, ctx, &ids, None);
     ui.add_space(8.0);
-    track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true }, "radio-tracks");
+    track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true, playlist: None }, "radio-tracks");
 }
 
 pub fn genre_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, genre: &Arc<str>) {

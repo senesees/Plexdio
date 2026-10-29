@@ -110,6 +110,13 @@ pub fn ago(ts: i64) -> String {
     }
 }
 
+/// Calendar date of a unix timestamp (UTC), e.g. "3 Mar 2024".
+pub fn date(ts: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (y, m, d) = civil_from_days(ts.div_euclid(86_400));
+    format!("{d} {} {y}", MONTHS[(m as usize).clamp(1, 12) - 1])
+}
+
 /// UTC timestamp "YYYY-MM-DD HH:MM:SS.mmm" without pulling in a date crate.
 pub fn timestamp() -> String {
     let now = std::time::SystemTime::now()
@@ -165,6 +172,12 @@ pub fn init(dir: &Path, echo_stderr: bool) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_dates() {
+        assert_eq!(date(0), "1 Jan 1970");
+        assert_eq!(date(1_709_424_000), "3 Mar 2024");
+    }
 
     #[test]
     fn civil_dates() {

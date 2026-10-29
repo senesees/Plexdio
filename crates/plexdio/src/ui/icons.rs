@@ -28,6 +28,10 @@ pub enum Icon {
     Back,
     Refresh,
     Plus,
+    /// Three dots (more options).
+    More,
+    /// Microphone (lyrics).
+    Lyrics,
     Trash,
     Up,
     Down,
@@ -187,6 +191,25 @@ pub fn paint(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Plus => {
             p.line_segment([at(12.0, 5.0), at(12.0, 19.0)], stroke);
             p.line_segment([at(5.0, 12.0), at(19.0, 12.0)], stroke);
+        }
+        Icon::Lyrics => {
+            // Capsule head, a U-shaped holder, the stem and the base.
+            let head = egui::Rect::from_min_max(at(9.0, 3.0), at(15.0, 14.0));
+            p.rect_stroke(head, 3.0 * u, stroke, egui::StrokeKind::Middle);
+            let holder: Vec<Pos2> = (0..=12)
+                .map(|i| {
+                    let a = std::f32::consts::PI * i as f32 / 12.0;
+                    at(12.0 - 6.0 * a.cos(), 11.0 + 6.0 * a.sin())
+                })
+                .collect();
+            p.add(Shape::line(holder, stroke));
+            p.line_segment([at(12.0, 17.0), at(12.0, 21.0)], stroke);
+            p.line_segment([at(8.5, 21.0), at(15.5, 21.0)], stroke);
+        }
+        Icon::More => {
+            for x in [5.5, 12.0, 18.5] {
+                p.circle_filled(at(x, 12.0), 1.8 * u, color);
+            }
         }
         Icon::Trash => {
             p.line_segment([at(4.0, 6.0), at(20.0, 6.0)], stroke);

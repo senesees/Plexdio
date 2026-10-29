@@ -233,8 +233,9 @@ Cross-cutting changes made along the way:
 - Repaint scheduling: one "wanted frame rate" picked from the active features (base 4 fps, lyrics 10, visualiser 30).
 - README: feature list, Status table and the manual checklist for a real account updated per feature.
 
-## Open questions for the operator
+## Decisions
 
-- Downloads: is original quality only acceptable at first, or are transcoded downloads needed from day one?
-- Cast: which players do you want to cast to (Plexamp on a phone, a Plexamp headless box, a TV)?
-- Visualiser: in the now-playing bar always (when on), or only in the mini-player?
+- Downloads: original quality only (no transcoded downloads).
+- Cast: list every castable player found; support casting to several players at once if the protocol allows
+  (one play queue, `playMedia` sent to each selected player, the first one is the "leader" mirrored in the bar).
+- Visualiser: in both the now-playing bar and the mini-player.

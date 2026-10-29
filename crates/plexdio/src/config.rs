@@ -65,6 +65,10 @@ pub struct Config {
     /// Output device name; `None` follows the Windows default device.
     pub output_device: Option<String>,
     pub window_size: Option<[f32; 2]>,
+    /// Library tab sorts and filter chips.
+    pub library: crate::ui::views::library::LibraryPrefs,
+    /// Interface zoom (1.0 = 100 %), 0.8..=1.5.
+    pub zoom: f32,
 }
 
 impl Default for Config {
@@ -96,8 +100,22 @@ impl Default for Config {
             eq_gains: [0.0; crate::audio::eq::BAND_COUNT],
             output_device: None,
             window_size: None,
+            library: Default::default(),
+            zoom: 1.0,
         }
     }
+}
+
+/// Zoom limits and step (10 %).
+pub const ZOOM_MIN: f32 = 0.8;
+pub const ZOOM_MAX: f32 = 1.5;
+
+/// Keep a zoom factor in range, on a 10 % step.
+pub fn clamp_zoom(z: f32) -> f32 {
+    if !z.is_finite() {
+        return 1.0;
+    }
+    ((z * 10.0).round() / 10.0).clamp(ZOOM_MIN, ZOOM_MAX)
 }
 
 impl Config {
@@ -136,6 +154,7 @@ impl Config {
         self.image_cache_mb = self.image_cache_mb.clamp(10, 10_000);
         self.audio_cache_mb = self.audio_cache_mb.clamp(50, 50_000);
         crate::audio::eq::sanitize(&mut self.eq_gains);
+        self.zoom = clamp_zoom(self.zoom);
     }
 
     /// Atomically write the config (write temp file, then rename).

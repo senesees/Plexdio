@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS albums (
     genre        TEXT,
     leaf_count   INTEGER,
     user_rating  REAL,
+    summary      TEXT,
     added_at     INTEGER NOT NULL DEFAULT 0,
     updated_at   INTEGER NOT NULL DEFAULT 0,
     seen         INTEGER NOT NULL DEFAULT 1
@@ -92,3 +93,12 @@ CREATE TABLE IF NOT EXISTS play_history (
     played_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS play_history_track ON play_history(track_id);
+
+-- Lyrics fetched from the server, so they show offline and are not fetched again. A NULL body
+-- remembers that the track has none (re-checked after a while).
+CREATE TABLE IF NOT EXISTS lyrics (
+    track_id   INTEGER PRIMARY KEY,
+    body       TEXT,
+    provider   TEXT,
+    fetched_at INTEGER NOT NULL
+);

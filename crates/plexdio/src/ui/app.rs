@@ -28,7 +28,7 @@ use super::icons::{self, Icon};
 use super::runner::WindowCmd;
 use crate::win::smtc::{NowPlaying, Smtc, SmtcButton, SmtcEvents};
 use crate::win::tray::{TrayEvent, TrayHandle};
-use super::views::common::{fmt_duration, LibTab, RadioSeed, RadioStation, Route, UiAction, ViewCtx};
+use super::views::common::{fmt_duration, LibTab, RadioSeed, RadioStation, Route, Selection, UiAction, ViewCtx};
 use super::views::library::BrowseState;
 use super::views::search::SearchState;
 use super::jobs::Jobs;
@@ -82,6 +82,66 @@ pub enum Msg {
     SyncDone(u64, Result<SyncReport, String>),
     /// Output device names and the Windows default, listed off the UI thread.
     OutputDevices(Vec<String>, Option<String>),
+    /// A playlist edit finished (library generation, outcome).
+    PlaylistSaved(u64, PlaylistSaved),
+    /// Full metadata of a track for the Track info dialog.
+    TrackDetails(Id, Result<Box<crate::plex::models::Metadata>, String>),
+    /// Lyrics fetched for a track: file text and provider, `None` when it has none.
+    Lyrics(Id, Result<Option<(String, Option<String>)>, String>),
+}
+
+/// Lyrics panel content for one track.
+#[derive(Debug, Clone)]
+enum LyricsState {
+    Loading,
+    /// The server has no lyrics for this track.
+    Missing,
+    /// Not cached and no server connection.
+    Offline,
+    Failed(String),
+    Ready(crate::player::lyrics::Lyrics),
+}
+
+/// "No lyrics" answers are re-checked after this long (lyrics may have been added since).
+const LYRICS_MISSING_TTL: i64 = 7 * 86_400;
+
+/// Outcome of one playlist edit sent to the server.
+#[derive(Debug)]
+pub struct PlaylistSaved {
+    /// What went wrong, for the banner.
+    pub error: Option<String>,
+    /// Banner text on success (empty: say nothing).
+    pub done: String,
+    /// Playlists as the server has them now (re-read after the edit), if that worked.
+    pub playlists: Option<Vec<crate::library_model::Playlist>>,
+    /// A playlist created by this edit.
+    pub created: Option<Id>,
+    /// Open the created playlist.
+    pub open: bool,
+}
+
+/// A modal dialog over the main window.
+#[derive(Debug, Clone)]
+enum Dialog {
+    /// Name a new playlist holding `ids`; `open` shows it once it is created.
+    NewPlaylist { title: String, ids: Vec<Id>, open: bool },
+    Rename { playlist: Id, title: String },
+    ConfirmDelete { playlist: Id, title: String },
+    /// `dupes` of `ids` are already in the playlist.
+    Duplicates { playlist: Id, ids: Vec<Id>, dupes: usize },
+    /// Track details; `local_plays` from this app's play history.
+    TrackInfo { id: Id, local_plays: Option<u64> },
+}
+
+/// A playlist edit for the server, with the server's item ids already looked up.
+#[derive(Debug, Clone)]
+enum PlaylistOp {
+    Create { title: String, ids: Vec<Id>, open: bool },
+    Add { playlist: Id, title: String, ids: Vec<Id> },
+    Remove { playlist: Id, items: Vec<i64> },
+    Move { playlist: Id, item: i64, after: Option<i64> },
+    Rename { playlist: Id, title: String },
+    Delete { playlist: Id, title: String },
 }
 
 /// Background sync status shown in the sidebar.
@@ -124,6 +184,7 @@ enum BarCmd {
     Shuffle(bool),
     Repeat,
     Queue,
+    Lyrics,
     Rate(u8),
     /// Open the album or artist of the playing track.
     Go(Route),
@@ -246,8 +307,30 @@ pub struct PlexdioApp {
     pub last_played_id: Option<i64>,
     /// Whether the queue side panel is open.
     pub queue_open: bool,
+    /// Short note shown over the window ("Zoom 120 %") and when it goes away (egui time).
+    toast: Option<(String, f64)>,
+    /// Zoom the window's minimum size was last set for.
+    min_size_zoom: f32,
+    /// Whether the lyrics side panel is open (it replaces the queue panel).
+    lyrics_open: bool,
+    /// Lyrics of the playing track (track id, state).
+    lyrics: Option<(Id, LyricsState)>,
+    /// The user scrolled the lyrics by hand: no auto-scroll until then (egui time).
+    lyrics_hold_until: f64,
+    /// Line the lyrics panel last scrolled to.
+    lyrics_line: Option<usize>,
     /// Play-order position of the queue row being dragged.
     pub queue_drag: Option<usize>,
+    /// Selected rows of the current page's track list.
+    selection: Selection,
+    /// Open modal dialog (playlist name, delete confirmation, duplicates).
+    dialog: Option<Dialog>,
+    /// Server metadata for the Track info dialog (track id, result).
+    track_details: Option<(Id, Result<Box<crate::plex::models::Metadata>, String>)>,
+    /// Playlist edits waiting for the server, sent one at a time in order.
+    playlist_ops: std::collections::VecDeque<PlaylistOp>,
+    /// A playlist edit is running on a worker.
+    playlist_busy: bool,
     /// Home mixes ("Made for you").
     pub mixes: Mixes,
     /// A play was recorded since the mixes were last built.
@@ -299,6 +382,10 @@ pub struct PlexdioApp {
 
 impl PlexdioApp {
     pub fn new(ctx: &egui::Context, config: Config, opts: LaunchOptions, store: Arc<dyn SecretStore>) -> Self {
+        let library_prefs = config.library.clone();
+        // Zoom is ours (saved, limited, kept at 100 % in the mini-player), not egui's built-in.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        ctx.set_zoom_factor(config.zoom);
         theme::apply(ctx);
         let http = Http::new(ClientInfo::new(config.client_id.clone()));
         let tv = PlexTv::new(http.clone(), opts.plex_tv_url.as_deref());
@@ -308,7 +395,7 @@ impl PlexdioApp {
             opts,
             route: Route::Home,
             history: Vec::new(),
-            browse: BrowseState::default(),
+            browse: BrowseState::with_prefs(library_prefs),
             search: SearchState::default(),
             art: {
                 let c = ctx.clone();
@@ -351,7 +438,18 @@ impl PlexdioApp {
             restored: false,
             last_played_id: None,
             queue_open: false,
+            toast: None,
+            min_size_zoom: 1.0,
+            lyrics_open: false,
+            lyrics: None,
+            lyrics_hold_until: 0.0,
+            lyrics_line: None,
             queue_drag: None,
+            selection: Selection::default(),
+            dialog: None,
+            track_details: None,
+            playlist_ops: Default::default(),
+            playlist_busy: false,
             mixes: Mixes::default(),
             mixes_dirty: true,
             radio_job: None,
@@ -714,6 +812,37 @@ impl PlexdioApp {
         }
     }
 
+    /// Change the interface zoom (saved), with a short note on screen.
+    fn set_zoom(&mut self, z: f32, ctx: &egui::Context) {
+        let z = crate::config::clamp_zoom(z);
+        if (z - self.config.zoom).abs() > 0.001 {
+            self.config.zoom = z;
+            self.save_config();
+        }
+        self.toast = Some((format!("Zoom {} %", (z * 100.0).round()), ctx.input(|i| i.time) + 1.5));
+        ctx.request_repaint();
+    }
+
+    /// The short note from [`Self::set_zoom`], centred near the top until it times out.
+    fn draw_toast(&mut self, ctx: &egui::Context) {
+        let Some((text, until)) = self.toast.clone() else { return };
+        let now = ctx.input(|i| i.time);
+        if now >= until {
+            self.toast = None;
+            return;
+        }
+        egui::Area::new(egui::Id::unique("toast"))
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 56.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).corner_radius(18.0).inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
+                    ui.label(RichText::new(text).strong());
+                });
+            });
+        ctx.request_repaint_after(Duration::from_secs_f64((until - now).max(0.05)));
+    }
+
     fn toggle_mini(&mut self) {
         self.mini = !self.mini;
         self.mini_geometry = true;
@@ -723,6 +852,7 @@ impl PlexdioApp {
     /// Ctrl+arrows skip/volume, Ctrl+M mini-player.
     fn shortcuts(&mut self, ui: &mut egui::Ui) {
         let (mut toggle, mut seek, mut skip, mut volume, mut mini) = (false, 0i64, 0i32, 0.0f32, false);
+        let mut zoom: Option<i32> = None;
         ui.input_mut(|i| {
             toggle = i.consume_key(egui::Modifiers::NONE, egui::Key::Space);
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
@@ -744,7 +874,16 @@ impl PlexdioApp {
                 volume -= 0.05;
             }
             mini = i.consume_key(egui::Modifiers::COMMAND, egui::Key::M);
+            for (key, step) in [(egui::Key::Plus, 1), (egui::Key::Equals, 1), (egui::Key::Minus, -1), (egui::Key::Num0, 0)] {
+                if i.consume_key(egui::Modifiers::COMMAND, key) || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, key) {
+                    zoom = Some(step);
+                }
+            }
         });
+        if let Some(step) = zoom {
+            let z = if step == 0 { 1.0 } else { self.config.zoom + step as f32 * 0.1 };
+            self.set_zoom(z, ui.ctx());
+        }
         if toggle {
             self.toggle_playback();
         }
@@ -1103,6 +1242,19 @@ impl PlexdioApp {
                 }
             }
             Msg::LibraryLoaded(..) | Msg::SyncProgress(..) | Msg::SyncDone(..) => {}
+            Msg::PlaylistSaved(gen, r) => self.playlist_saved(gen, r),
+            Msg::TrackDetails(id, r) => self.track_details = Some((id, r)),
+            Msg::Lyrics(id, r) => {
+                if self.lyrics.as_ref().is_some_and(|(l, _)| *l == id) {
+                    let state = match r {
+                        Ok(Some((body, provider))) => lyrics_from(&body, provider),
+                        Ok(None) => LyricsState::Missing,
+                        Err(e) => LyricsState::Failed(e),
+                    };
+                    self.lyrics = Some((id, state));
+                    self.lyrics_line = None;
+                }
+            }
             Msg::OutputDevices(devices, default) => {
                 self.output_devices = Some((devices, default));
                 self.output_devices_at = Some(std::time::Instant::now());
@@ -1202,6 +1354,7 @@ impl PlexdioApp {
 
     pub fn navigate(&mut self, r: Route) {
         if r != self.route {
+            self.selection.clear();
             let prev = std::mem::replace(&mut self.route, r);
             // Switching library tabs replaces instead of stacking.
             if !matches!((&prev, &self.route), (Route::Library(_), Route::Library(_))) {
@@ -1214,6 +1367,7 @@ impl PlexdioApp {
     }
 
     pub fn back(&mut self) {
+        self.selection.clear();
         if let Some(r) = self.history.pop() {
             self.route = r;
         }
@@ -1223,6 +1377,32 @@ impl PlexdioApp {
         match a {
             UiAction::Navigate(r) => self.navigate(r),
             UiAction::Rate(id, rating) => self.rate_track(id, rating),
+            UiAction::NewPlaylist(ids) => {
+                if self.can_edit_playlists() {
+                    let open = ids.is_empty();
+                    self.dialog = Some(Dialog::NewPlaylist { title: String::new(), ids, open });
+                }
+            }
+            UiAction::AddToPlaylist(pl, ids) => self.add_to_playlist(pl, ids, None),
+            UiAction::RemoveFromPlaylist(pl, rows) => {
+                self.selection.clear();
+                self.remove_from_playlist(pl, &rows)
+            }
+            UiAction::MovePlaylistItem(pl, from, to) => {
+                self.selection.clear();
+                self.move_playlist_item(pl, from, to)
+            }
+            UiAction::TrackInfo(id) => self.open_track_info(id),
+            UiAction::RenamePlaylist(pl) => {
+                if let Some(p) = self.can_edit_playlist(pl) {
+                    self.dialog = Some(Dialog::Rename { playlist: pl, title: p.title.to_string() });
+                }
+            }
+            UiAction::DeletePlaylist(pl) => {
+                if let Some(p) = self.can_edit_playlist(pl) {
+                    self.dialog = Some(Dialog::ConfirmDelete { playlist: pl, title: p.title.to_string() });
+                }
+            }
             UiAction::Play(..) | UiAction::PlayShuffled(..) | UiAction::PlayNext(..) | UiAction::AddToQueue(..) | UiAction::Radio(..) => {
                 self.playback_action(a)
             }
@@ -1721,6 +1901,311 @@ impl PlexdioApp {
     }
 
     /// Rate a track locally (cache + model) and on the server.
+    // ------------------------------------------------------------------ playlist editing
+    //
+    // Edits change the in-memory playlist at once (so the page reacts immediately), then go to
+    // the server one at a time. After each one the playlists are re-read from the server into the
+    // cache; when no further edit is waiting, that copy replaces the local one.
+
+    /// Playlists can only be edited with a server connection.
+    fn can_edit_playlists(&mut self) -> bool {
+        if self.offline || self.pms.is_none() {
+            self.banner = Some(("Connect to your server to edit playlists.".into(), true));
+            return false;
+        }
+        true
+    }
+
+    /// The playlist, if it exists, is a regular one and the server is reachable.
+    fn can_edit_playlist(&mut self, id: Id) -> Option<crate::library_model::Playlist> {
+        if !self.can_edit_playlists() {
+            return None;
+        }
+        let p = self.library.as_ref().and_then(|l| l.playlist(id)).cloned();
+        match p {
+            Some(p) if p.smart => {
+                self.banner = Some(("Smart playlists are edited by their rules on the server.".into(), true));
+                None
+            }
+            Some(p) => Some(p),
+            None => None,
+        }
+    }
+
+    /// Append tracks to a playlist. `skip_dupes`: `None` asks when some are already in it.
+    fn add_to_playlist(&mut self, pl: Id, ids: Vec<Id>, skip_dupes: Option<bool>) {
+        let Some(p) = self.can_edit_playlist(pl) else { return };
+        let have: std::collections::HashSet<Id> = p.items.iter().copied().collect();
+        let dupes = ids.iter().filter(|id| have.contains(id)).count();
+        if dupes > 0 && skip_dupes.is_none() {
+            self.dialog = Some(Dialog::Duplicates { playlist: pl, ids, dupes });
+            return;
+        }
+        let ids: Vec<Id> = if skip_dupes == Some(true) { ids.into_iter().filter(|id| !have.contains(id)).collect() } else { ids };
+        if ids.is_empty() {
+            return;
+        }
+        if let Some(l) = &mut self.library {
+            let dur: u64 = ids.iter().filter_map(|t| l.track(*t)).map(|t| t.duration_ms as u64).sum();
+            if let Some(p) = l.playlist_mut(pl) {
+                p.items.extend(&ids);
+                p.item_ids.extend(std::iter::repeat_n(None, ids.len()));
+                p.leaf_count += ids.len() as u32;
+                p.duration_ms += dur;
+            }
+            self.library_ver += 1;
+        }
+        self.queue_playlist_op(PlaylistOp::Add { playlist: pl, title: p.title.to_string(), ids });
+    }
+
+    /// Remove playlist page table rows.
+    fn remove_from_playlist(&mut self, pl: Id, rows: &[usize]) {
+        let Some(p) = self.can_edit_playlist(pl) else { return };
+        let Some(lib) = self.library.as_ref() else { return };
+        let visible = lib.playlist_rows(&p);
+        let mut pos: Vec<usize> = rows.iter().filter_map(|&r| visible.get(r).copied()).collect();
+        pos.sort_unstable();
+        pos.dedup();
+        let Some(items) = pos.iter().map(|&i| p.item_ids.get(i).copied().flatten()).collect::<Option<Vec<i64>>>() else {
+            self.banner = Some(("Still saving the last change to this playlist; try again in a moment.".into(), true));
+            return;
+        };
+        if items.is_empty() {
+            return;
+        }
+        if let Some(l) = &mut self.library {
+            let durs: Vec<u64> = pos.iter().map(|&i| l.track(p.items[i]).map_or(0, |t| t.duration_ms as u64)).collect();
+            if let Some(p) = l.playlist_mut(pl) {
+                for &i in pos.iter().rev() {
+                    p.items.remove(i);
+                    p.item_ids.remove(i);
+                }
+                p.leaf_count = p.leaf_count.saturating_sub(pos.len() as u32);
+                p.duration_ms = p.duration_ms.saturating_sub(durs.iter().sum());
+            }
+            self.library_ver += 1;
+        }
+        self.queue_playlist_op(PlaylistOp::Remove { playlist: pl, items });
+    }
+
+    /// Move the entry at table row `from` to table row `to` (drag and drop on the page).
+    fn move_playlist_item(&mut self, pl: Id, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        let Some(p) = self.can_edit_playlist(pl) else { return };
+        let Some(lib) = self.library.as_ref() else { return };
+        let visible = lib.playlist_rows(&p);
+        let (Some(&from), Some(&to)) = (visible.get(from), visible.get(to)) else { return };
+        let mut items = p.items.clone();
+        let mut item_ids = p.item_ids.clone();
+        let track = items.remove(from);
+        let item = item_ids.remove(from);
+        items.insert(to, track);
+        item_ids.insert(to, item);
+        let after = if to == 0 { Some(None) } else { item_ids[to - 1].map(Some) };
+        let (Some(item), Some(after)) = (item, after) else {
+            self.banner = Some(("Still saving the last change to this playlist; try again in a moment.".into(), true));
+            return;
+        };
+        if let Some(l) = &mut self.library {
+            if let Some(p) = l.playlist_mut(pl) {
+                p.items = items;
+                p.item_ids = item_ids;
+            }
+            self.library_ver += 1;
+        }
+        self.queue_playlist_op(PlaylistOp::Move { playlist: pl, item, after });
+    }
+
+    fn rename_playlist(&mut self, pl: Id, title: String) {
+        let title = title.trim().to_string();
+        let Some(p) = self.can_edit_playlist(pl) else { return };
+        if title.is_empty() || *p.title == *title {
+            return;
+        }
+        if let Some(l) = &mut self.library {
+            if let Some(p) = l.playlist_mut(pl) {
+                p.title = title.as_str().into();
+            }
+            self.library_ver += 1;
+        }
+        self.queue_playlist_op(PlaylistOp::Rename { playlist: pl, title });
+    }
+
+    fn delete_playlist(&mut self, pl: Id) {
+        let Some(p) = self.can_edit_playlist(pl) else { return };
+        if let Some(l) = &mut self.library {
+            l.playlists.retain(|x| x.id != pl);
+            self.library_ver += 1;
+        }
+        // Leave the page of the deleted playlist and drop it from the back history.
+        self.history.retain(|r| *r != Route::Playlist(pl));
+        if self.route == Route::Playlist(pl) {
+            self.route = self.history.pop().unwrap_or(Route::Playlists);
+        }
+        self.queue_playlist_op(PlaylistOp::Delete { playlist: pl, title: p.title.to_string() });
+    }
+
+    fn queue_playlist_op(&mut self, op: PlaylistOp) {
+        self.playlist_ops.push_back(op);
+        self.pump_playlist_ops();
+    }
+
+    /// Send the next waiting edit to the server (one at a time, in order).
+    fn pump_playlist_ops(&mut self) {
+        if self.playlist_busy {
+            return;
+        }
+        let (Some(pms), Some(path)) = (self.pms.clone(), self.db_path.clone()) else {
+            self.playlist_ops.clear();
+            return;
+        };
+        let Some(op) = self.playlist_ops.pop_front() else { return };
+        self.playlist_busy = true;
+        let gen = self.library_gen;
+        self.jobs.spawn("playlist-edit", move || Msg::PlaylistSaved(gen, run_playlist_op(&pms, &path, op)));
+    }
+
+    fn playlist_saved(&mut self, gen: u64, r: PlaylistSaved) {
+        self.playlist_busy = false;
+        if gen != self.library_gen {
+            // Another library was opened meanwhile; its playlists are not these.
+            self.playlist_ops.clear();
+            return;
+        }
+        match &r.error {
+            Some(e) => self.banner = Some((e.clone(), true)),
+            None if !r.done.is_empty() => self.banner = Some((r.done.clone(), false)),
+            None => {}
+        }
+        // With more edits waiting, keep the local copy: it already includes them.
+        if self.playlist_ops.is_empty() {
+            if let (Some(l), Some(pls)) = (&mut self.library, r.playlists) {
+                l.playlists = pls;
+                self.library_ver += 1;
+            }
+        }
+        if let (Some(id), true) = (r.created, r.open) {
+            self.navigate(Route::Playlist(id));
+        }
+        self.pump_playlist_ops();
+    }
+
+    /// Open the Track info dialog and ask the server for the file details.
+    fn open_track_info(&mut self, id: Id) {
+        let local_plays = self
+            .db_path
+            .as_ref()
+            .and_then(|p| LibraryDb::open(p).ok())
+            .and_then(|db| db.play_counts().ok())
+            .and_then(|c| c.into_iter().find(|(t, _)| *t == id).map(|(_, n)| n));
+        self.dialog = Some(Dialog::TrackInfo { id, local_plays });
+        self.track_details = None;
+        if let Some(pms) = self.pms.clone().filter(|_| !self.offline) {
+            self.jobs.spawn("track-info", move || {
+                let r = pms.metadata(&id.to_string()).map_err(|e| e.user_message()).and_then(|m| m.map(Box::new).ok_or_else(|| "not found on the server".to_string()));
+                Msg::TrackDetails(id, r)
+            });
+        }
+    }
+
+    /// The open dialog, if any, drawn as a modal over the window.
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.dialog.take() else { return };
+        enum Out {
+            Keep,
+            Close,
+            Create(String, Vec<Id>, bool),
+            Rename(Id, String),
+            Delete(Id),
+            Add(Id, Vec<Id>, bool),
+        }
+        let mut out = Out::Keep;
+        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(egui::Margin::same(20)).corner_radius(10.0);
+        let modal = egui::Modal::new(egui::Id::unique("dialog")).frame(frame).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.spacing_mut().item_spacing.y = 10.0;
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            match &mut dialog {
+                Dialog::NewPlaylist { title, ids, open } => {
+                    ui.label(RichText::new("New playlist").size(18.0).strong());
+                    if !ids.is_empty() {
+                        ui.label(RichText::new(format!("With {} {}", ids.len(), if ids.len() == 1 { "track" } else { "tracks" })).color(theme::TEXT_DIM));
+                    }
+                    name_field(ui, title, "Playlist name");
+                    let ok = !title.trim().is_empty();
+                    dialog_buttons(ui, "Create", ok, &mut out, Out::Close, || Out::Create(title.trim().to_string(), ids.clone(), *open), enter);
+                }
+                Dialog::Rename { playlist, title } => {
+                    ui.label(RichText::new("Rename playlist").size(18.0).strong());
+                    name_field(ui, title, "Playlist name");
+                    let ok = !title.trim().is_empty();
+                    dialog_buttons(ui, "Rename", ok, &mut out, Out::Close, || Out::Rename(*playlist, title.trim().to_string()), enter);
+                }
+                Dialog::ConfirmDelete { playlist, title } => {
+                    ui.label(RichText::new("Delete playlist?").size(18.0).strong());
+                    ui.label(format!("“{title}” will be deleted from your Plex server. The songs stay in your library."));
+                    dialog_buttons(ui, "Delete", true, &mut out, Out::Close, || Out::Delete(*playlist), enter);
+                }
+                Dialog::TrackInfo { id, local_plays } => {
+                    use super::views::track_info::{track_info, Details};
+                    ui.set_width(460.0);
+                    let details = match (&self.track_details, self.offline || self.pms.is_none()) {
+                        (Some((tid, Ok(m))), _) if tid == id => Details::Ready(m),
+                        (Some((tid, Err(e))), _) if tid == id => Details::Failed(e),
+                        (_, true) => Details::Offline,
+                        _ => Details::Loading,
+                    };
+                    let stream = self.playback.stream.as_ref().filter(|_| self.playback.track.as_ref().is_some_and(|t| t.id == *id));
+                    match self.library.as_ref() {
+                        Some(lib) => egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| track_info(ui, lib, *id, details, stream, *local_plays)).inner,
+                        None => {}
+                    }
+                    ui.add_space(6.0);
+                    if ui.add(egui::Button::new("Close").corner_radius(14.0)).clicked() || enter {
+                        out = Out::Close;
+                    }
+                }
+                Dialog::Duplicates { playlist, ids, dupes } => {
+                    let all = *dupes == ids.len();
+                    ui.label(RichText::new("Already in this playlist").size(18.0).strong());
+                    ui.label(if all {
+                        if ids.len() == 1 { "This song is already in the playlist.".to_string() } else { "These songs are already in the playlist.".to_string() }
+                    } else {
+                        format!("{dupes} of these {} songs are already in the playlist.", ids.len())
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Add anyway").clicked() {
+                            out = Out::Add(*playlist, ids.clone(), false);
+                        }
+                        if !all && ui.button("Skip duplicates").clicked() {
+                            out = Out::Add(*playlist, ids.clone(), true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            out = Out::Close;
+                        }
+                    });
+                }
+            }
+        });
+        if matches!(out, Out::Keep) && modal.should_close() {
+            out = Out::Close;
+        }
+        match out {
+            Out::Keep => self.dialog = Some(dialog),
+            Out::Close => {}
+            Out::Create(title, ids, open) => {
+                if self.can_edit_playlists() {
+                    self.queue_playlist_op(PlaylistOp::Create { title, ids, open });
+                }
+            }
+            Out::Rename(pl, title) => self.rename_playlist(pl, title),
+            Out::Delete(pl) => self.delete_playlist(pl),
+            Out::Add(pl, ids, skip) => self.add_to_playlist(pl, ids, Some(skip)),
+        }
+    }
+
     pub fn rate_track(&mut self, id: crate::library_model::Id, rating: u8) {
         let value = (rating > 0).then_some(rating as f64);
         if let Some(l) = &mut self.library {
@@ -1938,6 +2423,9 @@ impl PlexdioApp {
                 {
                     cmds.push(BarCmd::Mute(!st.muted));
                 }
+                if icons::button(ui, Icon::Lyrics, 18.0, self.lyrics_open).on_hover_text("Lyrics").clicked() {
+                    cmds.push(BarCmd::Lyrics);
+                }
                 if icons::button(ui, Icon::Queue, 18.0, self.queue_open).on_hover_text("Queue").clicked() {
                     cmds.push(BarCmd::Queue);
                 }
@@ -1994,7 +2482,14 @@ impl PlexdioApp {
                         self.config.repeat = mode;
                         save = true;
                     }
-                    BarCmd::Queue => self.queue_open = !self.queue_open,
+                    BarCmd::Queue => {
+                        self.queue_open = !self.queue_open;
+                        self.lyrics_open &= !self.queue_open;
+                    }
+                    BarCmd::Lyrics => {
+                        self.lyrics_open = !self.lyrics_open;
+                        self.queue_open &= !self.lyrics_open;
+                    }
                     BarCmd::Rate(r) => {
                         // Re-borrow after the loop's immutable borrows; deferred below.
                         rate = Some(r);
@@ -2018,6 +2513,161 @@ impl PlexdioApp {
         }
         if st.state == PlayState::Playing {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// Load the lyrics of the playing track when it changed: from the cache, else from the server.
+    fn ensure_lyrics(&mut self) {
+        let Some(id) = self.playback.track.as_ref().map(|t| t.id) else {
+            self.lyrics = None;
+            return;
+        };
+        if self.lyrics.as_ref().is_some_and(|(l, _)| *l == id) {
+            return;
+        }
+        self.lyrics_line = None;
+        let now = crate::logging::unix_now();
+        let cached = self.db_path.as_ref().and_then(|p| LibraryDb::open(p).ok()).and_then(|db| db.lyrics(id).ok().flatten());
+        match cached {
+            Some((Some(body), provider, _)) => {
+                self.lyrics = Some((id, lyrics_from(&body, provider)));
+                return;
+            }
+            Some((None, _, at)) if now - at < LYRICS_MISSING_TTL => {
+                self.lyrics = Some((id, LyricsState::Missing));
+                return;
+            }
+            _ => {}
+        }
+        let (Some(pms), Some(path)) = (self.pms.clone().filter(|_| !self.offline), self.db_path.clone()) else {
+            self.lyrics = Some((id, LyricsState::Offline));
+            return;
+        };
+        self.lyrics = Some((id, LyricsState::Loading));
+        self.jobs.spawn("lyrics", move || {
+            let r = (|| {
+                let Some(meta) = pms.track_with_lyrics(&id.to_string())? else { return Ok(None) };
+                let Some(stream) = meta.lyrics_stream() else { return Ok(None) };
+                let body = pms.stream_content(stream.key.as_deref().unwrap_or_default())?;
+                Ok(Some((String::from_utf8_lossy(&body).into_owned(), stream.provider.clone())))
+            })()
+            .map_err(|e: PlexError| e.user_message());
+            if let (Ok(found), Ok(db)) = (&r, LibraryDb::open(&path)) {
+                let (body, provider) = match found {
+                    Some((b, p)) => (Some(b.as_str()), p.as_deref()),
+                    None => (None, None),
+                };
+                if let Err(e) = db.set_lyrics(id, body, provider, crate::logging::unix_now()) {
+                    log::warn!("cannot cache lyrics: {e}");
+                }
+            }
+            Msg::Lyrics(id, r)
+        });
+    }
+
+    /// The lyrics side panel: the current line highlighted and kept in the middle; clicking a
+    /// timed line seeks to it.
+    fn lyrics_panel(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Lyrics").strong().size(16.0).color(theme::TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icons::button(ui, Icon::Close, 16.0, false).on_hover_text("Close the lyrics").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.lyrics_open = false;
+            return;
+        }
+        let Some(track) = self.playback.track.clone() else {
+            ui.add_space(8.0);
+            ui.label(RichText::new("Play a song to see its lyrics.").color(theme::TEXT_DIM));
+            return;
+        };
+        ui.label(RichText::new(format!("{} · {}", track.title, track.artist)).small().color(theme::TEXT_DIM));
+        ui.add_space(4.0);
+        ui.separator();
+        let state = self.lyrics.as_ref().filter(|(id, _)| *id == track.id).map(|(_, s)| s.clone()).unwrap_or(LyricsState::Loading);
+        let msg = |ui: &mut egui::Ui, text: &str| {
+            ui.add_space(12.0);
+            ui.label(RichText::new(text).color(theme::TEXT_DIM));
+        };
+        let lyrics = match state {
+            LyricsState::Loading => {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    theme::spinner(ui, 14.0);
+                    ui.label(RichText::new("Looking for lyrics…").color(theme::TEXT_DIM));
+                });
+                return;
+            }
+            LyricsState::Missing => return msg(ui, "No lyrics for this song."),
+            LyricsState::Offline => return msg(ui, "Lyrics need a connection to your server the first time."),
+            LyricsState::Failed(e) => return msg(ui, &format!("Couldn't load the lyrics: {e}")),
+            LyricsState::Ready(l) if l.is_empty() => return msg(ui, "No lyrics for this song."),
+            LyricsState::Ready(l) => l,
+        };
+        // A little ahead of the audio, so a line lights up as it starts being sung.
+        let pos = self.playback.position_ms + 200;
+        let current = lyrics.current(pos);
+        let now = ui.input(|i| i.time);
+        let panel = ui.max_rect();
+        if ui.rect_contains_pointer(panel) && ui.input(|i| i.smooth_scroll_delta.y != 0.0) {
+            self.lyrics_hold_until = now + 4.0;
+        }
+        let held = now < self.lyrics_hold_until;
+        let follow = lyrics.timed && !held && current != self.lyrics_line;
+        let mut seek = None;
+        let pad = (panel.height() / 3.0).max(40.0);
+        egui::ScrollArea::vertical().id_salt(("lyrics", track.id)).auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(if lyrics.timed { pad } else { 12.0 });
+            ui.spacing_mut().item_spacing.y = 10.0;
+            for (i, line) in lyrics.lines.iter().enumerate() {
+                // An empty timed line is an instrumental break; in plain lyrics it is a verse gap.
+                if line.text.is_empty() && !lyrics.timed {
+                    ui.add_space(6.0);
+                    continue;
+                }
+                let text = if line.text.is_empty() { "♪" } else { line.text.as_str() };
+                let (size, color) = match current {
+                    Some(c) if c == i => (20.0, theme::TEXT),
+                    Some(c) if i < c => (17.0, theme::TEXT_DIM.linear_multiply(0.7)),
+                    _ if lyrics.timed => (17.0, theme::TEXT_DIM),
+                    _ => (16.0, theme::TEXT),
+                };
+                let rich = RichText::new(text).size(size).color(color);
+                let rich = if current == Some(i) { rich.strong() } else { rich };
+                let mut label = egui::Label::new(rich).wrap();
+                if lyrics.timed {
+                    label = label.sense(egui::Sense::click());
+                }
+                let resp = ui.add(label);
+                let rect = resp.rect;
+                if lyrics.timed && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    seek = line.at_ms;
+                } else if follow && current == Some(i) {
+                    ui.scroll_to_rect(rect, Some(Align::Center));
+                }
+            }
+            ui.add_space(if lyrics.timed { pad } else { 12.0 });
+            if let Some(p) = &lyrics.provider {
+                ui.label(RichText::new(format!("Lyrics: {p}")).small().color(theme::TEXT_DIM));
+            }
+        });
+        if follow {
+            self.lyrics_line = current;
+        }
+        if let (Some(ms), Some(eng)) = (seek, &self.engine) {
+            log::info!("lyrics: seek to {ms} ms");
+            eng.seek(ms);
+            self.lyrics_hold_until = 0.0;
+            self.lyrics_line = None;
+        }
+        if lyrics.timed && self.playback.state == PlayState::Playing {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
     }
 
@@ -2214,15 +2864,30 @@ impl PlexdioApp {
             return;
         }
         let mut actions = Vec::new();
+        let mut prefs_changed = false;
         let route = self.route.clone();
         let greeting = greeting();
         let now_playing = self.playback.track.as_ref().map(|t| t.id);
         {
-            let mut vc = ViewCtx { lib, art: &mut self.art, actions: &mut actions, now_playing, mixes: &self.mixes, similar: &self.similar };
+            let mut vc = ViewCtx {
+                lib,
+                art: &mut self.art,
+                actions: &mut actions,
+                now_playing,
+                mixes: &self.mixes,
+                similar: &self.similar,
+                selection: &mut self.selection,
+            };
             use super::views::{detail, library, search};
             match &route {
                 Route::Home => detail::home_view(ui, &mut vc, &greeting),
-                Route::Library(tab) => library::library_view(ui, &mut vc, &mut self.browse, *tab, self.library_ver),
+                Route::Library(tab) => {
+                    library::library_view(ui, &mut vc, &mut self.browse, *tab, self.library_ver);
+                    if std::mem::take(&mut self.browse.prefs_changed) {
+                        self.config.library = self.browse.prefs.clone();
+                        prefs_changed = true;
+                    }
+                }
                 Route::Playlists => library::playlists_view(ui, &mut vc),
                 Route::Album(id) => detail::album_view(ui, &mut vc, *id),
                 Route::Artist(id) => detail::artist_view(ui, &mut vc, *id),
@@ -2233,6 +2898,11 @@ impl PlexdioApp {
                 Route::Search => search::search_view(ui, &mut vc, &mut self.search, self.library_ver),
                 Route::Settings => {}
             }
+            let bottom = ui.clip_rect().center_bottom();
+            super::views::common::selection_bar(ui, &mut vc, bottom);
+        }
+        if prefs_changed {
+            self.save_config();
         }
         for a in actions {
             self.apply_action(a);
@@ -2464,6 +3134,18 @@ impl PlexdioApp {
     }
 
     fn settings_window(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        setting_row(ui, "Zoom", Some("Size of text and controls (Ctrl+= / Ctrl+− / Ctrl+0)"), |ui| {
+            let mut z = self.config.zoom;
+            egui::ComboBox::from_id_salt("zoom").selected_text(format!("{} %", (z * 100.0).round())).width(90.0).show_ui(ui, |ui| {
+                for pct in (80..=150).step_by(10) {
+                    ui.selectable_value(&mut z, pct as f32 / 100.0, format!("{pct} %"));
+                }
+            });
+            if (z - self.config.zoom).abs() > 0.001 {
+                let ctx = ui.ctx().clone();
+                self.set_zoom(z, &ctx);
+            }
+        });
         setting_row(ui, "Mini-player", Some("A small always-on-top window (Ctrl+M)"), |ui| {
             if theme::secondary_button(ui, if self.mini { "Leave" } else { "Open" }).clicked() {
                 self.toggle_mini();
@@ -2739,6 +3421,111 @@ fn bar_link(ui: &mut egui::Ui, text: RichText, enabled: bool) -> bool {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
+/// Parsed lyrics with a readable provider name.
+fn lyrics_from(body: &str, provider: Option<String>) -> LyricsState {
+    let mut l = crate::player::lyrics::parse(body.as_bytes());
+    let named = provider.map(|p| {
+        let low = p.to_ascii_lowercase();
+        if low.contains("lyricfind") {
+            "LyricFind".to_string()
+        } else if low.contains("localmedia") || low.contains("local") {
+            "lyrics file".to_string()
+        } else {
+            p
+        }
+    });
+    l.provider = l.provider.take().or(named);
+    LyricsState::Ready(l)
+}
+
+/// Run one playlist edit against the server, then re-read the playlists into the cache.
+fn run_playlist_op(pms: &PmsClient, db_path: &std::path::Path, op: PlaylistOp) -> PlaylistSaved {
+    let plural = |n: usize| format!("{n} {}", if n == 1 { "track" } else { "tracks" });
+    let (mut created, mut open, mut touched) = (None, false, Vec::new());
+    let (res, done) = match op {
+        PlaylistOp::Create { title, ids, open: o } => {
+            open = o;
+            let r = pms.create_playlist(&title, &ids).map(|id| {
+                created = Some(id);
+                touched.push(id);
+            });
+            let done = if ids.is_empty() { format!("Created “{title}”.") } else { format!("Created “{title}” with {}.", plural(ids.len())) };
+            (r, done)
+        }
+        PlaylistOp::Add { playlist, title, ids } => {
+            touched.push(playlist);
+            (pms.add_to_playlist(playlist, &ids), format!("Added {} to “{title}”.", plural(ids.len())))
+        }
+        PlaylistOp::Remove { playlist, items } => {
+            touched.push(playlist);
+            let r = items.iter().try_for_each(|&i| pms.remove_playlist_item(playlist, i));
+            (r, format!("Removed {} from the playlist.", plural(items.len())))
+        }
+        PlaylistOp::Move { playlist, item, after } => {
+            touched.push(playlist);
+            (pms.move_playlist_item(playlist, item, after), String::new())
+        }
+        PlaylistOp::Rename { playlist, title } => {
+            touched.push(playlist);
+            (pms.rename_playlist(playlist, &title), String::new())
+        }
+        PlaylistOp::Delete { playlist, title } => (pms.delete_playlist(playlist), format!("Deleted “{title}”.")),
+    };
+    let error = res.err().map(|e| {
+        log::warn!("playlist edit failed: {e}");
+        format!("Couldn't save the playlist change: {}", e.user_message())
+    });
+    // Re-read even after a failure, so the local copy goes back to what the server has.
+    let playlists = LibraryDb::open(db_path).ok().and_then(|mut db| {
+        if let Err(e) = crate::cache::sync::sync_playlists(pms, &mut db, &touched) {
+            log::warn!("playlist refresh after edit failed: {e}");
+            return None;
+        }
+        LibraryModel::load_playlists(&db).ok()
+    });
+    PlaylistSaved { error, done, playlists, created, open }
+}
+
+/// Single-line name field that takes the focus when the dialog opens.
+fn name_field(ui: &mut egui::Ui, text: &mut String, hint: &str) {
+    let resp = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(f32::INFINITY).margin(egui::Margin::symmetric(10, 8)));
+    if ui.memory(|m| m.focused().is_none()) {
+        resp.request_focus();
+    }
+}
+
+/// Confirm / Cancel row of a dialog; Enter confirms when `ok`.
+fn dialog_buttons<T>(ui: &mut egui::Ui, confirm: &str, ok: bool, out: &mut T, cancel: T, on_ok: impl FnOnce() -> T, enter: bool) {
+    // Destructive actions get a red button.
+    let (fill, text) = if confirm == "Delete" { (theme::ERROR, egui::Color32::WHITE) } else { (theme::ACCENT, egui::Color32::from_rgb(24, 24, 24)) };
+    let mut confirmed = false;
+    let mut cancelled = false;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let b = egui::Button::new(RichText::new(confirm).color(text).strong()).fill(fill).corner_radius(14.0);
+        if ui.add_enabled(ok, b).clicked() {
+            confirmed = true;
+        }
+        if ui.add(egui::Button::new("Cancel").corner_radius(14.0)).clicked() {
+            cancelled = true;
+        }
+    });
+    if ok && (confirmed || enter) {
+        *out = on_ok();
+    } else if cancelled {
+        *out = cancel;
+    }
+}
+
+/// Minimum main window size (pixels) at a zoom factor.
+fn min_w(zoom: f32) -> u32 {
+    (760.0 * zoom.max(1.0)).round() as u32
+}
+
+fn min_h(zoom: f32) -> u32 {
+    (480.0 * zoom.max(1.0)).round() as u32
+}
+
 /// Signed-in account above Settings: an initial avatar and the name, lined up with the nav items.
 fn account_row(ui: &mut egui::Ui, name: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
@@ -2786,11 +3573,18 @@ impl UiApp for PlexdioApp {
     fn ui(&mut self, ui: &mut egui::Ui) {
         if !self.mini {
             if let Some(rect) = ui.ctx().input(|i| i.viewport().inner_rect) {
+                // Ui points times the zoom are window pixels (what the window size is set in).
+                let z = ui.ctx().zoom_factor();
+                let (w, h) = (rect.width() * z, rect.height() * z);
                 // Ignore transient sizes while the mini-player geometry is being applied.
-                if rect.width() >= 760.0 && rect.height() >= 480.0 {
-                    self.last_window_size = Some([rect.width(), rect.height()]);
+                if w >= 760.0 && h >= 480.0 {
+                    self.last_window_size = Some([w, h]);
                 }
             }
+        }
+        let want_zoom = if self.mini { 1.0 } else { self.config.zoom };
+        if (ui.ctx().zoom_factor() - want_zoom).abs() > 0.001 {
+            ui.ctx().set_zoom_factor(want_zoom);
         }
         for msg in self.jobs.drain() {
             self.handle(msg);
@@ -2819,7 +3613,7 @@ impl UiApp for PlexdioApp {
             self.navigate(Route::Search);
             self.search.focus = true;
         }
-        if self.screen == Screen::Main && !ui.ctx().egui_wants_keyboard_input() {
+        if self.screen == Screen::Main && self.dialog.is_none() && !ui.ctx().egui_wants_keyboard_input() {
             self.shortcuts(ui);
         }
         if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1)) {
@@ -2853,7 +3647,14 @@ impl UiApp for PlexdioApp {
                     .resizable(false)
                     .frame(egui::Frame::new().fill(theme::SIDEBAR).inner_margin(egui::Margin::symmetric(10, 6)))
                     .show(ui, |ui| self.sidebar(ui));
-                if self.queue_open {
+                if self.lyrics_open {
+                    self.ensure_lyrics();
+                    egui::Panel::right("lyrics_panel")
+                        .exact_size(340.0)
+                        .resizable(false)
+                        .frame(egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(14, 6)))
+                        .show(ui, |ui| self.lyrics_panel(ui));
+                } else if self.queue_open {
                     egui::Panel::right("queue_panel")
                         .exact_size(320.0)
                         .resizable(false)
@@ -2863,6 +3664,8 @@ impl UiApp for PlexdioApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(24, 8)))
                     .show(ui, |ui| self.content(ui));
+                self.dialogs(&ui.ctx().clone());
+                self.draw_toast(ui.ctx());
                 self.maybe_search_server(ui.ctx().input(|i| i.time));
             }
         }
@@ -2925,9 +3728,14 @@ impl UiApp for PlexdioApp {
                 let [w, h] = self.config.window_size.unwrap_or([1180.0, 760.0]);
                 cmds.push(WindowCmd::AlwaysOnTop(false));
                 cmds.push(WindowCmd::Resizable(true));
-                cmds.push(WindowCmd::MinSize(760, 480));
+                cmds.push(WindowCmd::MinSize(min_w(self.config.zoom), min_h(self.config.zoom)));
                 cmds.push(WindowCmd::Size(w as u32, h as u32));
+                self.min_size_zoom = self.config.zoom;
             }
+        } else if !self.mini && (self.min_size_zoom - self.config.zoom).abs() > 0.001 {
+            // Bigger text needs a bigger window to lay out like at 100 %.
+            cmds.push(WindowCmd::MinSize(min_w(self.config.zoom), min_h(self.config.zoom)));
+            self.min_size_zoom = self.config.zoom;
         }
         if let Some(smtc) = &mut self.smtc {
             let playing = self.playback.state == PlayState::Playing;

@@ -73,6 +73,39 @@ pub struct TrackInfo {
     pub duration_ms: u64,
 }
 
+/// How the playing track reaches the speakers (for the Track info dialog).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamInfo {
+    /// Converted by the server's transcoder, at this bitrate cap.
+    pub transcode_kbps: Option<u32>,
+    /// Played from a file on this computer (a download), not streamed.
+    pub local: bool,
+    /// Sample rate of the decoded file and of the output device.
+    pub source_rate: u32,
+    pub out_rate: u32,
+    /// File type the decoder was given ("flac", "mp3", ...).
+    pub format: Option<String>,
+}
+
+impl StreamInfo {
+    fn of(a: &Active) -> Self {
+        let transcode_kbps = match &a.spec.source {
+            SourceSpec::Http { url, .. } if url.contains("/transcode/") => url
+                .split(['?', '&'])
+                .find_map(|kv| kv.strip_prefix("maxAudioBitrate="))
+                .and_then(|v| v.parse().ok()),
+            _ => None,
+        };
+        Self {
+            transcode_kbps,
+            local: matches!(a.spec.source, SourceSpec::Local(_)),
+            source_rate: a.decoder.sample_rate(),
+            out_rate: a.decoder.out_rate(),
+            format: a.spec.ext_hint().map(str::to_ascii_lowercase),
+        }
+    }
+}
+
 /// One entry of the queue as shown to the UI: the queue slot (`index`) and whether it is the
 /// track playing right now.
 #[derive(Clone, Debug)]
@@ -101,6 +134,8 @@ pub struct PlaybackStatus {
     pub queue: Arc<Vec<QueueEntry>>,
     pub queue_gen: u64,
     pub error: Option<String>,
+    /// Stream details of the playing track.
+    pub stream: Option<StreamInfo>,
 }
 
 impl Default for PlaybackStatus {
@@ -121,6 +156,7 @@ impl Default for PlaybackStatus {
             queue: Arc::new(Vec::new()),
             queue_gen: 0,
             error: None,
+            stream: None,
         }
     }
 }
@@ -973,6 +1009,7 @@ impl PlayerCore {
             queue: self.snapshot.clone(),
             queue_gen: self.snapshot_gen,
             error: self.error.clone(),
+            stream: self.current.as_ref().map(StreamInfo::of),
         }
     }
 }

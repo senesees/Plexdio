@@ -455,12 +455,96 @@ fn route(state: &Arc<Mutex<State>>, method: &Method, path: &str, q: &HashMap<Str
                 .filter_map(|(i, tid)| {
                     lib.track(*tid).map(|t| {
                         let mut v = track_json(lib, t, false);
-                        v["playlistItemID"] = json!(90_000 + i);
+                        v["playlistItemID"] = json!(p.item_ids.get(i).copied().unwrap_or(90_000 + i as u64));
                         v
                     })
                 })
                 .collect();
             json_resp(200, &json!({ "MediaContainer": { "size": items.len(), "totalSize": p.items.len(), "Metadata": items } }))
+        }
+        // Playlist editing (the calls python-plexapi makes). Smart playlists are read-only.
+        (Method::Post, ["playlists"]) => {
+            let ids = uri_ids(q.get("uri").map(String::as_str).unwrap_or(""));
+            let title = q.get("title").cloned().unwrap_or_default();
+            if title.is_empty() || q.get("smart").map(String::as_str) == Some("1") {
+                return status(400);
+            }
+            let now = st.library.tick();
+            let id = st.library.playlists.iter().map(|p| p.id).max().unwrap_or(499).max(499) + 1;
+            let item_ids: Vec<u64> = ids.iter().map(|_| st.library.next_playlist_item_id()).collect();
+            st.library.playlists.push(library::Playlist { id, title, smart: false, items: ids, item_ids, added_at: now, updated_at: now });
+            let lib = &st.library;
+            let v = playlist_json(lib, lib.playlists.last().unwrap());
+            json_resp(200, &json!({ "MediaContainer": { "size": 1, "Metadata": [v] } }))
+        }
+        (Method::Put, ["playlists", id, "items"]) => {
+            let ids = uri_ids(q.get("uri").map(String::as_str).unwrap_or(""));
+            let id: u64 = id.parse().unwrap_or(0);
+            let now = st.library.tick();
+            let item_ids: Vec<u64> = ids.iter().map(|_| st.library.next_playlist_item_id()).collect();
+            let Some(p) = st.library.playlists.iter_mut().find(|p| p.id == id) else { return status(404) };
+            if p.smart {
+                return status(400);
+            }
+            p.items.extend(ids);
+            p.item_ids.extend(item_ids);
+            p.updated_at = now;
+            json_resp(200, &json!({ "MediaContainer": { "size": 0 } }))
+        }
+        (Method::Delete, ["playlists", id, "items", item]) => {
+            let (id, item): (u64, u64) = (id.parse().unwrap_or(0), item.parse().unwrap_or(0));
+            let now = st.library.tick();
+            let Some(p) = st.library.playlists.iter_mut().find(|p| p.id == id) else { return status(404) };
+            let Some(pos) = p.item_ids.iter().position(|&i| i == item) else { return status(404) };
+            p.items.remove(pos);
+            p.item_ids.remove(pos);
+            p.updated_at = now;
+            json_resp(200, &json!({ "MediaContainer": { "size": 0 } }))
+        }
+        (Method::Put, ["playlists", id, "items", item, "move"]) => {
+            let (id, item): (u64, u64) = (id.parse().unwrap_or(0), item.parse().unwrap_or(0));
+            let after: Option<u64> = q.get("after").and_then(|a| a.parse().ok());
+            let now = st.library.tick();
+            let Some(p) = st.library.playlists.iter_mut().find(|p| p.id == id) else { return status(404) };
+            let Some(from) = p.item_ids.iter().position(|&i| i == item) else { return status(404) };
+            let (track, iid) = (p.items.remove(from), p.item_ids.remove(from));
+            let to = match after {
+                None => 0,
+                Some(a) => match p.item_ids.iter().position(|&i| i == a) {
+                    Some(i) => i + 1,
+                    None => return status(404),
+                },
+            };
+            p.items.insert(to, track);
+            p.item_ids.insert(to, iid);
+            p.updated_at = now;
+            json_resp(200, &json!({ "MediaContainer": { "size": 0 } }))
+        }
+        (Method::Put, ["playlists", id]) => {
+            let id: u64 = id.parse().unwrap_or(0);
+            let now = st.library.tick();
+            let Some(p) = st.library.playlists.iter_mut().find(|p| p.id == id) else { return status(404) };
+            if let Some(t) = q.get("title").filter(|t| !t.is_empty()) {
+                p.title = t.clone();
+            }
+            p.updated_at = now;
+            json_resp(200, &json!({ "MediaContainer": { "size": 0 } }))
+        }
+        (Method::Delete, ["playlists", id]) => {
+            let id: u64 = id.parse().unwrap_or(0);
+            let before = st.library.playlists.len();
+            st.library.playlists.retain(|p| p.id != id);
+            if st.library.playlists.len() == before {
+                return status(404);
+            }
+            json_resp(200, &json!({ "MediaContainer": { "size": 0 } }))
+        }
+        (Method::Get, ["library", "streams", id]) => {
+            let id: u64 = id.parse().unwrap_or(0);
+            match (id % 10 == 4).then(|| lyrics_for(id / 10)).flatten() {
+                Some((_, text)) => bytes_resp(200, "text/plain; charset=utf-8", text.as_bytes().to_vec(), vec![]),
+                None => status(404),
+            }
         }
         (Method::Get, ["hubs", "search"]) => {
             let query = q.get("query").map(|s| s.to_lowercase()).unwrap_or_default();
@@ -625,7 +709,7 @@ fn artist_json(lib: &Library, a: &library::Artist) -> Value {
     let _ = lib;
     json!({
         "ratingKey": a.id.to_string(), "key": format!("/library/metadata/{}/children", a.id), "type": "artist",
-        "title": a.title, "titleSort": a.title.trim_start_matches("The "), "summary": format!("{} is a mock artist.", a.title),
+        "title": a.title, "titleSort": a.title.trim_start_matches("The "), "summary": format!("{0} is a mock artist from the Plexdio test library. They formed in a garage, toured small clubs for years and recorded their first songs on borrowed equipment. Critics called their sound warm, restless and hard to pin down. {0} still plays every song live, and their fans travel far to hear them. This text is long on purpose, so the app can show it shortened with a Read more link.", a.title),
         "thumb": format!("/library/metadata/{}/thumb/{}", a.id, a.updated_at),
         "art": format!("/library/metadata/{}/art/{}", a.id, a.updated_at),
         "addedAt": a.added_at, "updatedAt": a.updated_at, "librarySectionID": 1,
@@ -640,6 +724,7 @@ fn album_json(lib: &Library, a: &library::Album) -> Value {
     let thumb = if a.title == "Live at the Mill" { Value::Null } else { json!(format!("/library/metadata/{}/thumb/{}", a.id, a.updated_at)) };
     json!({
         "ratingKey": a.id.to_string(), "key": format!("/library/metadata/{}/children", a.id), "type": "album",
+        "summary": format!("{} is an album in the mock library, recorded over a long winter. It moves from quiet songs to loud ones and back again.", a.title),
         "title": a.title, "parentRatingKey": a.artist_id.to_string(), "parentTitle": artist.map(|x| x.title.clone()),
         "parentThumb": artist.map(|x| format!("/library/metadata/{}/thumb/{}", x.id, x.updated_at)),
         "year": a.year, "thumb": thumb, "addedAt": a.added_at, "updatedAt": a.updated_at,
@@ -657,6 +742,15 @@ fn track_json(lib: &Library, t: &Track, detail: bool) -> Value {
         stream["albumGain"] = json!(audio.gain_db);
         stream["peak"] = json!(0.95);
         stream["loudness"] = json!(-18.0 - audio.gain_db);
+        stream["samplingRate"] = json!(44_100);
+        if matches!(audio.codec, "flac" | "alac" | "pcm") {
+            stream["bitDepth"] = json!(16);
+        }
+    }
+    let mut streams = vec![stream];
+    if let (true, Some((format, _))) = (detail, lyrics_for(t.id)) {
+        streams.push(json!({ "id": t.id * 10 + 4, "streamType": 4, "key": format!("/library/streams/{}", t.id * 10 + 4),
+                             "format": format, "timed": if format == "lrc" { "1" } else { "0" }, "provider": "com.plexapp.agents.localmedia" }));
     }
     json!({
         "ratingKey": t.id.to_string(), "key": format!("/library/metadata/{}", t.id), "type": "track",
@@ -674,9 +768,24 @@ fn track_json(lib: &Library, t: &Track, detail: bool) -> Value {
             "audioChannels": 2, "audioCodec": audio.codec, "container": audio.container,
             "Part": [{ "id": t.id, "key": format!("/library/parts/{}/{}/{}", t.id, t.updated_at, audio.name),
                        "duration": audio.duration_ms, "size": audio.bytes.len(), "container": audio.container,
-                       "file": format!("/music/{}", audio.name), "Stream": [stream] }]
+                       "file": format!("/music/{}", audio.name), "Stream": streams }]
         }]
     })
+}
+
+/// Lyrics of the fixture tracks that have some: (format, file text). The fixture songs are 8 s
+/// long, so the timed lines are close together.
+fn lyrics_for(track_id: u64) -> Option<(&'static str, &'static str)> {
+    match track_id {
+        10_000 => Some(("lrc", "[ti:Mock song]\n[00:00.50]First light over the water\n[00:02.00]Hold on to the afterglow\n[00:03.50]Every colour fading slow\n[00:05.00]Into the night we go\n[00:06.50]Afterglow\n")),
+        10_001 => Some(("txt", "Plain lyrics without timing\nSecond line of the song\n\nA new verse starts here\n")),
+        _ => None,
+    }
+}
+
+/// Item ids from a `server://…/library/metadata/1,2,3` URI.
+fn uri_ids(uri: &str) -> Vec<u64> {
+    uri.rsplit_once("/metadata/").map(|(_, ids)| ids.split(',').filter_map(|i| i.trim().parse().ok()).collect()).unwrap_or_default()
 }
 
 fn playlist_json(lib: &Library, p: &library::Playlist) -> Value {

@@ -82,6 +82,8 @@ pub struct Playlist {
     pub title: String,
     pub smart: bool,
     pub items: Vec<u64>,
+    /// `playlistItemID` per entry of `items` (filled by `reindex` for the fixtures).
+    pub item_ids: Vec<u64>,
     pub added_at: i64,
     pub updated_at: i64,
 }
@@ -92,6 +94,8 @@ pub struct Library {
     pub albums: Vec<Album>,
     pub tracks: Vec<Track>,
     pub playlists: Vec<Playlist>,
+    /// Last `playlistItemID` handed out.
+    pub next_item_id: u64,
     /// Logical clock for addedAt/updatedAt (unix seconds).
     pub clock: i64,
     /// Lookup indexes. Rebuilt by `reindex()`; the large synthetic library needs them so a
@@ -120,6 +124,18 @@ impl Library {
         for t in &self.tracks {
             *self.leaf_counts.entry(t.album_id).or_insert(0) += 1;
         }
+        for i in 0..self.playlists.len() {
+            while self.playlists[i].item_ids.len() < self.playlists[i].items.len() {
+                let id = self.next_playlist_item_id();
+                self.playlists[i].item_ids.push(id);
+            }
+        }
+    }
+
+    /// A fresh, never reused `playlistItemID`.
+    pub fn next_playlist_item_id(&mut self) -> u64 {
+        self.next_item_id = self.next_item_id.max(90_000) + 1;
+        self.next_item_id
     }
 
     pub fn artist(&self, id: u64) -> Option<&Artist> {
@@ -206,6 +222,7 @@ impl Library {
             title: "Evening Mix".into(),
             smart: false,
             items: vec![10_000, 10_008, 10_013, 10_020, 10_003],
+            item_ids: Vec::new(),
             added_at: t,
             updated_at: t,
         });
@@ -214,6 +231,7 @@ impl Library {
             title: "Gapless Test".into(),
             smart: false,
             items: vec![10_004, 10_005],
+            item_ids: Vec::new(),
             added_at: t,
             updated_at: t,
         });
@@ -269,6 +287,7 @@ impl Library {
             title: "Big Playlist".into(),
             smart: false,
             items: lib.tracks.iter().step_by(37).take(2000).map(|t| t.id).collect(),
+            item_ids: Vec::new(),
             added_at: lib.clock,
             updated_at: lib.clock,
         });

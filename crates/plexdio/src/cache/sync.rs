@@ -115,13 +115,7 @@ pub fn sync_library(
 
     // Playlists are few: refresh the list, then items only for changed playlists.
     progress(SyncProgress { stage: "playlists", done: 0, total: None });
-    let playlists = pms.playlists()?;
-    let stale = db.upsert_playlists(&playlists)?;
-    for id in &stale {
-        let items = pms.playlist_items(&id.to_string())?;
-        db.set_playlist_items(*id, &items, now_secs())?;
-    }
-    report.playlists_refreshed = stale.len();
+    report.playlists_refreshed = sync_playlists(pms, db, &[])?;
 
     db.set_meta("last_sync_at", &now_secs().to_string())?;
     log::info!(
@@ -133,4 +127,22 @@ pub fn sync_library(
         report.playlists_refreshed
     );
     Ok(report)
+}
+
+/// Refresh the playlist list, then the items of every changed playlist plus those in `force`
+/// (a playlist just edited from this app). Returns how many playlists had their items fetched.
+pub fn sync_playlists(pms: &PmsClient, db: &mut LibraryDb, force: &[i64]) -> Result<usize, SyncError> {
+    let playlists = pms.playlists()?;
+    let mut stale = db.upsert_playlists(&playlists)?;
+    let known: Vec<i64> = playlists.iter().filter_map(|m| m.rating_key.as_deref()?.parse().ok()).collect();
+    for id in force {
+        if known.contains(id) && !stale.contains(id) {
+            stale.push(*id);
+        }
+    }
+    for id in &stale {
+        let items = pms.playlist_items(&id.to_string())?;
+        db.set_playlist_items(*id, &items, now_secs())?;
+    }
+    Ok(stale.len())
 }

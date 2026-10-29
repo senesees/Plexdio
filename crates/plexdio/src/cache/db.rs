@@ -4,7 +4,9 @@ use crate::plex::models::Metadata;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: &str = "1";
+/// Bump when the schema changes; add the step to [`LibraryDb::migrate`] so caches (and the
+/// local play history) survive the upgrade.
+pub const SCHEMA_VERSION: &str = "2";
 
 pub struct LibraryDb {
     pub conn: Connection,
@@ -55,6 +57,7 @@ impl LibraryDb {
         let db = Self { conn, path: path.to_path_buf() };
         match db.meta("schema_version")? {
             Some(v) if v == SCHEMA_VERSION => {}
+            Some(v) if db.migrate(&v)? => {}
             Some(v) => {
                 log::warn!("cache schema {v} != {SCHEMA_VERSION}; clearing cache");
                 db.clear()?;
@@ -62,6 +65,21 @@ impl LibraryDb {
             None => db.set_meta("schema_version", SCHEMA_VERSION)?,
         }
         Ok(db)
+    }
+
+    /// Upgrade an older cache in place. Returns false for versions it does not know (the caller
+    /// then clears the cache).
+    fn migrate(&self, from: &str) -> rusqlite::Result<bool> {
+        if from != "1" {
+            return Ok(false);
+        }
+        // 1 -> 2: album summaries. Forget the last sync so the next one is full and fills them.
+        log::info!("migrating cache schema 1 -> 2");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("ALTER TABLE albums ADD COLUMN summary TEXT; DELETE FROM meta WHERE key = 'last_sync_at';")?;
+        tx.execute("UPDATE meta SET value = ?1 WHERE key = 'schema_version'", [SCHEMA_VERSION])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
@@ -90,7 +108,7 @@ impl LibraryDb {
     pub fn clear(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "DELETE FROM artists; DELETE FROM albums; DELETE FROM tracks; DELETE FROM playlists;
-             DELETE FROM playlist_items; DELETE FROM play_history; DELETE FROM meta;",
+             DELETE FROM playlist_items; DELETE FROM play_history; DELETE FROM lyrics; DELETE FROM meta;",
         )?;
         self.set_meta("schema_version", SCHEMA_VERSION)
     }
@@ -144,12 +162,12 @@ impl LibraryDb {
                 }
                 Kind::Album => {
                     let mut st = tx.prepare_cached(
-                        "INSERT INTO albums(id,artist_id,title,artist_title,year,thumb,genre,leaf_count,user_rating,added_at,updated_at,seen)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1)
+                        "INSERT INTO albums(id,artist_id,title,artist_title,year,thumb,genre,leaf_count,user_rating,added_at,updated_at,seen,summary)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,?12)
                          ON CONFLICT(id) DO UPDATE SET artist_id=excluded.artist_id,title=excluded.title,
                            artist_title=excluded.artist_title,year=excluded.year,thumb=excluded.thumb,genre=excluded.genre,
                            leaf_count=excluded.leaf_count,user_rating=excluded.user_rating,added_at=excluded.added_at,
-                           updated_at=excluded.updated_at,seen=1",
+                           updated_at=excluded.updated_at,seen=1,summary=excluded.summary",
                     )?;
                     for m in items {
                         let Some(id) = key_i64(&m.rating_key) else { continue };
@@ -164,7 +182,8 @@ impl LibraryDb {
                             m.leaf_count,
                             m.user_rating,
                             m.added_at.unwrap_or(0),
-                            m.updated_at.unwrap_or(0)
+                            m.updated_at.unwrap_or(0),
+                            m.summary.as_deref().filter(|s| !s.trim().is_empty())
                         ])?;
                         n += 1;
                     }
@@ -306,6 +325,23 @@ impl LibraryDb {
         rows.collect()
     }
 
+    /// Cached lyrics of a track: `Some((body, provider, fetched_at))`, where a `None` body means
+    /// the server had none.
+    pub fn lyrics(&self, track_id: i64) -> rusqlite::Result<Option<(Option<String>, Option<String>, i64)>> {
+        self.conn
+            .query_row("SELECT body, provider, fetched_at FROM lyrics WHERE track_id = ?1", [track_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()
+    }
+
+    pub fn set_lyrics(&self, track_id: i64, body: Option<&str>, provider: Option<&str>, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO lyrics(track_id, body, provider, fetched_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(track_id) DO UPDATE SET body = excluded.body, provider = excluded.provider, fetched_at = excluded.fetched_at",
+            params![track_id, body, provider, at],
+        )?;
+        Ok(())
+    }
+
     pub fn set_track_rating(&self, track_id: i64, rating: Option<f64>) -> rusqlite::Result<()> {
         self.conn.execute("UPDATE tracks SET user_rating=?2 WHERE id=?1", params![track_id, rating])?;
         Ok(())
@@ -326,5 +362,42 @@ impl LibraryDb {
             |r| r.get::<_, Option<i64>>(0),
         )
         .map(|v| v.unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_1_cache_is_migrated_without_losing_history() {
+        let dir = std::env::temp_dir().join(format!("plexdio-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.sqlite");
+        {
+            // A version 1 cache: albums without `summary`, a finished sync and some history.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER, title TEXT NOT NULL, artist_title TEXT,
+                   year INTEGER, thumb TEXT, genre TEXT, leaf_count INTEGER, user_rating REAL,
+                   added_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, seen INTEGER NOT NULL DEFAULT 1);
+                 CREATE TABLE play_history (track_id INTEGER NOT NULL, played_at INTEGER NOT NULL);
+                 INSERT INTO meta VALUES ('schema_version', '1'), ('last_sync_at', '123');
+                 INSERT INTO albums(id, title) VALUES (5, 'Old');
+                 INSERT INTO play_history VALUES (42, 1000);",
+            )
+            .unwrap();
+        }
+        let db = LibraryDb::open(&path).unwrap();
+        assert_eq!(db.meta("schema_version").unwrap().as_deref(), Some(SCHEMA_VERSION));
+        assert_eq!(db.meta("last_sync_at").unwrap(), None, "next sync is full so summaries get filled");
+        let summary: Option<String> = db.conn.query_row("SELECT summary FROM albums WHERE id = 5", [], |r| r.get(0)).unwrap();
+        assert_eq!(summary, None);
+        let plays: i64 = db.conn.query_row("SELECT COUNT(*) FROM play_history", [], |r| r.get(0)).unwrap();
+        assert_eq!(plays, 1, "local play history survives the upgrade");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

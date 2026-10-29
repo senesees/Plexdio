@@ -236,6 +236,33 @@ pub struct Stream {
     pub album_peak: Option<f64>,
     #[serde(default, deserialize_with = "lenient_f64")]
     pub loudness: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub id: Option<i64>,
+    /// `/library/streams/{id}`: where a lyrics stream's text is fetched from.
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub sampling_rate: Option<i64>,
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub bit_depth: Option<i64>,
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub channels: Option<i64>,
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub bitrate: Option<i64>,
+    /// Lyrics format: `lrc` (timed) or `txt`.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Lyrics are time-synced (some servers send "1"/"0" strings).
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub timed: bool,
+    /// Where lyrics come from (e.g. a sidecar file or LyricFind).
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+pub mod stream_type {
+    pub const AUDIO: i64 = 2;
+    pub const LYRICS: i64 = 4;
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
@@ -364,6 +391,12 @@ impl Metadata {
     pub fn audio_stream(&self) -> Option<&Stream> {
         self.first_part()
             .and_then(|p| p.streams.iter().find(|s| s.stream_type == Some(2)))
+    }
+
+    /// The lyrics stream of the first part, if the server has lyrics for this track.
+    pub fn lyrics_stream(&self) -> Option<&Stream> {
+        self.first_part()
+            .and_then(|p| p.streams.iter().find(|s| s.stream_type == Some(stream_type::LYRICS) && s.key.is_some()))
     }
 
     pub fn genre_names(&self) -> Vec<String> {
