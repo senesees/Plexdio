@@ -2,6 +2,7 @@
 //! server, the saved session (queue and position) used to resume after a restart, home mixes and
 //! radio stations.
 
+pub mod cast;
 pub mod lyrics;
 pub mod mixes;
 pub mod radio;

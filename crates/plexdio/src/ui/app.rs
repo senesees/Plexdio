@@ -88,6 +88,10 @@ pub enum Msg {
     TrackDetails(Id, Result<Box<crate::plex::models::Metadata>, String>),
     /// Lyrics fetched for a track: file text and provider, `None` when it has none.
     Lyrics(Id, Result<Option<(String, Option<String>)>, String>),
+    /// News from the download worker (library generation, event).
+    Download(u64, crate::cache::offline::Event),
+    /// Players found for casting.
+    CastPlayers(Result<Vec<crate::plex::remote::PlayerInfo>, String>),
 }
 
 /// Lyrics panel content for one track.
@@ -129,6 +133,8 @@ enum Dialog {
     ConfirmDelete { playlist: Id, title: String },
     /// `dupes` of `ids` are already in the playlist.
     Duplicates { playlist: Id, ids: Vec<Id>, dupes: usize },
+    /// Confirm deleting every download.
+    ConfirmRemoveDownloads,
     /// Track details; `local_plays` from this app's play history.
     TrackInfo { id: Id, local_plays: Option<u64> },
 }
@@ -307,6 +313,17 @@ pub struct PlexdioApp {
     pub last_played_id: Option<i64>,
     /// Whether the queue side panel is open.
     pub queue_open: bool,
+    /// Playback on other Plex players, when casting.
+    cast: Option<crate::player::cast::CastSession>,
+    /// Players found by the last search (`None` while searching or never searched).
+    cast_players: Option<Result<Vec<crate::plex::remote::PlayerInfo>, String>>,
+    /// Players ticked in the cast menu.
+    cast_pick: std::collections::BTreeSet<String>,
+    /// Downloads for offline listening of the open library.
+    offline_dl: crate::cache::offline::OfflineState,
+    downloader: Option<crate::cache::offline::Downloader>,
+    /// Spectrum/waveform state for the visualiser.
+    vis: super::visualiser::Visualiser,
     /// Short note shown over the window ("Zoom 120 %") and when it goes away (egui time).
     toast: Option<(String, f64)>,
     /// Zoom the window's minimum size was last set for.
@@ -438,6 +455,12 @@ impl PlexdioApp {
             restored: false,
             last_played_id: None,
             queue_open: false,
+            vis: Default::default(),
+            offline_dl: Default::default(),
+            cast: None,
+            cast_players: None,
+            cast_pick: Default::default(),
+            downloader: None,
             toast: None,
             min_size_zoom: 1.0,
             lyrics_open: false,
@@ -611,7 +634,10 @@ impl PlexdioApp {
             // Sync starts once the cache is loaded (see Msg::LibraryLoaded).
             self.load_cached_library(server_id, &section, &server_name);
         } else {
+            // Back online with the library already loaded (reconnect after an offline start).
             self.start_sync(false);
+            self.flush_pending_scrobbles();
+            self.reconcile_downloads();
         }
     }
 
@@ -625,6 +651,10 @@ impl PlexdioApp {
         self.art.reset();
         self.sync = SyncState::default();
         self.db_path = Some(path.clone());
+        if let Some(d) = self.downloader.take() {
+            d.cancel_all();
+        }
+        self.offline_dl = crate::cache::offline::OfflineState { dir: Some(crate::cache::offline::offline_dir(server_id)), ..Default::default() };
         let gen = self.library_gen;
         let title = section.title.clone().unwrap_or_else(|| "Music".into());
         let server_name = server_name.to_string();
@@ -758,6 +788,10 @@ impl PlexdioApp {
 
     /// Play/pause from a shortcut, the tray menu or a media key.
     fn toggle_playback(&mut self) {
+        if let Some(c) = &self.cast {
+            c.send(crate::player::cast::CastCmd::Toggle);
+            return;
+        }
         if let Some(eng) = &self.engine {
             eng.play_pause();
         }
@@ -767,6 +801,10 @@ impl PlexdioApp {
 
     /// Skip forward (`dir > 0`) or back.
     fn skip_track(&mut self, dir: i32) {
+        if let Some(c) = &self.cast {
+            c.send(if dir > 0 { crate::player::cast::CastCmd::Next } else { crate::player::cast::CastCmd::Prev });
+            return;
+        }
         if let Some(eng) = &self.engine {
             if dir > 0 {
                 eng.next();
@@ -784,6 +822,10 @@ impl PlexdioApp {
             return;
         }
         let target = (self.playback.position_ms as i64 + delta_ms).clamp(0, self.playback.duration_ms as i64) as u64;
+        if let Some(c) = &self.cast {
+            c.send(crate::player::cast::CastCmd::Seek(target));
+            return;
+        }
         if let Some(eng) = &self.engine {
             eng.seek(target);
         }
@@ -793,6 +835,12 @@ impl PlexdioApp {
 
     fn nudge_volume(&mut self, delta: f32) {
         let v = (self.config.volume + delta).clamp(0.0, 1.0);
+        if let Some(c) = &self.cast {
+            // Remote players keep their own volume; this app's setting stays as it is.
+            let now = self.playback.volume;
+            c.send(crate::player::cast::CastCmd::Volume(((now + delta).clamp(0.0, 1.0) * 100.0).round() as u32));
+            return;
+        }
         if let Some(eng) = &self.engine {
             eng.set_volume(v);
             if v > 0.0 && self.config.muted {
@@ -925,6 +973,11 @@ impl PlexdioApp {
             .as_ref()
             .and_then(|t| self.library.as_ref().and_then(|l| l.track(t.id)))
             .and_then(|t| t.thumb.clone());
+        if self.config.visualiser != super::visualiser::VisMode::Off {
+            let w = ui.max_rect();
+            let r = egui::Rect::from_min_max(egui::pos2(w.left() + 84.0, w.bottom() - 22.0), egui::pos2(w.right() - 8.0, w.bottom() - 2.0));
+            self.vis.paint(ui.painter(), r, self.config.visualiser, theme::ACCENT.gamma_multiply(0.35));
+        }
         let mut cmds = Vec::new();
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -1004,7 +1057,9 @@ impl PlexdioApp {
                 Cmd::Next => self.skip_track(1),
                 Cmd::Prev => self.skip_track(-1),
                 Cmd::Seek(ms) => {
-                    if let Some(eng) = &self.engine {
+                    if let Some(c) = &self.cast {
+                        c.send(crate::player::cast::CastCmd::Seek(ms));
+                    } else if let Some(eng) = &self.engine {
                         eng.seek(ms);
                     }
                     self.poll_playback();
@@ -1198,7 +1253,12 @@ impl PlexdioApp {
                 }
                 if first_load && !self.offline {
                     self.start_sync(false);
+                    self.flush_pending_scrobbles();
                 }
+                if first_load {
+                    self.load_offline_state();
+                }
+                self.reconcile_downloads();
                 self.maybe_restore_session();
                 self.refresh_mixes();
             }
@@ -1243,6 +1303,12 @@ impl PlexdioApp {
             }
             Msg::LibraryLoaded(..) | Msg::SyncProgress(..) | Msg::SyncDone(..) => {}
             Msg::PlaylistSaved(gen, r) => self.playlist_saved(gen, r),
+            Msg::CastPlayers(r) => self.cast_players = Some(r),
+            Msg::Download(gen, ev) => {
+                if gen == self.library_gen {
+                    self.download_event(ev);
+                }
+            }
             Msg::TrackDetails(id, r) => self.track_details = Some((id, r)),
             Msg::Lyrics(id, r) => {
                 if self.lyrics.as_ref().is_some_and(|(l, _)| *l == id) {
@@ -1316,6 +1382,23 @@ impl PlexdioApp {
             let (text, color) = self.sync_status_text();
             ui.label(RichText::new(text).size(11.5).color(color));
         });
+        let queued = self.offline_dl.queued.len();
+        let failed = self.offline_dl.failed.len();
+        if queued > 0 || failed > 0 {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                if queued > 0 {
+                    let pct = self.offline_dl.current.and_then(|(_, d, t)| t.filter(|t| *t > 0).map(|t| format!(" · {}%", d * 100 / t))).unwrap_or_default();
+                    ui.label(RichText::new(format!("Downloading {}{pct}", plural_s(queued, "song", "songs"))).size(11.5).color(theme::ACCENT));
+                } else {
+                    ui.label(RichText::new(format!("{} failed to download", plural_s(failed, "song", "songs"))).size(11.5).color(theme::ERROR));
+                    if ui.link(RichText::new("Retry").size(11.5)).clicked() {
+                        self.offline_dl.failed.clear();
+                        self.reconcile_downloads();
+                    }
+                }
+            });
+        }
         ui.add_space(8.0);
         let cat = route_category(&self.route);
         let mut go = None;
@@ -1393,6 +1476,11 @@ impl PlexdioApp {
                 self.move_playlist_item(pl, from, to)
             }
             UiAction::TrackInfo(id) => self.open_track_info(id),
+            UiAction::SetOffline(pins, on) => self.set_offline(&pins, on),
+            UiAction::RetryDownloads => {
+                self.offline_dl.failed.clear();
+                self.reconcile_downloads();
+            }
             UiAction::RenamePlaylist(pl) => {
                 if let Some(p) = self.can_edit_playlist(pl) {
                     self.dialog = Some(Dialog::Rename { playlist: pl, title: p.title.to_string() });
@@ -1629,15 +1717,20 @@ impl PlexdioApp {
 
     /// Start playback of `ids` at `start`, building stream sources for the current server.
     fn play_ids(&mut self, ids: &[crate::library_model::Id], start: usize) {
-        if self.pms.is_none() {
-            self.banner = Some(("Connect to your server to play music.".into(), true));
+        if let Some(c) = &self.cast {
+            if let Some(&first) = ids.get(start).or(ids.first()) {
+                c.send(crate::player::cast::CastCmd::Play { ids: ids.to_vec(), start: first, offset_ms: 0 });
+            }
             return;
         }
+        // Offline, only downloaded songs play; start at the chosen one if it is among them.
+        let start_id = ids.get(start).copied();
         let specs = self.track_specs(ids);
         if specs.is_empty() {
-            self.banner = Some(("These tracks have no playable audio.".into(), true));
+            self.banner = Some((self.nothing_playable().into(), true));
             return;
         }
+        let start = start_id.and_then(|id| specs.iter().position(|s| s.id == id)).unwrap_or(0);
         let idx = start.min(specs.len() - 1);
         self.ensure_engine().play_playlist(specs, idx);
         self.poll_playback();
@@ -1645,15 +1738,24 @@ impl PlexdioApp {
 
     /// Specs for queue edits: like [`Self::track_specs`] but reports why nothing could be queued.
     fn queue_specs(&mut self, ids: &[crate::library_model::Id]) -> Vec<TrackSpec> {
-        if self.pms.is_none() {
-            self.banner = Some(("Connect to your server to queue music.".into(), true));
+        if self.cast.is_some() {
+            self.banner = Some(("Adding to the queue isn't available while casting; play the songs instead.".into(), true));
             return Vec::new();
         }
         let specs = self.track_specs(ids);
         if specs.is_empty() {
-            self.banner = Some(("These tracks have no playable audio.".into(), true));
+            self.banner = Some((self.nothing_playable().into(), true));
         }
         specs
+    }
+
+    /// Why a play request found nothing to play.
+    fn nothing_playable(&self) -> &'static str {
+        if self.pms.is_none() || self.offline {
+            "You're offline and none of these songs are downloaded."
+        } else {
+            "These tracks have no playable audio."
+        }
     }
 
     /// Create the engine on first use. Doing it lazily keeps startup free of audio-device work.
@@ -1686,9 +1788,11 @@ impl PlexdioApp {
     /// Stream descriptions for `ids`. Opus is not decodable locally and a bitrate cap asks the
     /// server to transcode, so both go through the universal transcoder.
     fn track_specs(&self, ids: &[crate::library_model::Id]) -> Vec<TrackSpec> {
-        let (Some(lib), Some(pms)) = (self.library.as_ref(), self.pms.as_ref()) else {
+        let Some(lib) = self.library.as_ref() else {
             return Vec::new();
         };
+        // Without a server only downloaded songs can play.
+        let pms = self.pms.as_ref().filter(|_| !self.offline);
         let cap = match self.config.quality {
             crate::config::StreamQuality::Kbps(k) => Some(k),
             crate::config::StreamQuality::Original => None,
@@ -1698,11 +1802,13 @@ impl PlexdioApp {
             let Some(t) = lib.track(*id) else { continue };
             let codec = t.codec.as_deref().unwrap_or("").to_ascii_lowercase();
             let container = t.container.as_deref().unwrap_or("").to_ascii_lowercase();
-            let source = if cap.is_some() || codec == "opus" {
+            let source = if let Some(path) = self.offline_dl.path(t.id).filter(|p| p.is_file()) {
+                SourceSpec::Local(path)
+            } else if let (Some(pms), true) = (pms, cap.is_some() || codec == "opus") {
                 let kbps = cap.unwrap_or(320);
                 let url = pms.transcode_url(&t.id.to_string(), kbps, &format!("plexdio-{}", self.config.client_id), &self.config.client_id);
                 SourceSpec::Http { url, key: format!("{}_t{kbps}.mp3", t.id) }
-            } else if let Some(part) = t.part_key.as_deref() {
+            } else if let (Some(part), Some(pms)) = (t.part_key.as_deref(), pms) {
                 let ext = if container.is_empty() { codec_extension(&codec) } else { container.as_str() };
                 SourceSpec::Http { url: pms.part_url(part), key: format!("{}.{ext}", t.id) }
             } else {
@@ -1726,6 +1832,10 @@ impl PlexdioApp {
     }
 
     fn poll_playback(&mut self) {
+        if self.cast.is_some() {
+            self.poll_cast();
+            return;
+        }
         let Some(e) = &self.engine else { return };
         let prev_state = self.playback.state;
         let st = e.status();
@@ -1783,9 +1893,24 @@ impl PlexdioApp {
         };
         let actions = self.report.observe(track, state, position, duration);
         if !actions.is_empty() {
-            self.ensure_reporter();
-            if let Some(r) = &self.reporter {
-                r.apply(&actions);
+            if self.pms.is_none() || self.offline {
+                // Offline: keep plays to report later (timeline updates are not worth keeping).
+                let ids: Vec<i64> = actions.iter().filter_map(|a| if let crate::player::report::Action::Scrobble(id) = a { Some(*id) } else { None }).collect();
+                if let (false, Some(path)) = (ids.is_empty(), self.db_path.clone()) {
+                    let at = crate::logging::unix_now();
+                    std::thread::spawn(move || {
+                        if let Ok(db) = LibraryDb::open(&path) {
+                            for id in ids {
+                                let _ = db.add_pending_scrobble(id, at);
+                            }
+                        }
+                    });
+                }
+            } else {
+                self.ensure_reporter();
+                if let Some(r) = &self.reporter {
+                    r.apply(&actions);
+                }
             }
         }
         // Local play history (Most played mixes and shuffle weights read this).
@@ -1900,7 +2025,367 @@ impl PlexdioApp {
         self.poll_playback();
     }
 
-    /// Rate a track locally (cache + model) and on the server.
+    // ------------------------------------------------------------------ cast
+
+    /// Look for players to cast to (account devices and the server's clients).
+    fn find_cast_players(&mut self) {
+        let (Some(pms), Some(token)) = (self.pms.clone().filter(|_| !self.offline), self.token.clone()) else {
+            self.cast_players = Some(Err("Connect to your server to cast.".into()));
+            return;
+        };
+        self.cast_players = None;
+        let tv = self.tv.clone();
+        self.jobs.spawn("cast-players", move || Msg::CastPlayers(Ok(crate::plex::remote::discover(&tv, &token, &pms))));
+    }
+
+    /// Move playback to the ticked players: the current queue continues there at the same spot.
+    fn start_cast(&mut self) {
+        let Some(pms) = self.pms.clone().filter(|_| !self.offline) else { return };
+        let players: Vec<crate::plex::remote::PlayerInfo> = match &self.cast_players {
+            Some(Ok(list)) => list.iter().filter(|p| self.cast_pick.contains(&p.id)).cloned().collect(),
+            _ => Vec::new(),
+        };
+        if players.is_empty() {
+            return;
+        }
+        if let Some(c) = self.cast.take() {
+            c.send(crate::player::cast::CastCmd::Stop);
+        }
+        let ids: Vec<Id> = self.playback.queue.iter().map(|e| e.info.id).collect();
+        let current = self.playback.track.as_ref().map(|t| t.id);
+        let offset = self.playback.position_ms;
+        if let Some(e) = &self.engine {
+            if self.playback.state == PlayState::Playing {
+                e.play_pause();
+            }
+        }
+        log::info!("casting to {}", players.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "));
+        let ctx = self.jobs.sender().1;
+        let session = crate::player::cast::CastSession::start(pms, players, move || ctx.request_repaint());
+        if let (false, Some(start)) = (ids.is_empty(), current) {
+            session.send(crate::player::cast::CastCmd::Play { ids, start, offset_ms: offset });
+        }
+        self.cast = Some(session);
+    }
+
+    /// Stop casting; with `here`, playback continues on this computer where the player was.
+    fn stop_cast(&mut self, here: bool) {
+        let Some(c) = self.cast.take() else { return };
+        let st = c.status();
+        c.send(crate::player::cast::CastCmd::Stop);
+        let tl = st.timeline.unwrap_or_default();
+        if here {
+            if let Some(track) = tl.track {
+                let start = st.ids.iter().position(|id| *id == track).unwrap_or(0);
+                let ids = if st.ids.is_empty() { vec![track] } else { st.ids };
+                self.play_ids(&ids, start);
+                if tl.time_ms > 1000 {
+                    if let Some(e) = &self.engine {
+                        e.seek(tl.time_ms);
+                    }
+                }
+            }
+        }
+        self.playback = Default::default();
+        self.poll_playback();
+    }
+
+    /// While casting, the bar shows the leader player's state.
+    fn poll_cast(&mut self) {
+        let Some(c) = &self.cast else { return };
+        let st = c.status();
+        let tl = st.timeline.clone().unwrap_or_default();
+        let lib = self.library.as_ref();
+        let info = |id: Id| -> crate::audio::engine::TrackInfo {
+            match lib.and_then(|l| l.track(id)) {
+                Some(t) => crate::audio::engine::TrackInfo {
+                    id,
+                    title: t.title.to_string(),
+                    artist: t.display_artist().to_string(),
+                    album: t.album.to_string(),
+                    duration_ms: t.duration_ms as u64,
+                },
+                None => crate::audio::engine::TrackInfo { id, title: "Unknown track".into(), artist: String::new(), album: String::new(), duration_ms: tl.duration_ms },
+            }
+        };
+        let queue: Vec<crate::audio::engine::QueueEntry> = st
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| crate::audio::engine::QueueEntry { index: i, current: Some(*id) == tl.track, info: info(*id) })
+            .collect();
+        let state = match tl.state.as_str() {
+            "playing" | "buffering" => PlayState::Playing,
+            "paused" => PlayState::Paused,
+            _ => PlayState::Idle,
+        };
+        let prev = &self.playback;
+        let queue_gen = if prev.queue.len() == queue.len() && prev.queue.iter().zip(&queue).all(|(a, b)| a.info.id == b.info.id && a.current == b.current) {
+            prev.queue_gen
+        } else {
+            prev.queue_gen + 1
+        };
+        self.playback = PlaybackStatus {
+            state,
+            track: tl.track.map(info),
+            index: queue.iter().position(|e| e.current).unwrap_or(0),
+            queue_len: queue.len(),
+            position_ms: tl.time_ms,
+            duration_ms: tl.duration_ms,
+            volume: tl.volume.map_or(1.0, |v| v as f32 / 100.0),
+            muted: false,
+            sink: c.label(),
+            sink_real: true,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            queue: Arc::new(queue),
+            queue_gen,
+            error: st.error.clone(),
+            stream: None,
+        };
+    }
+
+    /// The cast menu: players with tick boxes, start / stop.
+    fn cast_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(240.0);
+        ui.label(RichText::new("Play on").strong());
+        let casting = self.cast.as_ref().map(|c| c.players.iter().map(|p| p.id.clone()).collect::<std::collections::BTreeSet<_>>());
+        if ui.selectable_label(casting.is_none(), "This computer").clicked() {
+            self.stop_cast(true);
+            ui.close();
+            return;
+        }
+        ui.separator();
+        match &self.cast_players {
+            None => {
+                ui.horizontal(|ui| {
+                    theme::spinner(ui, 14.0);
+                    ui.label(RichText::new("Looking for players…").color(theme::TEXT_DIM));
+                });
+            }
+            Some(Err(e)) => {
+                ui.label(RichText::new(e).color(theme::TEXT_DIM));
+            }
+            Some(Ok(list)) if list.is_empty() => {
+                ui.label(RichText::new("No players found. Open Plexamp or Plex on another device and search again.").color(theme::TEXT_DIM));
+            }
+            Some(Ok(list)) => {
+                for p in list.clone() {
+                    let mut on = self.cast_pick.contains(&p.id);
+                    let label = if p.product.is_empty() { p.name.clone() } else { format!("{} · {}", p.name, p.product) };
+                    if ui.checkbox(&mut on, label).changed() {
+                        log::info!("cast: {} {}", if on { "picked" } else { "unpicked" }, p.name);
+                        if on {
+                            self.cast_pick.insert(p.id.clone());
+                        } else {
+                            self.cast_pick.remove(&p.id);
+                        }
+                    }
+                }
+                ui.label(RichText::new("Tick several to play on all of them.").small().color(theme::TEXT_DIM));
+            }
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let n = self.cast_pick.len();
+            let same = casting.as_ref() == Some(&self.cast_pick);
+            if ui.add_enabled(n > 0 && !same, egui::Button::new(if n > 1 { format!("Play on {n} players") } else { "Play there".to_string() }).corner_radius(14.0)).clicked() {
+                self.start_cast();
+                ui.close();
+            }
+            if ui.link("Search again").clicked() {
+                self.find_cast_players();
+            }
+        });
+        if let Some(c) = &self.cast {
+            ui.separator();
+            ui.label(RichText::new(format!("Playing on {}", c.label())).small().color(theme::ACCENT));
+            if ui.link("Stop casting").clicked() {
+                self.stop_cast(false);
+                ui.close();
+            }
+        }
+        ui.label(RichText::new("Experimental: not every player accepts remote control.").small().color(theme::TEXT_DIM));
+    }
+
+    // ------------------------------------------------------------------ downloads
+
+    /// Read pins and finished downloads of the open library (files gone from disk are dropped).
+    fn load_offline_state(&mut self) {
+        let Some(db) = self.db_path.as_ref().and_then(|p| LibraryDb::open(p).ok()) else { return };
+        self.offline_dl.pins = db.pins().unwrap_or_default().into_iter().collect();
+        let dir = self.offline_dl.dir.clone();
+        let mut files = db.offline_files().unwrap_or_default();
+        files.retain(|id, (file, _)| {
+            let ok = dir.as_ref().is_some_and(|d| d.join(file.as_str()).is_file());
+            if !ok {
+                let _ = db.remove_offline_file(*id);
+            }
+            ok
+        });
+        self.offline_dl.files = files;
+        self.offline_dl.ver += 1;
+    }
+
+    /// Pin or unpin albums, playlists or songs for offline listening.
+    fn set_offline(&mut self, pins: &[crate::cache::offline::Pin], on: bool) {
+        let Some(db) = self.db_path.as_ref().and_then(|p| LibraryDb::open(p).ok()) else { return };
+        let now = crate::logging::unix_now();
+        for &pin in pins {
+            if let Err(e) = db.set_pin(pin, on, now) {
+                log::warn!("cannot save download pin: {e}");
+            }
+            if on {
+                self.offline_dl.pins.insert(pin);
+            } else {
+                self.offline_dl.pins.remove(&pin);
+            }
+        }
+        if !on {
+            // Start over so songs that are no longer wanted are not fetched.
+            if let Some(d) = &self.downloader {
+                d.cancel_all();
+            }
+            self.offline_dl.queued.clear();
+            self.offline_dl.current = None;
+        } else if self.offline || self.pms.is_none() {
+            self.banner = Some(("Marked for download; it starts when your server is reachable.".into(), false));
+        }
+        self.reconcile_downloads();
+    }
+
+    /// Make the downloads match the pins: delete songs no longer wanted, queue missing ones.
+    fn reconcile_downloads(&mut self) {
+        use crate::cache::offline::{prune_dir, wanted_tracks, Downloader, Job};
+        let (Some(lib), Some(dir), Some(db_path)) = (self.library.as_ref(), self.offline_dl.dir.clone(), self.db_path.clone()) else { return };
+        let pins: Vec<_> = self.offline_dl.pins.iter().copied().collect();
+        let wanted = wanted_tracks(lib, &pins);
+        let wanted_set: std::collections::HashSet<Id> = wanted.iter().copied().collect();
+        // Delete what is no longer wanted.
+        let stale: Vec<Id> = self.offline_dl.files.keys().copied().filter(|id| !wanted_set.contains(id)).collect();
+        if !stale.is_empty() {
+            if let Ok(db) = LibraryDb::open(&db_path) {
+                for id in &stale {
+                    let _ = db.remove_offline_file(*id);
+                }
+            }
+            for id in &stale {
+                self.offline_dl.files.remove(id);
+            }
+            self.offline_dl.ver += 1;
+        }
+        // File name each wanted song has (or will have); everything else in the folder goes.
+        let jobs: Vec<Job> = match self.pms.as_ref().filter(|_| !self.offline) {
+            Some(pms) => wanted
+                .iter()
+                .filter(|id| !self.offline_dl.has(**id) && !self.offline_dl.queued.contains(id) && !self.offline_dl.failed.contains_key(id))
+                .filter_map(|id| download_job(lib, pms, *id, &self.config.client_id))
+                .collect(),
+            None => Vec::new(),
+        };
+        // Everything in the folder that is not a wanted song's file (or its `.part`) goes.
+        let mut keep: std::collections::HashSet<String> = self.offline_dl.files.values().map(|(f, _)| f.clone()).collect();
+        keep.extend(wanted.iter().filter_map(|id| lib.track(*id)).map(|t| format!("{}.{}", t.id, download_ext(t))));
+        std::thread::spawn({
+            let dir = dir.clone();
+            move || {
+                let n = prune_dir(&dir, &keep);
+                if n > 0 {
+                    log::info!("removed {n} downloads that are no longer wanted");
+                }
+            }
+        });
+        let pms_local = self.pms.as_ref().is_some_and(|p| p.conn.local);
+        if jobs.is_empty() {
+            return;
+        }
+        if self.config.downloads_lan_only && !pms_local {
+            return;
+        }
+        if self.downloader.is_none() {
+            let (tx, ctx) = self.jobs.sender();
+            let gen = self.library_gen;
+            self.downloader = Some(Downloader::start(&self.http, dir, db_path, move |ev| {
+                let _ = tx.send(Msg::Download(gen, ev));
+                ctx.request_repaint();
+            }));
+        }
+        let d = self.downloader.as_ref().expect("just started");
+        log::info!("queueing {} downloads", jobs.len());
+        for j in jobs {
+            self.offline_dl.queued.insert(j.track);
+            d.queue(j);
+        }
+    }
+
+    fn download_event(&mut self, ev: crate::cache::offline::Event) {
+        use crate::cache::offline::Event;
+        match ev {
+            Event::Progress { track, done, total } => self.offline_dl.current = Some((track, done, total)),
+            Event::Finished { track, file, bytes } => {
+                self.offline_dl.queued.remove(&track);
+                self.offline_dl.current = None;
+                self.offline_dl.files.insert(track, (file, bytes));
+                self.offline_dl.ver += 1;
+            }
+            Event::Failed { track, error } => {
+                self.offline_dl.queued.remove(&track);
+                self.offline_dl.current = None;
+                if error.starts_with("cannot write") {
+                    // Disk full or folder gone: stop instead of failing every song.
+                    if let Some(d) = &self.downloader {
+                        d.cancel_all();
+                    }
+                    self.offline_dl.queued.clear();
+                    self.banner = Some((format!("Downloads stopped: {error}"), true));
+                }
+                self.offline_dl.failed.insert(track, error);
+            }
+        }
+    }
+
+    /// Delete every download of this library and forget the pins.
+    fn remove_all_downloads(&mut self) {
+        if let Some(d) = &self.downloader {
+            d.cancel_all();
+        }
+        if let Some(db) = self.db_path.as_ref().and_then(|p| LibraryDb::open(p).ok()) {
+            let _ = db.clear_pins();
+            for id in self.offline_dl.files.keys() {
+                let _ = db.remove_offline_file(*id);
+            }
+        }
+        if let Some(dir) = &self.offline_dl.dir {
+            crate::cache::offline::prune_dir(dir, &Default::default());
+        }
+        let dir = self.offline_dl.dir.take();
+        self.offline_dl = crate::cache::offline::OfflineState { dir, ver: self.offline_dl.ver + 1, ..Default::default() };
+    }
+
+    /// Report plays made while offline.
+    fn flush_pending_scrobbles(&mut self) {
+        let (Some(pms), Some(path)) = (self.pms.clone(), self.db_path.clone()) else { return };
+        std::thread::spawn(move || {
+            let Ok(db) = LibraryDb::open(&path) else { return };
+            let pending = db.pending_scrobbles().unwrap_or_default();
+            if pending.is_empty() {
+                return;
+            }
+            log::info!("reporting {} plays made offline", pending.len());
+            for (row, id) in pending {
+                match pms.scrobble(&id.to_string()) {
+                    Ok(()) => {
+                        let _ = db.remove_pending_scrobble(row);
+                    }
+                    Err(e) => {
+                        log::debug!("offline play report failed: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     // ------------------------------------------------------------------ playlist editing
     //
     // Edits change the in-memory playlist at once (so the page reacts immediately), then go to
@@ -2084,6 +2569,7 @@ impl PlexdioApp {
             if let (Some(l), Some(pls)) = (&mut self.library, r.playlists) {
                 l.playlists = pls;
                 self.library_ver += 1;
+                self.reconcile_downloads();
             }
         }
         if let (Some(id), true) = (r.created, r.open) {
@@ -2120,6 +2606,7 @@ impl PlexdioApp {
             Rename(Id, String),
             Delete(Id),
             Add(Id, Vec<Id>, bool),
+            RemoveDownloads,
         }
         let mut out = Out::Keep;
         let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(egui::Margin::same(20)).corner_radius(10.0);
@@ -2148,6 +2635,11 @@ impl PlexdioApp {
                     ui.label(format!("“{title}” will be deleted from your Plex server. The songs stay in your library."));
                     dialog_buttons(ui, "Delete", true, &mut out, Out::Close, || Out::Delete(*playlist), enter);
                 }
+                Dialog::ConfirmRemoveDownloads => {
+                    ui.label(RichText::new("Remove all downloads?").size(18.0).strong());
+                    ui.label("The downloaded songs of this library are deleted from this computer. They stay on your Plex server.");
+                    dialog_buttons(ui, "Delete", true, &mut out, Out::Close, || Out::RemoveDownloads, enter);
+                }
                 Dialog::TrackInfo { id, local_plays } => {
                     use super::views::track_info::{track_info, Details};
                     ui.set_width(460.0);
@@ -2158,9 +2650,8 @@ impl PlexdioApp {
                         _ => Details::Loading,
                     };
                     let stream = self.playback.stream.as_ref().filter(|_| self.playback.track.as_ref().is_some_and(|t| t.id == *id));
-                    match self.library.as_ref() {
-                        Some(lib) => egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| track_info(ui, lib, *id, details, stream, *local_plays)).inner,
-                        None => {}
+                    if let Some(lib) = self.library.as_ref() {
+                        egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| track_info(ui, lib, *id, details, stream, *local_plays));
                     }
                     ui.add_space(6.0);
                     if ui.add(egui::Button::new("Close").corner_radius(14.0)).clicked() || enter {
@@ -2203,9 +2694,11 @@ impl PlexdioApp {
             Out::Rename(pl, title) => self.rename_playlist(pl, title),
             Out::Delete(pl) => self.delete_playlist(pl),
             Out::Add(pl, ids, skip) => self.add_to_playlist(pl, ids, Some(skip)),
+            Out::RemoveDownloads => self.remove_all_downloads(),
         }
     }
 
+    /// Rate a track locally (cache + model) and on the server.
     pub fn rate_track(&mut self, id: crate::library_model::Id, rating: u8) {
         let value = (rating > 0).then_some(rating as f64);
         if let Some(l) = &mut self.library {
@@ -2282,8 +2775,8 @@ impl PlexdioApp {
         let info_w = (full * 0.24).clamp(130.0, 260.0);
         let vol_w = if wide { 90.0 } else { 64.0 };
         let gap = ui.spacing().item_spacing.x;
-        // Stars (wide only), queue, mute, volume slider; each followed by item spacing.
-        let right_w = if wide { 5.0 * (14.0 + gap) + 8.0 } else { 0.0 } + (18.0 + gap) * 2.0 + vol_w + gap;
+        // Stars (wide only), queue, lyrics, cast, mute, volume slider; each followed by item spacing.
+        let right_w = if wide { 5.0 * (14.0 + gap) + 8.0 } else { 0.0 } + (18.0 + gap) * 4.0 + vol_w + gap;
         let left_w = 48.0 + 10.0 + info_w + 3.0 * gap;
         let center_w = (full - left_w - right_w - 2.0 * gap).max(160.0);
 
@@ -2334,6 +2827,12 @@ impl PlexdioApp {
             // Center column: transport row, then elapsed / seek bar / duration.
             ui.add_space(gap);
             let (center_rect, _) = ui.allocate_exact_size(egui::vec2(center_w, 56.0), egui::Sense::hover());
+            if self.config.visualiser != super::visualiser::VisMode::Off {
+                // Faintly behind the transport and seek bar, the full bar height.
+                let bar = ui.max_rect();
+                let r = egui::Rect::from_min_max(egui::pos2(center_rect.left(), bar.top() - 6.0), egui::pos2(center_rect.right(), bar.bottom() + 6.0));
+                self.vis.paint(ui.painter(), r, self.config.visualiser, theme::ACCENT.gamma_multiply(0.16));
+            }
             // The seek row's rect, so the right column can line up with it.
             let seek_row;
             {
@@ -2423,6 +2922,15 @@ impl PlexdioApp {
                 {
                     cmds.push(BarCmd::Mute(!st.muted));
                 }
+                let cast = icons::button(ui, Icon::Cast, 18.0, self.cast.is_some()).on_hover_text(match &self.cast {
+                    Some(c) => format!("Playing on {}", c.label()),
+                    None => "Play on another device".to_string(),
+                });
+                if cast.clicked() && self.cast_players.is_none() {
+                    self.find_cast_players();
+                }
+                // Stays open while players are ticked; closes on a click outside.
+                egui::Popup::menu(&cast).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| self.cast_menu(ui));
                 if icons::button(ui, Icon::Lyrics, 18.0, self.lyrics_open).on_hover_text("Lyrics").clicked() {
                     cmds.push(BarCmd::Lyrics);
                 }
@@ -2449,6 +2957,35 @@ impl PlexdioApp {
         let mut save = false;
         let mut rate = None;
         let mut go = None;
+        let cmds: Vec<BarCmd> = match &self.cast {
+            // Transport goes to the players being cast to; the rest stays local.
+            Some(cast) => cmds
+                .into_iter()
+                .filter(|c| {
+                    use crate::player::cast::CastCmd;
+                    let to = match c {
+                        BarCmd::Toggle => Some(CastCmd::Toggle),
+                        BarCmd::Next => Some(CastCmd::Next),
+                        BarCmd::Prev => Some(CastCmd::Prev),
+                        BarCmd::Seek(ms) => Some(CastCmd::Seek(*ms)),
+                        BarCmd::Volume(v) => Some(CastCmd::Volume((v * 100.0).round() as u32)),
+                        _ => None,
+                    };
+                    match to {
+                        Some(cmd) => {
+                            cast.send(cmd);
+                            false
+                        }
+                        None => true,
+                    }
+                })
+                .collect(),
+            None => cmds,
+        };
+        if self.cast.is_some() && self.engine.is_none() {
+            // Nothing local yet: panels and links still work.
+            self.ensure_engine();
+        }
         if let Some(eng) = &self.engine {
             for c in cmds {
                 log::info!("transport: {:?}", c);
@@ -2877,11 +3414,16 @@ impl PlexdioApp {
                 mixes: &self.mixes,
                 similar: &self.similar,
                 selection: &mut self.selection,
+                offline: &self.offline_dl,
             };
             use super::views::{detail, library, search};
             match &route {
                 Route::Home => detail::home_view(ui, &mut vc, &greeting),
                 Route::Library(tab) => {
+                    if self.browse.downloaded_ver != self.offline_dl.ver {
+                        self.browse.downloaded = self.offline_dl.files.keys().copied().collect();
+                        self.browse.downloaded_ver = self.offline_dl.ver;
+                    }
                     library::library_view(ui, &mut vc, &mut self.browse, *tab, self.library_ver);
                     if std::mem::take(&mut self.browse.prefs_changed) {
                         self.config.library = self.browse.prefs.clone();
@@ -2982,6 +3524,7 @@ impl PlexdioApp {
                     settings_card(&mut cols[0], "Equalizer", |ui| self.settings_equalizer(ui, &mut changed));
                     settings_card(&mut cols[0], "Window", |ui| self.settings_window(ui, &mut changed));
                     settings_card(&mut cols[0], "Discord", |ui| self.settings_discord(ui, &mut changed));
+                    settings_card(&mut cols[1], "Downloads", |ui| self.settings_downloads(ui, &mut changed));
                     settings_card(&mut cols[1], "Storage", |ui| self.settings_storage(ui, &mut changed));
                     settings_card(&mut cols[1], "Account", |ui| self.settings_account(ui));
                 });
@@ -2993,6 +3536,7 @@ impl PlexdioApp {
                 settings_card(ui, "Equalizer", |ui| self.settings_equalizer(ui, &mut changed));
                 settings_card(ui, "Window", |ui| self.settings_window(ui, &mut changed));
                 settings_card(ui, "Discord", |ui| self.settings_discord(ui, &mut changed));
+                settings_card(ui, "Downloads", |ui| self.settings_downloads(ui, &mut changed));
                 settings_card(ui, "Storage", |ui| self.settings_storage(ui, &mut changed));
                 settings_card(ui, "Account", |ui| self.settings_account(ui));
             }
@@ -3134,6 +3678,18 @@ impl PlexdioApp {
     }
 
     fn settings_window(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        setting_row(ui, "Visualiser", Some("Moving bars or a wave behind the player controls"), |ui| {
+            let mut m = self.config.visualiser;
+            egui::ComboBox::from_id_salt("visualiser").selected_text(m.label()).width(90.0).show_ui(ui, |ui| {
+                for opt in [super::visualiser::VisMode::Off, super::visualiser::VisMode::Bars, super::visualiser::VisMode::Wave] {
+                    ui.selectable_value(&mut m, opt, opt.label());
+                }
+            });
+            if m != self.config.visualiser {
+                self.config.visualiser = m;
+                *changed = true;
+            }
+        });
         setting_row(ui, "Zoom", Some("Size of text and controls (Ctrl+= / Ctrl+− / Ctrl+0)"), |ui| {
             let mut z = self.config.zoom;
             egui::ComboBox::from_id_salt("zoom").selected_text(format!("{} %", (z * 100.0).round())).width(90.0).show_ui(ui, |ui| {
@@ -3235,6 +3791,32 @@ impl PlexdioApp {
         {
             self.banner = Some((format!("Open {} in your browser.", crate::discord::SETUP_URL), false));
         }
+    }
+
+    fn settings_downloads(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        let n = self.offline_dl.files.len();
+        let summary = if n == 0 {
+            "Nothing downloaded yet. Use the download button on an album, playlist or mix.".to_string()
+        } else {
+            format!("{} · {}", plural_s(n, "song", "songs"), human_bytes(self.offline_dl.bytes()))
+        };
+        setting_row(ui, "Downloaded music", Some(&summary), |ui| {
+            ui.add_enabled_ui(n > 0 || !self.offline_dl.pins.is_empty(), |ui| {
+                if theme::secondary_button(ui, "Remove all").on_hover_text("Delete every download of this library").clicked() {
+                    self.dialog = Some(Dialog::ConfirmRemoveDownloads);
+                }
+            });
+        });
+        setting_row(ui, "Only on the home network", Some("Download only while connected to your server locally, not over the internet"), |ui| {
+            let mut v = self.config.downloads_lan_only;
+            if theme::toggle(ui, &mut v).changed() {
+                self.config.downloads_lan_only = v;
+                *changed = true;
+                if !v {
+                    self.reconcile_downloads();
+                }
+            }
+        });
     }
 
     fn settings_storage(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
@@ -3378,6 +3960,11 @@ fn remove_dir_all(dir: std::path::PathBuf) -> std::io::Result<()> {
     }
 }
 
+/// "1 song" / "3 songs".
+fn plural_s(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 pub fn human_bytes(n: u64) -> String {
     match n {
         0..=1023 => format!("{n} B"),
@@ -3436,6 +4023,29 @@ fn lyrics_from(body: &str, provider: Option<String>) -> LyricsState {
     });
     l.provider = l.provider.take().or(named);
     LyricsState::Ready(l)
+}
+
+/// File extension a download of `t` gets: the original container, except Opus, which only
+/// plays through the server's MP3 transcoder.
+fn download_ext(t: &crate::library_model::Track) -> String {
+    let codec = t.codec.as_deref().unwrap_or("").to_ascii_lowercase();
+    if codec == "opus" {
+        return "mp3".into();
+    }
+    let container = t.container.as_deref().unwrap_or("").to_ascii_lowercase();
+    if container.is_empty() { codec_extension(&codec).to_string() } else { container }
+}
+
+/// Download job for a song (original file; Opus as 320 kbps MP3).
+fn download_job(lib: &LibraryModel, pms: &PmsClient, id: Id, client_id: &str) -> Option<crate::cache::offline::Job> {
+    let t = lib.track(id)?;
+    let ext = download_ext(t);
+    let url = if t.codec.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("opus")) {
+        pms.transcode_url(&id.to_string(), 320, &format!("plexdio-dl-{client_id}"), client_id)
+    } else {
+        pms.part_url(t.part_key.as_deref()?)
+    };
+    Some(crate::cache::offline::Job { track: id, url, ext })
 }
 
 /// Run one playlist edit against the server, then re-read the playlists into the cache.
@@ -3590,6 +4200,17 @@ impl UiApp for PlexdioApp {
             self.handle(msg);
         }
         self.poll_playback();
+        if self.config.visualiser != super::visualiser::VisMode::Off && self.screen == Screen::Main {
+            let playing = self.playback.state == PlayState::Playing;
+            // Nothing plays here while casting, so there is nothing to show.
+            let scope = self.engine.as_ref().filter(|_| self.cast.is_none()).map(|e| e.scope());
+            self.vis.update(scope.as_ref(), playing, ui.input(|i| i.time));
+            // 30 frames a second only while there is something to animate.
+            let minimized = ui.input(|i| i.viewport().minimized == Some(true));
+            if (playing || self.vis.moving()) && !minimized {
+                ui.ctx().request_repaint_after(Duration::from_millis(33));
+            }
+        }
         self.poll_radio();
         self.poll_similar();
         if self.similar_job.is_some() {

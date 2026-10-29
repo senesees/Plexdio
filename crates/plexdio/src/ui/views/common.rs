@@ -81,6 +81,10 @@ pub enum UiAction {
     DeletePlaylist(Id),
     /// Show the Track info dialog.
     TrackInfo(Id),
+    /// Keep (or stop keeping) albums, playlists or songs downloaded.
+    SetOffline(Vec<crate::cache::offline::Pin>, bool),
+    /// Try failed downloads again.
+    RetryDownloads,
 }
 
 /// Selected rows of one track list (click, Ctrl+click, Shift+click, Ctrl+A).
@@ -187,6 +191,8 @@ pub struct ViewCtx<'a> {
     pub similar: &'a std::collections::HashMap<Id, Vec<Id>>,
     /// Selected rows of the current page's track list.
     pub selection: &'a mut Selection,
+    /// Downloads for offline listening.
+    pub offline: &'a crate::cache::offline::OfflineState,
 }
 
 pub fn fmt_duration(ms: u64) -> String {
@@ -274,6 +280,46 @@ pub fn play_buttons(ui: &mut egui::Ui, ctx: &mut ViewCtx, ids: &[Id], radio: Opt
             egui::Popup::menu(&add).show(|ui| add_to_playlist_menu(ui, ctx, ids, None));
         }
     });
+}
+
+/// Download toggle for a collection: shows progress while its songs download and turns accent
+/// once all of them are on this computer. `pins` are what it keeps offline, `ids` its songs.
+pub fn download_button(ui: &mut egui::Ui, ctx: &mut ViewCtx, pins: Vec<crate::cache::offline::Pin>, ids: &[Id]) {
+    if ids.is_empty() {
+        return;
+    }
+    let pinned = !pins.is_empty() && pins.iter().all(|p| ctx.offline.pinned(*p));
+    let (done, total) = ctx.offline.progress(ids);
+    let complete = pinned && done == total;
+    let tip = if complete {
+        "Downloaded: plays without a connection. Click to remove the download.".to_string()
+    } else if pinned {
+        format!("Downloading {done} of {total} songs. Click to cancel.")
+    } else {
+        "Download to play without a connection".to_string()
+    };
+    let resp = icons::button(ui, Icon::Download, 30.0, complete).on_hover_text(tip);
+    if pinned && !complete {
+        // Progress arc around the icon.
+        let c = resp.rect.center();
+        let r = resp.rect.width() / 2.0 + 1.0;
+        let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+        let n = 32;
+        let pts: Vec<egui::Pos2> = (0..=((n as f32 * frac).ceil() as usize))
+            .map(|i| {
+                let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * (i as f32 / n as f32).min(frac);
+                egui::pos2(c.x + r * a.cos(), c.y + r * a.sin())
+            })
+            .collect();
+        ui.painter().circle_stroke(c, r, egui::Stroke::new(2.0, theme::CARD_HOVER));
+        if pts.len() > 1 {
+            ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(2.0, theme::ACCENT)));
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    }
+    if resp.clicked() {
+        ctx.actions.push(UiAction::SetOffline(pins, !pinned));
+    }
 }
 
 /// "New playlist…" and every regular playlist (except `skip`, the one being shown); picking one
@@ -398,6 +444,10 @@ pub fn track_row(ui: &mut egui::Ui, ctx: &mut ViewCtx, ids: &[Id], opts: TableOp
     if opts.album {
         let ax = rect.right() - dur_w - album_w - 10.0;
         clipped(ui, egui::pos2(ax, cy), &t.album, 13.0, theme::TEXT_DIM, album_w - 10.0, Align2::LEFT_CENTER);
+    }
+    if ctx.offline.has(id) {
+        let dr = Rect::from_center_size(egui::pos2(rect.right() - dur_w - 34.0, cy), egui::vec2(13.0, 13.0));
+        icons::paint(ui.painter(), dr, Icon::Download, theme::ACCENT.linear_multiply(0.8));
     }
     if t.user_rating > 0.0 {
         let sr = Rect::from_center_size(egui::pos2(rect.right() - dur_w - 14.0, cy), egui::vec2(14.0, 14.0));
@@ -582,6 +632,16 @@ pub fn track_menu(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id, ids: &[Id], row:
     }
     if ctx.lib.artist(artist_id).is_some() && ui.button("Go to artist").clicked() {
         ctx.actions.push(UiAction::Navigate(Route::Artist(artist_id)));
+        ui.close();
+    }
+    let pin = (crate::cache::offline::PinKind::Track, id);
+    if ctx.offline.pinned(pin) {
+        if ui.button("Remove download").clicked() {
+            ctx.actions.push(UiAction::SetOffline(vec![pin], false));
+            ui.close();
+        }
+    } else if !ctx.offline.has(id) && ui.button("Download").clicked() {
+        ctx.actions.push(UiAction::SetOffline(vec![pin], true));
         ui.close();
     }
     if ui.button("Track info…").clicked() {

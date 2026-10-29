@@ -32,6 +32,10 @@ pub enum Icon {
     More,
     /// Microphone (lyrics).
     Lyrics,
+    /// Arrow into a tray (download for offline).
+    Download,
+    /// Screen with signal arcs (play on another device).
+    Cast,
     Trash,
     Up,
     Down,
@@ -191,6 +195,25 @@ pub fn paint(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Plus => {
             p.line_segment([at(12.0, 5.0), at(12.0, 19.0)], stroke);
             p.line_segment([at(5.0, 12.0), at(19.0, 12.0)], stroke);
+        }
+        Icon::Cast => {
+            // Screen outline open at the bottom-left, where the signal arcs sit.
+            p.add(Shape::line(vec![at(3.0, 9.0), at(3.0, 5.0), at(21.0, 5.0), at(21.0, 19.0), at(14.0, 19.0)], stroke));
+            for r in [4.0f32, 8.0] {
+                let arc: Vec<Pos2> = (0..=8)
+                    .map(|i| {
+                        let a = std::f32::consts::FRAC_PI_2 * i as f32 / 8.0;
+                        at(3.0 + r * a.sin(), 19.0 - r * a.cos())
+                    })
+                    .collect();
+                p.add(Shape::line(arc, stroke));
+            }
+            p.circle_filled(at(3.5, 18.5), 1.6 * u, color);
+        }
+        Icon::Download => {
+            p.line_segment([at(12.0, 3.5), at(12.0, 15.0)], stroke);
+            p.add(Shape::line(vec![at(7.0, 10.5), at(12.0, 15.5), at(17.0, 10.5)], stroke));
+            p.add(Shape::line(vec![at(4.0, 15.0), at(4.0, 20.0), at(20.0, 20.0), at(20.0, 15.0)], stroke));
         }
         Icon::Lyrics => {
             // Capsule head, a U-shaped holder, the stem and the base.

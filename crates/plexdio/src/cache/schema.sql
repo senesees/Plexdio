@@ -102,3 +102,24 @@ CREATE TABLE IF NOT EXISTS lyrics (
     provider   TEXT,
     fetched_at INTEGER NOT NULL
 );
+
+-- Downloads for offline listening (see cache/offline.rs): what the user pinned, the files
+-- that are complete, and plays to report once the server is reachable again.
+CREATE TABLE IF NOT EXISTS offline_pins (
+    kind     TEXT NOT NULL,
+    item_id  INTEGER NOT NULL,
+    added_at INTEGER NOT NULL,
+    PRIMARY KEY (kind, item_id)
+);
+
+CREATE TABLE IF NOT EXISTS offline_tracks (
+    track_id INTEGER PRIMARY KEY,
+    file     TEXT NOT NULL,
+    bytes    INTEGER NOT NULL,
+    done_at  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS pending_scrobbles (
+    track_id  INTEGER NOT NULL,
+    played_at INTEGER NOT NULL
+);

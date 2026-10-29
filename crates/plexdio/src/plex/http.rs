@@ -128,6 +128,11 @@ impl Http {
 
     /// Perform a request once. Returns the response body bytes for 2xx responses.
     fn request_once(&self, method: Method, url: &str, token: Option<&str>, query: &[(&str, &str)]) -> Result<Vec<u8>> {
+        self.request_once_with(method, url, token, query, &[])
+    }
+
+    /// One request with extra headers (remote control needs `X-Plex-Target-Client-Identifier`).
+    pub fn request_once_with(&self, method: Method, url: &str, token: Option<&str>, query: &[(&str, &str)], extra: &[(&str, &str)]) -> Result<Vec<u8>> {
         let agent = self.agent_for(url);
         macro_rules! decorate {
             ($req:expr) => {{
@@ -137,6 +142,9 @@ impl Http {
                 }
                 if let Some(t) = token {
                     req = req.header("X-Plex-Token", t);
+                }
+                for (k, v) in extra {
+                    req = req.header(*k, *v);
                 }
                 for (k, v) in query {
                     req = req.query(*k, *v);

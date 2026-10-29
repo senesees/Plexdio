@@ -1,5 +1,14 @@
 # Feature plan
 
+**Status (2026-10-29): everything below is implemented** and tested against mockplex (unit and
+integration tests, Linux build, Windows 11 VM smoke test). Where the build differs from the plan:
+- Downloads run one at a time (not two), and album art is not pinned (it stays in the normal image
+  cache). Opus songs are downloaded as the server's 320 kbps MP3, since the player can't decode Opus.
+- Cast polls the leader's timeline once a second (`wait=0`) instead of long-polling.
+- The library schema went to version 2 with an in-place migration (`LibraryDb::migrate`); the local
+  play history survives upgrades.
+- Still unverified on a real server: playlist rename, lyrics stream content, the cast protocol.
+
 Plan for the next batch of features. Each item lists what it does, the Plex API it needs, where it
 lands in the code, what mockplex must learn so it can be tested, and the risks. Sizes are rough:
 S ≈ half a day, M ≈ 1–2 days, L ≈ 3+ days.

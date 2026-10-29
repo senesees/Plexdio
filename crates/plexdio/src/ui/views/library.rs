@@ -78,6 +78,8 @@ impl RatingFilter {
 #[serde(default)]
 pub struct LibFilters {
     pub unplayed: bool,
+    /// Only songs (albums, artists) that are downloaded.
+    pub downloaded: bool,
     pub rating: RatingFilter,
     /// First year of a decade (1990 = the 1990s).
     pub decade: Option<i32>,
@@ -103,6 +105,9 @@ pub struct LibraryPrefs {
     pub filters: LibFilters,
 }
 
+/// Jump bar letters and the first index of each.
+type LetterIndex = Vec<(char, usize)>;
+
 /// Per-album and per-artist play/rating totals, rebuilt when the library changes.
 #[derive(Default)]
 struct Stats {
@@ -124,10 +129,13 @@ pub struct BrowseState {
     pub prefs_changed: bool,
     /// Row/card to scroll to on the next frame (A–Z jump bar).
     scroll_to: Option<usize>,
+    /// Downloaded songs (copied from the app when they change) and their version.
+    pub downloaded: std::collections::HashSet<Id>,
+    pub downloaded_ver: u64,
     stats: Stats,
     memo: std::collections::HashMap<&'static str, (u64, Vec<usize>)>,
     /// Jump bar letters per tab, for the list they were computed from.
-    letters: std::collections::HashMap<&'static str, (u64, Vec<(char, usize)>)>,
+    letters: std::collections::HashMap<&'static str, (u64, LetterIndex)>,
 }
 
 fn fingerprint(parts: &[&dyn std::fmt::Debug]) -> u64 {
@@ -228,8 +236,9 @@ impl BrowseState {
         self.ensure_stats(lib, ver);
         let f = self.filter.trim().to_lowercase();
         let (sort, desc, chips) = (self.prefs.album_sort, self.prefs.album_desc, self.prefs.filters.clone());
-        let key = fingerprint(&[&ver, &f, &sort, &desc, &chips]);
-        self.memo("albums", key, |st| {
+        let key = fingerprint(&[&ver, &f, &sort, &desc, &chips, &self.downloaded_ver]);
+        let dl = std::mem::take(&mut self.downloaded);
+        let v = self.memo("albums", key, |st| {
             let a = &lib.albums;
             let mut v: Vec<usize> = (0..a.len())
                 .filter(|&i| matches(&a[i].title, &f) || matches(&a[i].artist, &f))
@@ -237,6 +246,10 @@ impl BrowseState {
                 .filter(|&i| chips.rating.min().is_none_or(|m| st.album[i].1 >= m))
                 .filter(|&i| chips.decade.is_none_or(|d| decade_of(a[i].year) == Some(d)))
                 .filter(|&i| chips.genre.as_deref().is_none_or(|g| a[i].genre.as_deref() == Some(g)))
+                .filter(|&i| !chips.downloaded || {
+                    let ids = lib.album_track_ids(a[i].id);
+                    !ids.is_empty() && ids.iter().all(|t| dl.contains(t))
+                })
                 .collect();
             match sort {
                 AlbumSort::Title => {} // model order is by title
@@ -251,21 +264,25 @@ impl BrowseState {
             }
             v
         })
-        .to_vec()
+        .to_vec();
+        self.downloaded = dl;
+        v
     }
 
     pub fn artists(&mut self, lib: &LibraryModel, ver: u64) -> Vec<usize> {
         self.ensure_stats(lib, ver);
         let f = self.filter.trim().to_lowercase();
         let (sort, desc, chips) = (self.prefs.artist_sort, self.prefs.artist_desc, self.prefs.filters.clone());
-        let key = fingerprint(&[&ver, &f, &sort, &desc, &chips]);
-        self.memo("artists", key, |st| {
+        let key = fingerprint(&[&ver, &f, &sort, &desc, &chips, &self.downloaded_ver]);
+        let dl = std::mem::take(&mut self.downloaded);
+        let v = self.memo("artists", key, |st| {
             let a = &lib.artists;
             let n_albums = |i: usize| lib.artist_albums.get(&a[i].id).map_or(0, Vec::len);
             let mut v: Vec<usize> = (0..a.len())
                 .filter(|&i| matches(&a[i].title, &f))
                 .filter(|&i| !chips.unplayed || st.artist_plays[i] == 0)
                 .filter(|&i| chips.genre.as_deref().is_none_or(|g| st.artist_genres[i].iter().any(|x| &**x == g)))
+                .filter(|&i| !chips.downloaded || lib.artist_track_ids(a[i].id).iter().any(|t| dl.contains(t)))
                 .collect();
             match sort {
                 ArtistSort::Name => {}
@@ -278,14 +295,17 @@ impl BrowseState {
             }
             v
         })
-        .to_vec()
+        .to_vec();
+        self.downloaded = dl;
+        v
     }
 
     pub fn tracks(&mut self, lib: &LibraryModel, ver: u64) -> Vec<Id> {
         self.ensure_stats(lib, ver);
         let f = self.filter.trim().to_lowercase();
         let (sort, desc, chips) = (self.prefs.track_sort, self.prefs.track_desc, self.prefs.filters.clone());
-        let key = fingerprint(&[&ver, &f, &sort, &desc, &chips]);
+        let key = fingerprint(&[&ver, &f, &sort, &desc, &chips, &self.downloaded_ver]);
+        let dl = std::mem::take(&mut self.downloaded);
         let idx = self
             .memo("tracks", key, |_| {
                 let t = &lib.tracks;
@@ -297,6 +317,7 @@ impl BrowseState {
                     .filter(|&i| chips.rating.min().is_none_or(|m| t[i].user_rating >= m))
                     .filter(|&i| chips.decade.is_none_or(|d| decade_of(year(i)) == Some(d)))
                     .filter(|&i| chips.genre.as_deref().is_none_or(|g| genre(i) == Some(g)))
+                    .filter(|&i| !chips.downloaded || dl.contains(&t[i].id))
                     .collect();
                 match sort {
                     TrackSort::Title => {}
@@ -313,6 +334,7 @@ impl BrowseState {
                 v
             })
             .to_vec();
+        self.downloaded = dl;
         idx.into_iter().map(|i| lib.tracks[i].id).collect()
     }
 }
@@ -366,6 +388,9 @@ fn filter_chips(ui: &mut egui::Ui, lib: &LibraryModel, f: &mut LibFilters, full:
         ui.spacing_mut().item_spacing.x = 8.0;
         if chip(ui, f.unplayed, "Unplayed").clicked() {
             f.unplayed = !f.unplayed;
+        }
+        if chip(ui, f.downloaded, "Downloaded").clicked() {
+            f.downloaded = !f.downloaded;
         }
         if full {
             let r = chip(ui, f.rating != RatingFilter::Any, if f.rating == RatingFilter::Any { "Rating ▾" } else { f.rating.label() });
@@ -700,6 +725,7 @@ mod tests {
     use crate::cache::db::{Kind, LibraryDb};
     use crate::plex::models::Metadata;
 
+    #[allow(clippy::too_many_arguments)]
     fn meta(id: i64, kind: &str, title: &str, parent: i64, year: i64, plays: i64, rating: f64, genre: Option<&str>) -> Metadata {
         Metadata {
             rating_key: Some(id.to_string()),

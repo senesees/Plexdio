@@ -8,3 +8,4 @@ pub mod runner;
 pub mod theme;
 pub mod titlebar;
 pub mod views;
+pub mod visualiser;

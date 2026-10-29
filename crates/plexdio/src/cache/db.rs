@@ -13,6 +13,9 @@ pub struct LibraryDb {
     pub path: PathBuf,
 }
 
+/// A cached lyrics row: (text, provider, fetched at); no text means the track has none.
+pub type CachedLyrics = (Option<String>, Option<String>, i64);
+
 /// Which table a sync step works on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -108,7 +111,8 @@ impl LibraryDb {
     pub fn clear(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "DELETE FROM artists; DELETE FROM albums; DELETE FROM tracks; DELETE FROM playlists;
-             DELETE FROM playlist_items; DELETE FROM play_history; DELETE FROM lyrics; DELETE FROM meta;",
+             DELETE FROM playlist_items; DELETE FROM play_history; DELETE FROM lyrics; DELETE FROM offline_pins;
+             DELETE FROM offline_tracks; DELETE FROM pending_scrobbles; DELETE FROM meta;",
         )?;
         self.set_meta("schema_version", SCHEMA_VERSION)
     }
@@ -327,7 +331,7 @@ impl LibraryDb {
 
     /// Cached lyrics of a track: `Some((body, provider, fetched_at))`, where a `None` body means
     /// the server had none.
-    pub fn lyrics(&self, track_id: i64) -> rusqlite::Result<Option<(Option<String>, Option<String>, i64)>> {
+    pub fn lyrics(&self, track_id: i64) -> rusqlite::Result<Option<CachedLyrics>> {
         self.conn
             .query_row("SELECT body, provider, fetched_at FROM lyrics WHERE track_id = ?1", [track_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()

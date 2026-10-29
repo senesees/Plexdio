@@ -292,6 +292,8 @@ pub struct PlayerCore {
     sink_name: String,
     sink_real: bool,
     eq: Equalizer,
+    /// Samples for the visualiser.
+    scope: super::scope::SharedScope,
 }
 
 impl PlayerCore {
@@ -327,6 +329,7 @@ impl PlayerCore {
             sink_name,
             sink_real,
             eq: Equalizer::new(rate),
+            scope: super::scope::shared(rate),
         };
         core.eq.set(cfg.eq_enabled, cfg.eq_gains);
         core.apply_volume();
@@ -959,10 +962,22 @@ impl PlayerCore {
             let frames = block.len() / 2;
             let accepted = self.sink.push(&block);
             self.frames_played += accepted as u64;
+            if let Ok(mut sc) = self.scope.lock() {
+                sc.push_stereo(&block[..accepted.min(frames) * 2]);
+            }
             if accepted < frames {
                 break;
             }
         }
+        if let Ok(mut sc) = self.scope.lock() {
+            sc.set_pending(self.sink.buffered_frames());
+            sc.rate = self.rate;
+        }
+    }
+
+    /// The visualiser's sample tap.
+    pub fn scope(&self) -> super::scope::SharedScope {
+        self.scope.clone()
     }
 
     /// Rebuild the queue snapshot when something changed.
@@ -1108,6 +1123,7 @@ fn source_kind(spec: &SourceSpec) -> &'static str {
 pub struct Engine {
     tx: Sender<Command>,
     status: Arc<Mutex<PlaybackStatus>>,
+    scope: super::scope::SharedScope,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1125,7 +1141,7 @@ impl Engine {
                 let sink = open_output(output.as_deref());
                 let mut core = PlayerCore::new(sink, cache, http, cfg);
                 let shared = Arc::new(Mutex::new(core.status()));
-                let _ = ready_tx.send(shared.clone());
+                let _ = ready_tx.send((shared.clone(), core.scope()));
                 let mut last_publish = Instant::now();
                 let mut last_device_check = Instant::now();
                 loop {
@@ -1170,8 +1186,13 @@ impl Engine {
                 core.handle(Command::Stop);
             })
             .expect("spawn audio engine");
-        let status = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
-        Self { tx, status, thread: Some(thread) }
+        let (status, scope) = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| (Default::default(), super::scope::shared(48_000)));
+        Self { tx, status, scope, thread: Some(thread) }
+    }
+
+    /// Samples being heard, for the visualiser.
+    pub fn scope(&self) -> super::scope::SharedScope {
+        self.scope.clone()
     }
 
     pub fn send(&self, cmd: Command) {

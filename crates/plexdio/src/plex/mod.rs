@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod http;
 pub mod models;
+pub mod remote;
 pub mod resources;
 pub mod server;
 

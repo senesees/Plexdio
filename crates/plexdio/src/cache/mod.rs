@@ -2,4 +2,5 @@
 
 pub mod db;
 pub mod images;
+pub mod offline;
 pub mod sync;

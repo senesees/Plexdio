@@ -86,7 +86,10 @@ pub fn album_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
         about(ui, summary, 2, ("album", id));
     }
     ui.add_space(8.0);
-    play_buttons(ui, ctx, &ids, Some(RadioSeed::Album(id)));
+    ui.horizontal(|ui| {
+        play_buttons(ui, ctx, &ids, Some(RadioSeed::Album(id)));
+        download_button(ui, ctx, vec![(crate::cache::offline::PinKind::Album, id)], &ids);
+    });
     ui.add_space(8.0);
     track_table(ui, ctx, &ids, TableOpts { album: false, artist: true, track_numbers: true, art: false, playlist: None }, "album-tracks");
 }
@@ -182,6 +185,7 @@ pub fn playlist_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, id: Id) {
     hero(ui, ctx, Hero { thumb: p.composite.as_deref(), seed: &p.title, round: false, kind: "PLAYLIST", title: &p.title, sub: &sub });
     ui.horizontal(|ui| {
         play_buttons(ui, ctx, &ids, None);
+        download_button(ui, ctx, vec![(crate::cache::offline::PinKind::Playlist, id)], &ids);
         if !p.smart {
             let more = icons::button(ui, Icon::More, 30.0, false).on_hover_text("More options");
             egui::Popup::menu(&more).show(|ui| {
@@ -220,7 +224,12 @@ pub fn mix_view(ui: &mut egui::Ui, ctx: &mut ViewCtx, key: &str) {
     let sub = format!("{} · {} tracks · {}", m.description, ids.len(), fmt_long_duration(total));
     let thumb = ids.first().and_then(|t| lib.track(*t)).and_then(|t| t.thumb.as_deref());
     hero(ui, ctx, Hero { thumb, seed: &m.title, round: false, kind: "MIX", title: &m.title, sub: &sub });
-    play_buttons(ui, ctx, &ids, None);
+    ui.horizontal(|ui| {
+        play_buttons(ui, ctx, &ids, None);
+        // A mix changes over time, so its current songs are kept one by one.
+        let pins = ids.iter().map(|t| (crate::cache::offline::PinKind::Track, *t)).collect();
+        download_button(ui, ctx, pins, &ids);
+    });
     ui.add_space(8.0);
     track_table(ui, ctx, &ids, TableOpts { album: true, artist: true, track_numbers: false, art: true, playlist: None }, "mix-tracks");
 }

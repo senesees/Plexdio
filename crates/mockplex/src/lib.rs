@@ -61,6 +61,43 @@ pub struct LoggedRequest {
     pub query: HashMap<String, String>,
 }
 
+/// A fake Plex player that remote control commands drive (see `/player/...`).
+#[derive(Debug, Clone)]
+pub struct MockPlayer {
+    pub name: String,
+    pub product: String,
+    /// Play queue it is playing and the position in it.
+    pub queue: Vec<u64>,
+    pub index: usize,
+    /// "stopped", "playing" or "paused".
+    pub state: String,
+    /// Position when the state last changed, and when that was.
+    pub base_ms: u64,
+    pub since: Option<std::time::Instant>,
+    pub volume: u32,
+    /// Commands received, e.g. "playMedia", "pause", "seekTo".
+    pub commands: Vec<String>,
+}
+
+impl MockPlayer {
+    fn new(name: &str, product: &str) -> Self {
+        Self { name: name.into(), product: product.into(), queue: Vec::new(), index: 0, state: "stopped".into(), base_ms: 0, since: None, volume: 100, commands: Vec::new() }
+    }
+
+    pub fn position_ms(&self) -> u64 {
+        match (self.state.as_str(), self.since) {
+            ("playing", Some(t)) => self.base_ms + t.elapsed().as_millis() as u64,
+            _ => self.base_ms,
+        }
+    }
+
+    fn set_state(&mut self, state: &str) {
+        self.base_ms = self.position_ms();
+        self.since = Some(std::time::Instant::now());
+        self.state = state.into();
+    }
+}
+
 struct PinState {
     code: String,
     polls: u32,
@@ -78,6 +115,10 @@ pub struct State {
     /// Simulate the server being down (all PMS endpoints fail with 503).
     pub server_down: bool,
     pub base_url: String,
+    /// Remote-controllable players by client identifier.
+    pub players: HashMap<String, MockPlayer>,
+    /// Play queues created with `POST /playQueues`.
+    pub play_queues: HashMap<u64, Vec<u64>>,
 }
 
 pub struct MockServer {
@@ -108,6 +149,11 @@ impl MockServer {
             valid_user_token: USER_TOKEN.into(),
             server_down: false,
             base_url: url.clone(),
+            players: HashMap::from([
+                ("mock-player-1".to_string(), MockPlayer::new("Kitchen", "Plexamp")),
+                ("mock-player-3".to_string(), MockPlayer::new("Living Room TV", "Plex for Android (TV)")),
+            ]),
+            play_queues: HashMap::new(),
         }));
         let server = Arc::new(server);
         let stop = Arc::new(AtomicBool::new(false));
@@ -129,6 +175,11 @@ impl MockServer {
             })
         };
         Ok(MockServer { url, port, state, server, stop, handle: Some(handle) })
+    }
+
+    /// Snapshot of a fake player's state.
+    pub fn player(&self, id: &str) -> Option<MockPlayer> {
+        self.state.lock().unwrap().players.get(id).cloned()
     }
 
     pub fn requests(&self) -> Vec<LoggedRequest> {
@@ -236,6 +287,7 @@ fn handle(req: Request, state: &Arc<Mutex<State>>) {
     let method = req.method().clone();
     let token = header(&req, "X-Plex-Token").or_else(|| query.get("X-Plex-Token").cloned());
     let range = header(&req, "Range");
+    let target = header(&req, "X-Plex-Target-Client-Identifier");
     {
         let mut st = state.lock().unwrap();
         if st.config.verbose {
@@ -243,7 +295,10 @@ fn handle(req: Request, state: &Arc<Mutex<State>>) {
         }
         st.requests.push(LoggedRequest { method: method.to_string(), path: path.clone(), query: query.clone() });
     }
-    let resp = route(state, &method, &path, &query, token.as_deref(), range.as_deref());
+    let resp = match (target, path.starts_with("/player/")) {
+        (Some(t), true) => player_route(state, &t, &path, &query, token.as_deref()),
+        _ => route(state, &method, &path, &query, token.as_deref(), range.as_deref()),
+    };
     let _ = req.respond(resp);
 }
 
@@ -316,7 +371,7 @@ fn route(state: &Arc<Mutex<State>>, method: &Method, path: &str, q: &HashMap<Str
                     { "protocol": "https", "address": "198.51.100.7", "port": 32400, "uri": "https://198-51-100-7.mock.plex.direct:32400", "local": false, "relay": false, "IPv6": false }
                   ] },
                 { "name": "Living Room TV", "product": "Plex for Android (TV)", "clientIdentifier": "mock-player-3",
-                  "provides": "player,pubsub-player", "owned": true, "connections": [] }
+                  "provides": "player,pubsub-player", "owned": true, "presence": true, "platform": "Android", "connections": [] }
             ]));
         }
         _ => {}
@@ -546,6 +601,25 @@ fn route(state: &Arc<Mutex<State>>, method: &Method, path: &str, q: &HashMap<Str
                 None => status(404),
             }
         }
+        // Remote control: players this server knows, and play queues for them.
+        (Method::Get, ["clients"]) => {
+            let mut servers: Vec<Value> = st
+                .players
+                .iter()
+                .map(|(id, p)| json!({ "name": p.name, "machineIdentifier": id, "product": p.product, "deviceClass": "phone", "protocolCapabilities": "timeline,playback,playqueues" }))
+                .collect();
+            servers.sort_by_key(|v| v["name"].as_str().unwrap_or("").to_string());
+            json_resp(200, &json!({ "MediaContainer": { "size": servers.len(), "Server": servers } }))
+        }
+        (Method::Post, ["playQueues"]) => {
+            let ids = uri_ids(q.get("uri").map(String::as_str).unwrap_or(""));
+            if ids.is_empty() {
+                return status(400);
+            }
+            let id = 7000 + st.play_queues.len() as u64;
+            st.play_queues.insert(id, ids.clone());
+            json_resp(200, &json!({ "MediaContainer": { "playQueueID": id, "playQueueSelectedItemID": 1, "size": ids.len() } }))
+        }
         (Method::Get, ["hubs", "search"]) => {
             let query = q.get("query").map(|s| s.to_lowercase()).unwrap_or_default();
             let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -771,6 +845,84 @@ fn track_json(lib: &Library, t: &Track, detail: bool) -> Value {
                        "file": format!("/music/{}", audio.name), "Stream": streams }]
         }]
     })
+}
+
+/// `/player/...` commands for the fake player `target` (proxied through the server like real
+/// Plex remote control).
+fn player_route(state: &Arc<Mutex<State>>, target: &str, path: &str, q: &HashMap<String, String>, token: Option<&str>) -> Resp {
+    let mut st = state.lock().unwrap();
+    if token != Some(SERVER_TOKEN) && token != Some(st.valid_user_token.as_str()) {
+        return status(401);
+    }
+    let queues = st.play_queues.clone();
+    let Some(p) = st.players.get_mut(target) else { return status(404) };
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match segs.as_slice() {
+        ["player", "timeline", "poll"] => {
+            let rating_key = p.queue.get(p.index).copied();
+            let dur = 8000u64;
+            if p.state == "playing" && p.position_ms() >= dur {
+                // Advance like a real player at the end of a song.
+                p.index += 1;
+                p.base_ms = 0;
+                p.since = Some(std::time::Instant::now());
+                if p.index >= p.queue.len() {
+                    p.state = "stopped".into();
+                    p.index = 0;
+                }
+            }
+            let rating_key = p.queue.get(p.index).copied().or(rating_key);
+            json_resp(200, &json!({ "MediaContainer": { "commandID": q.get("commandID"), "Timeline": [
+                { "type": "music", "state": p.state, "time": p.position_ms().min(dur), "duration": dur,
+                  "ratingKey": rating_key.map(|k| k.to_string()), "key": rating_key.map(|k| format!("/library/metadata/{k}")),
+                  "volume": p.volume, "controllable": "playPause,stop,skipPrevious,skipNext,seekTo,volume" },
+                { "type": "video", "state": "stopped" }, { "type": "photo", "state": "stopped" }
+            ] } }))
+        }
+        ["player", "playback", cmd] => {
+            p.commands.push(cmd.to_string());
+            match *cmd {
+                "playMedia" => {
+                    let qid = q.get("containerKey").and_then(|c| c.trim_start_matches("/playQueues/").split('?').next()?.parse::<u64>().ok());
+                    let Some(ids) = qid.and_then(|id| queues.get(&id)) else { return status(400) };
+                    p.queue = ids.clone();
+                    let key: Option<u64> = q.get("key").and_then(|k| k.rsplit('/').next()?.parse().ok());
+                    p.index = key.and_then(|k| p.queue.iter().position(|x| *x == k)).unwrap_or(0);
+                    p.base_ms = q.get("offset").and_then(|o| o.parse().ok()).unwrap_or(0);
+                    p.since = Some(std::time::Instant::now());
+                    p.state = "playing".into();
+                }
+                "play" => p.set_state("playing"),
+                "pause" => p.set_state("paused"),
+                "stop" => {
+                    p.set_state("stopped");
+                    p.base_ms = 0;
+                }
+                "skipNext" => {
+                    p.index = (p.index + 1).min(p.queue.len().saturating_sub(1));
+                    p.base_ms = 0;
+                    p.since = Some(std::time::Instant::now());
+                }
+                "skipPrevious" => {
+                    p.index = p.index.saturating_sub(1);
+                    p.base_ms = 0;
+                    p.since = Some(std::time::Instant::now());
+                }
+                "seekTo" => {
+                    p.base_ms = q.get("offset").and_then(|o| o.parse().ok()).unwrap_or(0);
+                    p.since = Some(std::time::Instant::now());
+                }
+                "setParameters" => {
+                    if let Some(v) = q.get("volume").and_then(|v| v.parse().ok()) {
+                        p.volume = v;
+                    }
+                }
+                _ => return status(404),
+            }
+            json_resp(200, &json!({ "MediaContainer": { "size": 0 } }))
+        }
+        _ => status(404),
+    }
 }
 
 /// Lyrics of the fixture tracks that have some: (format, file text). The fixture songs are 8 s

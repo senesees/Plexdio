@@ -29,13 +29,39 @@ Mini-player:
 - **Offline-first library**: a per-server SQLite cache with a full and a delta sync
   (`updatedAt>>=`/`addedAt>>=` plus a count-check sweep). The UI opens the cached library
   immediately, even with the server unreachable.
-- **Browsing**: Home (recently added, mixes, playlists), Artists / Albums / Tracks / Genres,
-  playlists, artist/album/playlist pages, virtualised lists that stay smooth with
-  100 000 tracks. Artist pages scroll as one page: Popular, Discography and **Fans also
-  like** (similar artists from the server's related hubs, or genre matches from your
-  library).
+- **Browsing**: Home (recently added, **Made for you** mixes, playlists), Artists / Albums /
+  Tracks / Genres, artist/album/playlist pages, virtualised lists that stay smooth with
+  100 000 tracks. Artist pages scroll as one page: Popular, Discography, **Fans also like**
+  (similar artists from the server's related hubs, or genre matches from your library) and
+  the artist's bio; album pages show the album's description.
+- **Made for you**: Most played, Recently played, Your favourites, Rediscover, Forgotten
+  favourites, New additions, Deep cuts, and mixes for your top genres and decades. Each opens
+  as its own page, like a playlist.
+- **Library sorting and filters**: sort by name, artist, year, date added, plays or rating
+  (reversible); filter chips for Unplayed, Downloaded, rating, decade and genre; an A–Z jump bar
+  for name order. The choices are remembered.
+- **Playlist editing**: create, rename and delete playlists; *Add to playlist* from any song's
+  right-click menu, the selection, or an album/mix/playlist page (with a prompt for songs
+  already in it); remove songs and drag them into a new order. Smart playlists stay read-only.
+- **Multi-select**: click, `Ctrl`+click, `Shift`+click and `Ctrl+A` in any song list; a bar and
+  the right-click menu play, queue, add to a playlist or remove the selection.
 - **Instant search**: in-memory, diacritic-folding prefix/substring search over artists,
-  albums and tracks, plus a server `/hubs/search` supplement. `Ctrl+F`.
+  albums, songs, playlists and genres with a **Top result**, plus a server `/hubs/search`
+  supplement. `Ctrl+F`; `↑`/`↓` move through the results, `Enter` opens (or plays) and
+  `Shift+Enter` adds to the queue.
+- **Lyrics**: a side panel with the server's lyrics (sidecar `.lrc`/`.txt`, or LyricFind with
+  Plex Pass). Time-synced lyrics follow the song, centred on the current line; click a line to
+  jump there. Lyrics are cached, so they also show offline.
+- **Track info**: format, bitrate, sample rate/bit depth, channels, size, file path, plays,
+  dates and ReplayGain, and for the playing song how it plays (original or converted, and any
+  resampling).
+- **Downloads for offline listening**: keep albums, playlists, mixes or single songs on this
+  computer in original quality (Opus as 320 kbps MP3, which the player can decode). Downloaded
+  playlists follow changes on the server. Downloaded songs play without a connection; plays made
+  offline are reported once the server is back. Optional: download only on the home network.
+- **Cast** (experimental): play on other Plex players on your account or server (Plexamp, Plex
+  apps), several at once if you like. The now-playing bar shows and controls what they play;
+  *This computer* takes the music back where they were.
 - **Playback**: gapless and crossfade (0–12 s), ReplayGain/loudness normalisation, a
   **10-band equaliser** with presets, seek, volume, mute, prefetch and an on-disk audio
   cache. Codecs are decoded in-process with Symphonia (MP3, FLAC, AAC/M4A, ALAC, Vorbis,
@@ -56,6 +82,9 @@ Mini-player:
 - **Discord Rich Presence** (optional): your Discord status shows "Listening to Plexdio" with
   the song, artist, album cover and a progress bar while music plays; pausing clears it. See
   [Discord setup](#discord-setup).
+- **Visualiser** (optional): spectrum bars or a waveform behind the player controls and along
+  the mini-player, from the audio actually being heard.
+- **Zoom**: 80–150 % (`Ctrl+=`, `Ctrl+−`, `Ctrl+0`, or Settings), remembered.
 - **Windows integration**: a themed title bar (drag, double-click to maximise, resize from any
   edge, live redraw while resizing), tray icon with menu, minimise/close to tray, media keys
   (`RegisterHotKey`, plus the System Media Transport Controls media overlay with metadata,
@@ -64,8 +93,8 @@ Mini-player:
   `Ctrl+↑/↓`, `Ctrl+M`, `Ctrl+F`).
 - **Settings**, as cards of rows with switches: streaming quality (original or a bitrate cap
   via the transcoder), crossfade, normalisation, autoplay, the equaliser, window behaviour,
-  Discord, image and audio cache sizes with usage and clear buttons, account/sign-out. Two
-  columns on wide windows, one on narrow ones.
+  Discord, zoom, visualiser, downloads, image and audio cache sizes with usage and clear
+  buttons, account/sign-out. Two columns on wide windows, one on narrow ones.
 
 ### Equaliser
 
@@ -132,6 +161,12 @@ real account.
 | Download reconnect after a dropped connection | ⚠️ code review only (no fault-injection test yet) |
 | Queue, shuffle/repeat, resume, timeline/scrobble/rating | ✅ tests + mock request log |
 | Radio page, autoplay, Home mixes, Fans also like | ✅ mock server (sonic on and off) + Wine |
+| Playlist editing (create/add/move/remove/rename/delete) | ✅ integration tests + Linux build against the mock |
+| Multi-select, library sorts/filters/jump bar, search keys | ✅ unit tests + Linux build against the mock |
+| Lyrics (LRC/TXT/JSON parsing, synced panel, cache) | ✅ unit tests + mock lyric streams |
+| Downloads (pins, resume, offline play, pending scrobbles) | ✅ integration tests + Linux build offline; download on Windows 11 VM |
+| Cast / multi-cast (discovery, play queue, commands, timeline) | ✅ against the mock's fake players only |
+| Visualiser, zoom, track info | ✅ unit tests + Linux build screenshots |
 | Discord Rich Presence protocol | ✅ test against a fake Discord socket; Wine (no Discord → retries quietly) |
 | Themed title bar, mini-player, settings layout | ✅ Wine screenshots |
 | Settings persistence, tray, media keys, shortcuts | ✅ Wine |
@@ -190,16 +225,21 @@ crates/plexdio
   logging.rs         rotating file log (1 MB x 3)
   discord.rs         Discord Rich Presence over the local IPC pipe
   cover_art.rs       public album-cover lookup (Deezer, iTunes) for Rich Presence
-  plex/              HTTP client, PIN auth, resource/connection racing, models, endpoints
-  cache/             SQLite schema/db, full+delta sync, artwork disk cache, audio cache
+  plex/              HTTP client, PIN auth, resource/connection racing, models, endpoints,
+                     remote control of other players (cast)
+  cache/             SQLite schema/db (+ migrations), full+delta sync, artwork disk cache,
+                     offline downloads (pins, download worker)
   library_model.rs   compact in-memory indexes (interned Arc<str>) for lists and search
   audio/             source (progressive download, range resume/seek), symphonia decoder,
-                     mixer (gapless/crossfade), gain, 10-band equaliser, sinks (cpal / null)
-  player/            mixes, radio, similar artists, reporting, session resume
+                     mixer (gapless/crossfade), gain, 10-band equaliser, sinks (cpal / null),
+                     sample tap for the visualiser
+  player/            mixes, radio, similar artists, reporting, session resume, lyrics
+                     parser, cast sessions
   ui/                CPU-rendered egui: runner, app state, views, title bar, EQ editor,
-                     icons, artwork cache
+                     icons, artwork cache, visualiser (FFT)
   win/               tray + media keys, SMTC, autostart, single instance, Wine workarounds
-crates/mockplex      mock plex.tv + Plex Media Server (tiny_http)
+crates/mockplex      mock plex.tv + Plex Media Server (tiny_http), including playlist writes,
+                     lyric streams and fake remote-controllable players
 ```
 
 Notable choices:
@@ -223,7 +263,7 @@ Data locations: `%APPDATA%\Plexdio\config.json` (settings, resume queue),
 
 ## Footprint
 
-Release exe: **10 034 176 bytes (9.57 MiB)**, PE32+ x86-64, system DLLs only.
+Release exe: **10 557 952 bytes (10.07 MiB)**, PE32+ x86-64, system DLLs only.
 
 | Environment | Library | Idle working set | Idle CPU | Playing CPU |
 |---|---|---|---|---|
@@ -232,7 +272,8 @@ Release exe: **10 034 176 bytes (9.57 MiB)**, PE32+ x86-64, system DLLs only.
 | Wine on Linux | 25 tracks | 84 MB (includes Wine) | 0.10 % of a core | 2.6 % of a core (mini-player, EQ on) |
 
 ¹ Measured on the Plexify build before the equaliser, Discord and the new UI; not re-measured
-yet.
+yet. The visualiser redraws at 30 frames a second while on and playing (it is off by default);
+its CPU cost has not been measured on the VM yet.
 
 The 100 000-track case is the stress case: the compact in-memory index plus the 24 MB SQLite
 cache push the *working set* past 100 MB, while private memory stays under it. A library of a
@@ -266,7 +307,7 @@ memory under Wine.
 ## Testing
 
 ```sh
-cargo test --workspace                                  # 97 tests: parsing, sync, audio, EQ, queue, ...
+cargo test --workspace                                  # 128 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, ...
 cargo test --workspace --target x86_64-pc-windows-gnu   # same suite under Wine
 semgrep scan --config p/default --metrics off crates     # 0 findings
 cargo clippy --workspace --all-targets -- -D warnings
@@ -276,9 +317,11 @@ The integration tests start an in-process mock server and cover the PIN flow, co
 racing with a dead connection, paging, full and delta sync with add/update/delete, offline
 reads, the queue and shuffle rules, radio with and without sonic data, similar artists from
 the related hubs, and the audio pipeline (gapless sample counts, crossfade length,
-ReplayGain application) with generated fixtures. Unit tests cover the equaliser (bit-exact
-bypass, band gain, drawn response) and the Discord IPC exchange against a fake Discord
-socket.
+ReplayGain application) with generated fixtures, playlist editing, downloads (full, resumed
+and failing) and casting to the mock's fake players. Unit tests cover the equaliser (bit-exact
+bypass, band gain, drawn response), the Discord IPC exchange against a fake Discord socket,
+the LRC parser, the visualiser's FFT, the cache schema migration, selection and the library
+filters.
 
 ## What is not verified
 
@@ -301,8 +344,15 @@ socket.
 - **Long-running behaviour** (hours of playback, cache eviction under real use, sleep/resume)
   is not covered.
 - **Queue restore while the server is unreachable.** A normal start resumes the saved queue, track
-  and position. If the app starts offline it opens the cached library without restoring the queue
-  (playback needs the server); the queue comes back on the next start once the server is reachable.
+  and position. If the app starts offline it opens the cached library without restoring the queue;
+  downloaded songs can be played, and the queue comes back on the next start once the server is
+  reachable.
+- **Endpoints taken from python-plexapi but not tried on a real server**: renaming a playlist
+  (`PUT /playlists/{id}?title=`), the lyrics stream content (`/library/streams/{id}`, text or
+  JSON is accepted) and the whole remote-control (cast) protocol. Not every player accepts
+  remote control, and Plexamp on the desktop may not show up as a target.
+- **Downloaded album art** lives in the normal image cache and can be evicted when it is full;
+  offline pages then show the placeholder art.
 
 ### Manual checklist for a real Plex account
 
@@ -328,7 +378,15 @@ socket.
 10. Search (`Ctrl+F`) for an artist with accents; check the results match the server.
 11. Start a radio from a track and from an artist (the Radio page opens); let a queue run out
     with autoplay on. Open an artist page and check *Fans also like*.
-12. Follow [Discord setup](#discord-setup) (the link in *Settings → Discord* opens it), then play a
+12. Create a playlist, add songs from three places (right-click, a selection, an album page),
+    reorder by dragging, remove one and rename it; check the result in Plex Web.
+13. Open the lyrics panel on a song with an `.lrc` file (or LyricFind lyrics with Plex Pass):
+    the lines should follow the music; click a line to jump.
+14. Download an album, switch the network off, restart the app and play it; switch the network
+    back on and check the play shows up in Plex.
+15. Open Plexamp or a Plex app on a phone, cast to it from the bar's cast button (then to two
+    players at once), pause/skip from Plexdio, and take the music back with *This computer*.
+16. Follow [Discord setup](#discord-setup) (the link in *Settings → Discord* opens it), then play a
     song and check your Discord status; pause and confirm it clears.
-13. Rate a track 5 stars and check it appears in Most played after a while; sign out and back in
+17. Rate a track 5 stars and check it appears in Most played after a while; sign out and back in
     to confirm the token is cleared and re-stored.

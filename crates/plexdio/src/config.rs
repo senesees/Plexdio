@@ -69,6 +69,10 @@ pub struct Config {
     pub library: crate::ui::views::library::LibraryPrefs,
     /// Interface zoom (1.0 = 100 %), 0.8..=1.5.
     pub zoom: f32,
+    /// Visualiser in the now-playing bar and the mini-player.
+    pub visualiser: crate::ui::visualiser::VisMode,
+    /// Download songs for offline listening only over a local (home network) connection.
+    pub downloads_lan_only: bool,
 }
 
 impl Default for Config {
@@ -102,6 +106,8 @@ impl Default for Config {
             window_size: None,
             library: Default::default(),
             zoom: 1.0,
+            visualiser: Default::default(),
+            downloads_lan_only: false,
         }
     }
 }
