@@ -89,7 +89,9 @@ Mini-player:
   edge, live redraw while resizing), tray icon with menu, minimise/close to tray, media keys
   (`RegisterHotKey`, plus the System Media Transport Controls media overlay with metadata,
   status and seek timeline), start with Windows, a compact always-on-top mini-player (no
-  title bar; drag it anywhere), and keyboard shortcuts (`Space`, arrows, `Ctrl+←/→`,
+  title bar; drag it anywhere), windows that come back on screen by themselves when a
+  resolution change, an unplugged monitor or waking from sleep strands them, and keyboard
+  shortcuts (`Space`, arrows, `Ctrl+←/→`,
   `Ctrl+↑/↓`, `Ctrl+M`, `Ctrl+F`).
 - **Settings**, as cards of rows with switches: streaming quality (original or a bitrate cap
   via the transcoder), crossfade, normalisation, autoplay, the equaliser, window behaviour,
@@ -169,6 +171,7 @@ real account.
 | Visualiser, zoom, track info | ✅ unit tests + Linux build screenshots |
 | Discord Rich Presence protocol | ✅ test against a fake Discord socket; Wine (no Discord → retries quietly) |
 | Themed title bar, mini-player, settings layout | ✅ Wine screenshots |
+| Off-screen window rescue (display change, sleep) | ✅ unit tests + Windows 11 VM (window pushed to 5000,5000 came back in 3 s) |
 | Settings persistence, tray, media keys, shortcuts | ✅ Wine |
 | SMTC overlay (metadata, status, timeline, buttons) | ✅ Windows 11 VM |
 | Real audio output | ❌ no audio device in Wine or the VM (null sink path) |
@@ -307,7 +310,7 @@ memory under Wine.
 ## Testing
 
 ```sh
-cargo test --workspace                                  # 128 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, ...
+cargo test --workspace                                  # 132 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, ...
 cargo test --workspace --target x86_64-pc-windows-gnu   # same suite under Wine
 semgrep scan --config p/default --metrics off crates     # 0 findings
 cargo clippy --workspace --all-targets -- -D warnings
