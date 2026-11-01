@@ -71,7 +71,25 @@ pub struct Note {
     /// 0 (left) ..= LANES - 1 (right).
     pub lane: u8,
     pub kind: NoteKind,
+    /// Seconds to hold after catching it (0 for an ordinary note).
+    #[serde(default)]
+    pub len: f32,
 }
+
+impl Note {
+    /// When the note is over: its time, or the end of its hold.
+    pub fn end(&self) -> f32 {
+        self.t + self.len
+    }
+
+    pub fn is_hold(&self) -> bool {
+        self.len > 0.0
+    }
+}
+
+/// Shortest and longest hold, in seconds.
+pub const HOLD_MIN: f32 = 0.45;
+pub const HOLD_MAX: f32 = 3.0;
 
 /// The road at one moment.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -147,6 +165,39 @@ impl Rng {
     fn below(&mut self, n: u32) -> u32 {
         (self.next() % n as u64) as u32
     }
+}
+
+/// Turn hold candidates into holds: the end goes on the half-beat grid (at least [`HOLD_MIN`],
+/// at most [`HOLD_MAX`]); notes inside a hold are dropped, unless clearly stronger, which cut
+/// the hold short instead. A hold too short to keep becomes an ordinary note.
+fn settle_holds(mut kept: Vec<(Note, f32)>, a: &Analysis, min_gap: f32) -> Vec<Note> {
+    let mut grid: Vec<f32> = a.beats.clone();
+    grid.extend(a.beats.windows(2).map(|w| (w[0] + w[1]) / 2.0));
+    grid.sort_by(f32::total_cmp);
+    let gap = min_gap.max(0.25);
+    let mut drop = vec![false; kept.len()];
+    for i in 0..kept.len() {
+        let (h, score) = kept[i];
+        if drop[i] || !h.is_hold() {
+            continue;
+        }
+        let raw_end = h.end().min(h.t + HOLD_MAX);
+        let mut end = grid.iter().rev().find(|&&g| g <= raw_end + 0.05 && g >= h.t + HOLD_MIN).copied().unwrap_or(h.t);
+        for (later, later_score) in kept[i + 1..].iter().take_while(|n| n.0.t < end + gap) {
+            if *later_score > score + 0.2 {
+                end = end.min(later.t - gap);
+                break;
+            }
+        }
+        if end - h.t < HOLD_MIN {
+            kept[i].0.len = 0.0;
+            continue;
+        }
+        kept[i].0.len = end - h.t;
+        let inside = kept[i + 1..].iter().take_while(|n| n.0.t < end + gap).count();
+        drop[i + 1..i + 1 + inside].iter_mut().for_each(|d| *d = true);
+    }
+    kept.into_iter().zip(drop).filter(|(_, d)| !d).map(|((n, _), _)| n).collect()
 }
 
 /// The most lanes a note may be from the previous one, `gap` seconds later.
@@ -252,13 +303,24 @@ fn place_notes(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<Note> {
         while oi < a.onsets.len() && a.onsets[oi].t < t - window {
             oi += 1;
         }
-        let mut best: Option<(u8, f32)> = None;
+        let mut best: Option<(u8, f32, f32)> = None;
         for o in a.onsets[oi..].iter().take_while(|o| o.t <= t + window) {
-            if best.is_none_or(|(_, s)| o.strength > s) {
-                best = Some((o.band, o.strength));
+            if best.is_none_or(|(_, s, _)| o.strength > s) {
+                best = Some((o.band, o.strength, o.t));
             }
         }
-        let Some((band, strength)) = best else { continue };
+        let Some((mut band, strength, _)) = best else { continue };
+        // Any onset here that starts a sustained sound makes this a hold note in that sound's band
+        // (a chord held over a kick is a hold, even if the kick is louder). Its end is settled
+        // below.
+        let mut len = 0.0;
+        for o in a.onsets[oi..].iter().take_while(|o| o.t <= t + window) {
+            if let Some(x) = a.sustains.iter().find(|x| x.band == o.band && (x.start - o.t).abs() < 0.05) {
+                band = o.band;
+                len = (x.end - t).max(0.0);
+                break;
+            }
+        }
         let intensity = a.intensity_at(t);
         let score = strength + bonus;
         if score < p.threshold - 0.25 * intensity {
@@ -274,24 +336,25 @@ fn place_notes(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<Note> {
         let phrase = a.downbeats.partition_point(|&d| d <= t + 1e-3) / 4;
         let lane = if phrase % 2 == 1 { LANES - 1 - lane } else { lane };
         let colour = ((0.7 * intensity + 0.3 * strength) * COLOURS as f32).clamp(0.0, (COLOURS - 1) as f32) as u8;
-        scored.push((Note { t, lane, kind: NoteKind::Colour(colour) }, score));
+        scored.push((Note { t, lane, kind: NoteKind::Colour(colour), len }, score));
     }
     // Strongest first, skipping any candidate too close to one already taken.
     scored.sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.t.total_cmp(&y.0.t)));
-    let mut notes: Vec<Note> = Vec::new(); // kept sorted by time
-    for (note, _) in scored {
-        let i = notes.partition_point(|n| n.t < note.t);
-        let clear_before = i == 0 || note.t - notes[i - 1].t >= p.min_gap;
-        let clear_after = i == notes.len() || notes[i].t - note.t >= p.min_gap;
+    let mut kept: Vec<(Note, f32)> = Vec::new(); // kept sorted by time
+    for (note, score) in scored {
+        let i = kept.partition_point(|n| n.0.t < note.t);
+        let clear_before = i == 0 || note.t - kept[i - 1].0.t >= p.min_gap;
+        let clear_after = i == kept.len() || kept[i].0.t - note.t >= p.min_gap;
         if clear_before && clear_after {
-            notes.insert(i, note);
+            kept.insert(i, (note, score));
         }
     }
+    let mut notes = settle_holds(kept, a, p.min_gap);
     // Quick successions move at most two lanes (one when very quick), towards where they were
     // going.
     for i in 1..notes.len() {
         let (prev, cur) = (notes[i - 1], notes[i]);
-        let max = max_jump(cur.t - prev.t);
+        let max = max_jump(cur.t - prev.end());
         if cur.lane.abs_diff(prev.lane) > max {
             notes[i].lane = if cur.lane > prev.lane { prev.lane + max } else { prev.lane - max };
         }
@@ -307,13 +370,14 @@ fn place_notes(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<Note> {
         if greys.last().is_some_and(|g| t - g.t < 0.4) {
             continue;
         }
-        let near: Vec<u8> = notes.iter().filter(|n| (n.t - t).abs() < 0.5).map(|n| n.lane).collect();
+        // Lanes in use around then, including the whole length of a hold.
+        let near: Vec<u8> = notes.iter().filter(|n| n.t - 0.5 < t && t < n.end() + 0.5).map(|n| n.lane).collect();
         let free: Vec<u8> = (0..LANES).filter(|l| !near.contains(l)).collect();
         if free.is_empty() {
             continue;
         }
         let lane = free[rng.below(free.len() as u32) as usize];
-        greys.push(Note { t, lane, kind: NoteKind::Grey });
+        greys.push(Note { t, lane, kind: NoteKind::Grey, len: 0.0 });
     }
     notes.extend(greys);
     notes.sort_by(|x, y| x.t.total_cmp(&y.t));
@@ -365,6 +429,37 @@ mod tests {
             let used: std::collections::HashSet<u8> = colour.iter().map(|n| n.lane).collect();
             assert!(used.len() >= 4, "{d:?}: notes only on lanes {used:?}");
         }
+    }
+
+    #[test]
+    fn held_sounds_become_holds_with_nothing_inside() {
+        use crate::game::analysis::tests::pads;
+        let (d, _) = drums(120.0, 30.0, 0.0);
+        // Chords start on a beat (the drums' beats are at 0.25 + k/2 s).
+        let (p, held) = pads(30.0);
+        let shift = (0.25 * crate::game::analysis::RATE as f32) as usize;
+        let p: Vec<f32> = std::iter::repeat_n(0.0, shift).chain(p).take(d.len()).collect();
+        let held: Vec<(f32, f32)> = held.iter().map(|&(s, e)| (s + 0.25, e + 0.25)).collect();
+        let mix: Vec<f32> = d.iter().zip(&p).map(|(a, b)| a * 0.6 + b * 1.6).collect();
+        let a = analyse(&mix, None);
+        assert!(!a.sustains.is_empty(), "the chords are sustains");
+        for diff in Difficulty::ALL {
+            let m = generate(&a, diff, 11);
+            let holds: Vec<&Note> = m.notes.iter().filter(|n| n.is_hold()).collect();
+            assert!(!holds.is_empty(), "{diff:?} has holds");
+            for h in &holds {
+                assert!(h.len >= HOLD_MIN - 1e-4 && h.len <= HOLD_MAX + 1e-4, "{diff:?}: hold of {} s", h.len);
+                assert!(held.iter().any(|&(s, e)| h.t >= s - 0.1 && h.end() <= e + 0.3), "{diff:?}: hold {}–{} is not on a held chord", h.t, h.end());
+                for n in &m.notes {
+                    if n.t > h.t && n.t < h.end() {
+                        assert!(n.kind == NoteKind::Grey && n.lane != h.lane, "{diff:?}: {n:?} inside the hold at {}", h.t);
+                    }
+                }
+            }
+        }
+        // Pure drums: no holds.
+        let plain = generate(&analyse(&d, None), Difficulty::Elite, 11);
+        assert!(plain.notes.iter().all(|n| !n.is_hold()));
     }
 
     #[test]

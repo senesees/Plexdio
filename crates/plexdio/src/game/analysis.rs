@@ -21,7 +21,7 @@ const WIN: usize = 1024;
 /// Samples per second of the stored intensity curve.
 pub const INTENSITY_HZ: f32 = 10.0;
 /// Bump when the analysis changes, so cached results are rebuilt.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Frames are centred on their time, so a hit already shows in the frame before it: onsets and
 /// beats are moved this much later (measured against real songs).
 const LAG: f32 = 0.02;
@@ -41,6 +41,16 @@ pub struct Onset {
     /// 0..=1 in steps of 0.01, relative to the song's own loud onsets.
     #[serde(rename = "s")]
     pub strength: f32,
+}
+
+/// A sustained sound: an onset whose band stays loud afterwards (a held chord, synth or vocal
+/// note), the source of hold notes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Sustain {
+    pub start: f32,
+    pub end: f32,
+    /// 0 bass, 1 mids, 2 highs.
+    pub band: u8,
 }
 
 /// A stretch of the song with a similar sound (intro, verse, chorus, drop…).
@@ -76,6 +86,9 @@ pub struct Analysis {
     /// Loudness and activity, 0..=1, at [`INTENSITY_HZ`].
     pub intensity: Vec<f32>,
     pub sections: Vec<Section>,
+    /// Sustained sounds, sorted by start.
+    #[serde(default)]
+    pub sustains: Vec<Sustain>,
     /// Model beats were used.
     pub ai: bool,
 }
@@ -209,11 +222,14 @@ fn percentile(v: &[f32], q: f32) -> f32 {
 fn pick_onsets(flux: &[f32], band: u8, out: &mut Vec<Onset>) {
     let norm = percentile(flux, 0.95).max(1e-6);
     let n: Vec<f32> = flux.iter().map(|v| v / norm).collect();
+    // In sparse music (held chords, no drums) the typical level is tiny and the ripple of a
+    // steady tone would pass as onsets: also require 5 % of the band's loudest attack.
+    let floor = 0.05 * flux.iter().cloned().fold(0.0, f32::max) / norm;
     let mean = smooth(&n, 25);
     let mut last: Option<usize> = None;
     for i in 1..n.len().saturating_sub(1) {
         let v = n[i];
-        if v < 0.2 || v < mean[i] + 0.12 {
+        if v < 0.2 || v < floor || v < mean[i] + 0.12 {
             continue;
         }
         let lo = i.saturating_sub(3);
@@ -431,8 +447,57 @@ pub fn analyse(samples: &[f32], ai: Option<&AiBeats>) -> Analysis {
     let intensity: Vec<f32> = per_frame.iter().step_by(step).map(|v| (v * 1000.0).round() / 1000.0).collect();
 
     let sections = find_sections(&f, &intensity, &downbeats, duration);
+    let sustains = find_sustains(&f, &onsets);
 
-    Analysis { version: VERSION, duration, bpm, beats, downbeats, onsets, intensity, sections, ai: ai.is_some() }
+    Analysis { version: VERSION, duration, bpm, beats, downbeats, onsets, intensity, sections, sustains, ai: ai.is_some() }
+}
+
+/// Shortest and longest sustain, in seconds.
+const SUSTAIN_MIN: f32 = 0.5;
+const SUSTAIN_MAX: f32 = 4.0;
+
+/// Sustains: after a clear onset, the band's energy stays within 45 % (of its range above the
+/// band's quiet floor) of the onset's peak, with no new strong attack in that band (softer ones,
+/// other instruments in a full mix, don't count). Drums decay
+/// within a tenth of a second and never qualify; pads, held synths and sung notes do.
+fn find_sustains(f: &Features, onsets: &[Onset]) -> Vec<Sustain> {
+    let mut out = Vec::new();
+    for b in 0..3u8 {
+        let e = smooth(&f.energy[b as usize], 2);
+        let n = e.len();
+        if n == 0 {
+            continue;
+        }
+        let floor = percentile(&e, 0.1);
+        let range = (percentile(&e, 0.95) - floor).max(1e-3);
+        let band: Vec<&Onset> = onsets.iter().filter(|o| o.band == b).collect();
+        let mut busy_until = 0.0f32;
+        for (k, o) in band.iter().enumerate() {
+            if o.strength < 0.25 || o.t < busy_until {
+                continue;
+            }
+            let i = (((o.t - LAG) * FPS).round() as usize).min(n - 1);
+            let peak = e[i..(i + 4).min(n)].iter().cloned().fold(f32::MIN, f32::max);
+            if (peak - floor) / range < 0.35 {
+                continue; // too quiet to carry a hold
+            }
+            // Ends at the next strong attack in the band, or the cap.
+            let next = band[k + 1..].iter().find(|p| p.strength >= 0.6).map_or(n, |p| (((p.t - LAG) * FPS) as usize).min(n));
+            let limit = next.min(i + (SUSTAIN_MAX * FPS) as usize);
+            let keep = peak - 0.45 * (peak - floor);
+            let mut j = (i + 2).min(limit);
+            while j < limit && e[j] >= keep {
+                j += 1;
+            }
+            let len = (j - i) as f32 / FPS;
+            if len >= SUSTAIN_MIN {
+                out.push(Sustain { start: o.t, end: o.t + len, band: b });
+                busy_until = o.t + len;
+            }
+        }
+    }
+    out.sort_by(|a, b| a.start.total_cmp(&b.start));
+    out
 }
 
 /// Section boundaries where the sound changes: the distance between the mean features of the 6 s
@@ -591,6 +656,42 @@ pub(crate) mod tests {
         assert!(a.sections[0].intensity < a.sections[1].intensity);
         assert!(a.intensity_at(10.0) < a.intensity_at(35.0));
         assert_eq!(a.section_at(30.0), 1);
+    }
+
+    /// Held chords: a two-second tone every three seconds, with a soft attack-free gap between.
+    pub(crate) fn pads(seconds: f32) -> (Vec<f32>, Vec<(f32, f32)>) {
+        let n = (seconds * RATE as f32) as usize;
+        let mut out = vec![0.0f32; n];
+        let mut held = Vec::new();
+        let mut t = 1.0;
+        while t + 2.0 < seconds {
+            let s0 = (t * RATE as f32) as usize;
+            for i in 0..(2.0 * RATE as f32) as usize {
+                let tt = i as f32 / RATE as f32;
+                let env = (tt / 0.01).min(1.0) * ((2.0 - tt) / 0.05).min(1.0);
+                let x: f32 = [330.0f32, 415.0, 495.0].iter().map(|f| (std::f32::consts::TAU * f * tt).sin()).sum::<f32>() * 0.15;
+                if let Some(o) = out.get_mut(s0 + i) {
+                    *o += x * env;
+                }
+            }
+            held.push((t, t + 2.0));
+            t += 3.0;
+        }
+        (out, held)
+    }
+
+    #[test]
+    fn held_chords_are_sustains_and_drums_are_not() {
+        let (song, held) = pads(20.0);
+        let a = analyse(&song, None);
+        for &(s, e) in &held {
+            let found = a.sustains.iter().find(|x| (x.start - s).abs() < 0.08);
+            let x = found.unwrap_or_else(|| panic!("no sustain at {s}: {:?}", a.sustains));
+            assert!((x.end - e).abs() < 0.35, "sustain {x:?} should end near {e}");
+        }
+        let (drums, _) = drums(120.0, 20.0, 0.0);
+        let d = analyse(&drums, None);
+        assert!(d.sustains.is_empty(), "drums have no sustains: {:?}", d.sustains);
     }
 
     #[test]

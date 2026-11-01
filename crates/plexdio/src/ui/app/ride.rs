@@ -487,16 +487,29 @@ impl PlexdioApp {
                 }
                 // "+points" rising from the craft for each catch.
                 let t = s.clock.now() as f32 - self.config.ride.delay_ms as f32 / 1000.0;
+                use crate::game::play::Event;
+                let colour_of = |c: u8| {
+                    let [r, g, b] = crate::game::render::PALETTE[c as usize].map(|v| (v.min(1.0) * 255.0) as u8);
+                    Color32::from_rgb(r, g, b)
+                };
+                let craft_x = rect.center().x + ride.x * rect.width() * 0.17;
                 for e in &ride.events {
-                    if let crate::game::play::Event::Caught { t: te, colour, points, .. } = *e {
-                        let age = t - te;
-                        if (0.0..0.7).contains(&age) {
-                            let a = 1.0 - age / 0.7;
-                            let x = rect.center().x + ride.x * rect.width() * 0.17;
-                            let y = rect.top() + rect.height() * 0.6 - age * 90.0;
-                            let [r, g, b] = crate::game::render::PALETTE[colour as usize].map(|v| (v.min(1.0) * 255.0) as u8);
-                            text(egui::pos2(x, y), Align2::CENTER_CENTER, &format!("+{points}"), 16.0 + age * 10.0, Color32::from_rgb(r, g, b).gamma_multiply(a));
-                        }
+                    let (te, colour, label, size) = match *e {
+                        Event::Caught { t, colour, points, .. } => (t, colour, format!("+{points}"), 16.0),
+                        Event::HoldDone { t, colour, points, .. } => (t, colour, format!("Hold +{points}"), 22.0),
+                        _ => continue,
+                    };
+                    let age = t - te;
+                    if (0.0..0.7).contains(&age) {
+                        let a = 1.0 - age / 0.7;
+                        let y = rect.top() + rect.height() * 0.6 - age * 90.0;
+                        text(egui::pos2(craft_x, y), Align2::CENTER_CENTER, &label, size + age * 10.0, colour_of(colour).gamma_multiply(a));
+                    }
+                }
+                // A hold being ridden counts up above the craft.
+                if let Some(h) = ride.holding {
+                    if let crate::game::mapgen::NoteKind::Colour(c) = ride.map.notes[h.i].kind {
+                        text(egui::pos2(craft_x, rect.top() + rect.height() * 0.52), Align2::CENTER_CENTER, &format!("+{}", h.earned), 18.0, colour_of(c));
                     }
                 }
             }

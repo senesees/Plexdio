@@ -2,8 +2,8 @@
 //! road in 3D with a chase camera, the notes as glowing blocks, the craft and hit bursts. Flat
 //! shading and painter's order, PS1 style, all on the CPU.
 
-use super::mapgen::{Map, NoteKind, COLOURS, LANES, ROAD_HZ};
-use super::play::{lane_x, Event, Ride};
+use super::mapgen::{Map, NoteKind, COLOURS, HOLD_MAX, LANES, ROAD_HZ};
+use super::play::{lane_x, Event, NoteState, Ride};
 use crate::ui::retrovis::canvas::{Canvas, Rgb};
 use crate::ui::retrovis::math3d::{v3, Camera, V3};
 use serde::{Deserialize, Serialize};
@@ -170,22 +170,56 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
     out.polyline(&edges_r, tint, edge, 2.0, false);
 
     // Notes, far to near: everything ahead, plus missed notes until they are behind the camera
-    // (caught ones are gone).
-    let from = ride.next_note().min(map.notes.partition_point(|n| map.distance_at(n.t) < d_ship - CAM_BACK + 1.0));
-    let visible: Vec<usize> = (from..map.notes.len()).take_while(|&i| map.distance_at(map.notes[i].t) < d_ship + AHEAD).filter(|&i| !ride.collected(i)).collect();
+    // (caught ones are gone). A hold whose head has passed still shows while its tail is ahead.
+    let near = d_ship - CAM_BACK + 1.0;
+    let from = ride.next_note().min(map.notes.partition_point(|n| n.t < t - HOLD_MAX - 1.0));
+    let visible: Vec<usize> = (from..map.notes.len())
+        .take_while(|&i| map.distance_at(map.notes[i].t) < d_ship + AHEAD)
+        .filter(|&i| map.distance_at(map.notes[i].end()) >= near)
+        .collect();
+    // Hold ribbons lie on the road, under every block.
     for &i in visible.iter().rev() {
         let n = map.notes[i];
-        let d = map.distance_at(n.t);
-        let f = geom.at(d);
-        let centre = f.pos.add(f.right().mul(lane_x(n.lane) * STEER_M));
+        let NoteKind::Colour(c) = n.kind else { continue };
+        if !n.is_hold() {
+            continue;
+        }
+        let (from_t, light) = match ride.state(i) {
+            NoteState::Pending => (n.t, 1.0),
+            NoteState::Holding => (ride.consumed(i), 1.5 + 0.5 * (t * 18.0).sin()),
+            NoteState::Missed => (n.t, 0.35),
+            NoteState::Broken => (ride.consumed(i), 0.35),
+            _ => continue,
+        };
+        ribbon(out, &view, geom, map.distance_at(from_t).max(near), map.distance_at(n.end()), lane_x(n.lane) * STEER_M, PALETTE[c as usize], light, d_ship);
+    }
+    for &i in visible.iter().rev() {
+        let n = map.notes[i];
+        let state = ride.state(i);
         let (c, grey) = match n.kind {
             NoteKind::Colour(c) => (PALETTE[c as usize], false),
             NoteKind::Grey => (GREY, true),
         };
-        let far = ((d - d_ship) / AHEAD).clamp(0.0, 1.0);
-        // Missed notes dim as they go past.
-        let light = if d < d_ship { 0.45 } else { 1.0 - far * 0.6 };
-        draw_block(out, &view, centre, f, c, light, grey);
+        // The head, unless caught (or hit).
+        let d = map.distance_at(n.t);
+        if matches!(state, NoteState::Pending | NoteState::Missed) && d >= near {
+            let f = geom.at(d);
+            let centre = f.pos.add(f.right().mul(lane_x(n.lane) * STEER_M));
+            let far = ((d - d_ship) / AHEAD).clamp(0.0, 1.0);
+            // Missed notes dim as they go past.
+            let light = if d < d_ship || state == NoteState::Missed { 0.45 } else { 1.0 - far * 0.6 };
+            draw_block(out, &view, centre, f, c, light, grey, 1.0);
+        }
+        // A hold's tail: a low cap where it ends.
+        if n.is_hold() && !matches!(state, NoteState::Held) {
+            let d = map.distance_at(n.end());
+            if d >= near && d < d_ship + AHEAD {
+                let f = geom.at(d);
+                let centre = f.pos.add(f.right().mul(lane_x(n.lane) * STEER_M));
+                let light = if matches!(state, NoteState::Missed | NoteState::Broken) { 0.4 } else { 1.0 - ((d - d_ship) / AHEAD).clamp(0.0, 1.0) * 0.6 };
+                draw_block(out, &view, centre, f, c, light, false, 0.45);
+            }
+        }
     }
 
     // Hit effects travel with the craft (a burst left where the note was would fall behind the
@@ -211,11 +245,63 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
                     out.wash([1.0, 0.1, 0.05], k);
                 }
             }
-            Event::Missed { .. } => {}
+            Event::HoldDone { t: te, lane, colour, .. } => {
+                let age = t - te;
+                if (0.0..BURST).contains(&age) {
+                    let at = fx.pos.add(fx.right().mul(lane_x(lane) * STEER_M)).add(v3(0.0, 0.6, 0.0));
+                    burst(out, &view, at, fx, age, PALETTE[colour as usize], te + 0.5, 1.5);
+                }
+            }
+            Event::Missed { .. } | Event::HoldBroken { .. } => {}
+        }
+    }
+    // While holding: sparks stream back from the craft along the ribbon.
+    if let Some(h) = ride.holding {
+        if let NoteKind::Colour(c) = map.notes[h.i].kind {
+            let col = PALETTE[c as usize];
+            let fwd = v3(ship.heading.sin(), 0.0, ship.heading.cos());
+            for k in 0..10 {
+                let phase = (t * 3.0 + k as f32 * 0.137).fract();
+                let side = ((k as f32 * 2.39).sin()) * 0.7;
+                let p = ship_pos.add(fwd.mul(-0.5 - phase * 5.0)).add(ship.right().mul(side * (0.3 + phase))).add(v3(0.0, 0.3 + phase * 1.4, 0.0));
+                if let Some((x, y, _)) = view.project(p) {
+                    out.glow(x, y, 2.2 * (1.0 - phase) + 0.8, col, 1.3 * (1.0 - phase));
+                }
+            }
+            if let Some((x, y, z)) = view.project(ship_pos.add(v3(0.0, 0.2, 0.0))) {
+                out.glow(x, y, 26.0 / z.max(1.0), col, 0.6);
+            }
         }
     }
 
     draw_craft(out, &view, ship, ship_pos, ride.vx, tint, craft, t);
+}
+
+/// A hold's ribbon from `d0` to `d1` metres, `off` metres across the road: a glowing strip in
+/// its note's colour, far parts first.
+#[allow(clippy::too_many_arguments)]
+fn ribbon(out: &mut Canvas, view: &View, geom: &RoadGeom, d0: f32, d1: f32, off: f32, c: Rgb, light: f32, d_ship: f32) {
+    if d1 <= d0 {
+        return;
+    }
+    let steps = ((d1 - d0) / SEG).ceil().max(1.0) as usize;
+    let half = 0.55;
+    let lift = v3(0.0, 0.06, 0.0);
+    let edge = |d: f32, side: f32| {
+        let f = geom.at(d);
+        view.project(f.pos.add(f.right().mul(off + side)).add(lift))
+    };
+    for k in (0..steps).rev() {
+        let (a, b) = (d0 + (d1 - d0) * k as f32 / steps as f32, d0 + (d1 - d0) * (k + 1) as f32 / steps as f32);
+        let (Some(p0), Some(p1), Some(p2), Some(p3)) = (edge(a, -half), edge(a, half), edge(b, half), edge(b, -half)) else { continue };
+        let fog = 1.0 - (((a - d_ship) / AHEAD).clamp(0.0, 1.0)).powi(2);
+        let k = light * fog;
+        let fill = [c[0] * 0.55 * k, c[1] * 0.55 * k, c[2] * 0.55 * k];
+        out.tri_flat([(p0.0, p0.1), (p1.0, p1.1), (p2.0, p2.1)], fill, 0.9);
+        out.tri_flat([(p0.0, p0.1), (p2.0, p2.1), (p3.0, p3.1)], fill, 0.9);
+        out.line(p0.0, p0.1, p3.0, p3.1, c, 0.9 * k, 1.0);
+        out.line(p1.0, p1.1, p2.0, p2.1, c, 0.9 * k, 1.0);
+    }
 }
 
 /// A hit: a flash, sparks flying out and falling, and a shockwave ring on the road. `seed`
@@ -285,8 +371,10 @@ fn intensity_colour(v: f32) -> Rgb {
 }
 
 /// A note block: a box sitting on the road, flat-shaded, with a glow (greys don't glow).
-fn draw_block(out: &mut Canvas, view: &View, centre: V3, f: Frame, c: Rgb, light: f32, grey: bool) {
-    let (w, h, l) = (1.6, if grey { 1.8 } else { 1.0 }, 1.5);
+/// `height` scales the block (a hold's tail cap is low).
+#[allow(clippy::too_many_arguments)]
+fn draw_block(out: &mut Canvas, view: &View, centre: V3, f: Frame, c: Rgb, light: f32, grey: bool, height: f32) {
+    let (w, h, l) = (1.6, if grey { 1.8 } else { 1.0 } * height, 1.5);
     let r = f.right();
     let fwd = v3(f.heading.sin(), 0.0, f.heading.cos());
     let up = v3(0.0, 1.0, 0.0);

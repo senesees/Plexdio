@@ -84,13 +84,23 @@ fn main() {
             a.onsets.iter().filter(|o| o.band == 2).count(),
             a.sections.len()
         );
-        println!("    analysis as JSON: {} KB", serde_json::to_string(&a).map_or(0, |j| j.len()) / 1024);
+        println!("    analysis as JSON: {} KB; {} sustains", serde_json::to_string(&a).map_or(0, |j| j.len()) / 1024, a.sustains.len());
         for s in &a.sections {
             println!("    section {:6.1}–{:6.1} s, intensity {:.2}", s.start, s.end, s.intensity);
         }
         for m in &maps {
             let greys = m.notes.len() - m.colour_notes();
-            println!("    {:6}: {} notes ({:.1}/s), {} greys, {:.0} m", m.difficulty.label(), m.colour_notes(), m.colour_notes() as f32 / a.duration.max(1.0), greys, m.distance_at(a.duration));
+            let holds: Vec<f32> = m.notes.iter().filter(|n| n.is_hold()).map(|n| n.len).collect();
+            println!(
+                "    {:6}: {} notes ({:.1}/s), {} holds ({:.1} s held in all), {} greys, {:.0} m",
+                m.difficulty.label(),
+                m.colour_notes(),
+                m.colour_notes() as f32 / a.duration.max(1.0),
+                holds.len(),
+                holds.iter().sum::<f32>(),
+                greys,
+                m.distance_at(a.duration)
+            );
         }
         let png = out.join(format!("{name}.png"));
         timeline(&a, &maps).save(&png).expect("write png");
@@ -167,7 +177,8 @@ fn timeline(a: &Analysis, maps: &[Map]) -> image::RgbImage {
                 NoteKind::Colour(c) => PALETTE[c as usize],
                 NoteKind::Grey => [120, 120, 120],
             };
-            rect(&mut img, x - 1, y0 + top + n.lane as i32 * (18 / LANES as i32), 3, 5, c);
+            let len = (n.len * PX_PER_S) as i32;
+            rect(&mut img, x - 1, y0 + top + n.lane as i32 * (18 / LANES as i32), 3 + len, 3, c);
         }
     }
     img
@@ -263,14 +274,20 @@ fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
     while t < duration && shot < shots.len() {
         t += dt;
         // Autopilot: head for the next coloured note's lane.
-        let target = ride.map.notes[ride.next_note()..].iter().find(|n| matches!(n.kind, NoteKind::Colour(_))).map_or(0.0, |n| lane_x(n.lane));
+        // (Ride a hold out before heading for the next note.)
+        let target = match ride.holding {
+            Some(h) => lane_x(ride.map.notes[h.i].lane),
+            None => ride.map.notes[ride.next_note()..].iter().find(|n| matches!(n.kind, NoteKind::Colour(_))).map_or(0.0, |n| lane_x(n.lane)),
+        };
         ride.update(t, Input { pointer: Some(target / 2.4 + 0.5), ..Default::default() }, dt);
         let s0 = ((t * RATE as f32) as usize).min(samples.len());
         let audio = &samples[s0.saturating_sub(2048)..s0];
         vis.frame(Some((audio, RATE)), true, dt, w as f32 / h as f32);
         // Grab each shot just after a catch, so the hit effects show.
         let just_caught = ride.events.iter().any(|e| matches!(e, plexdio::game::play::Event::Caught { t: te, .. } if (0.08..0.2).contains(&(t - te))));
-        if t >= shots[shot] && just_caught {
+        // Every other shot is taken mid-hold, to show the ribbons.
+        let want = if shot % 2 == 1 { ride.holding.is_some_and(|h| t - ride.map.notes[h.i].t > 0.2) } else { just_caught };
+        if t >= shots[shot] && want {
             let clock = Instant::now();
             let craft = Craft::ALL[shot % Craft::ALL.len()];
             draw(&mut out, vis.canvas(), &ride, &geom, t, craft);

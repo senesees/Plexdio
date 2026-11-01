@@ -1,5 +1,5 @@
 //! A ride in progress: where the craft is across the road, which notes were caught or missed,
-//! score, combo and multiplier. Time always comes from the song (see [`super::clock`]); nothing
+//! holds being ridden, score, combo and multiplier. Time always comes from the song (see [`super::clock`]); nothing
 //! here can stop or slow the music.
 
 use super::mapgen::{Map, NoteKind, COLOURS, LANES};
@@ -19,6 +19,28 @@ pub const RUN_UP: f32 = 2.0;
 const POINTS: [u32; COLOURS as usize] = [10, 20, 40, 70, 100];
 /// Points lost on a grey block (never below zero).
 const GREY_PENALTY: u32 = 50;
+/// While holding, the craft may drift this far from the lane (a little more than [`CATCH`]).
+const HOLD_STAY: f32 = 0.26;
+/// A hold pays a tenth of its note's points for every tenth of a second, and its note's points
+/// again for riding it to the end.
+const TICK: f32 = 0.1;
+
+/// Where a note is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteState {
+    /// Still ahead (or reached without being judged, in a run-up or a seek).
+    Pending,
+    Caught,
+    Missed,
+    /// A grey that was hit.
+    GreyHit,
+    /// A hold being ridden right now.
+    Holding,
+    /// A hold ridden to the end.
+    Held,
+    /// A hold left early.
+    Broken,
+}
 
 /// Steering input for one frame.
 #[derive(Debug, Clone, Copy, Default)]
@@ -35,6 +57,20 @@ pub enum Event {
     Caught { t: f32, lane: u8, colour: u8, points: u32 },
     Missed { t: f32, lane: u8 },
     Grey { t: f32, lane: u8 },
+    /// A hold ridden to its end; `points` is everything it paid.
+    HoldDone { t: f32, lane: u8, colour: u8, points: u32 },
+    HoldBroken { t: f32, lane: u8 },
+}
+
+/// The hold being ridden.
+#[derive(Debug, Clone, Copy)]
+pub struct Holding {
+    /// Its note.
+    pub i: usize,
+    /// Paid up to this song time.
+    ticked_to: f32,
+    /// Points it has paid so far (head included).
+    pub earned: u32,
 }
 
 pub struct Ride {
@@ -57,17 +93,39 @@ pub struct Ride {
     last_t: f32,
     /// Recent events (the renderer draws bursts for a moment).
     pub events: Vec<Event>,
-    /// Per note: caught (or a grey that was hit), so it is gone from the road. Missed notes stay
-    /// and fly past.
-    collected: Vec<bool>,
+    /// Per note: where it is in its life.
+    states: Vec<NoteState>,
+    /// Per note (holds): song time up to which its ribbon has been ridden away.
+    consumed: Vec<f32>,
+    /// The hold being ridden, if any.
+    pub holding: Option<Holding>,
 }
 
 impl Ride {
     /// Start riding `map` at song time `t` (mid-song is fine).
     pub fn new(map: Map, t: f32) -> Self {
         let next = map.notes.partition_point(|n| n.t < t + RUN_UP);
-        let collected = vec![false; map.notes.len()];
-        Ride { map, x: 0.0, target: 0.0, vx: 0.0, score: 0, combo: 0, best_combo: 0, caught: 0, missed: 0, greys: 0, next, start: t, last_t: t, events: Vec::new(), collected }
+        let n = map.notes.len();
+        let consumed = map.notes.iter().map(|n| n.t).collect();
+        Ride {
+            map,
+            x: 0.0,
+            target: 0.0,
+            vx: 0.0,
+            score: 0,
+            combo: 0,
+            best_combo: 0,
+            caught: 0,
+            missed: 0,
+            greys: 0,
+            next,
+            start: t,
+            last_t: t,
+            events: Vec::new(),
+            states: vec![NoteState::Pending; n],
+            consumed,
+            holding: None,
+        }
     }
 
     /// Score multiplier from the current combo: ×2 at 10, ×3 at 25, ×4 at 50.
@@ -100,9 +158,50 @@ impl Ride {
         self.next
     }
 
-    /// Note `i` was caught (or hit, for a grey) and is no longer on the road.
-    pub fn collected(&self, i: usize) -> bool {
-        self.collected.get(i).copied().unwrap_or(false)
+    pub fn state(&self, i: usize) -> NoteState {
+        self.states.get(i).copied().unwrap_or(NoteState::Pending)
+    }
+
+    /// Song time up to which hold `i`'s ribbon has been ridden away (its start if not).
+    pub fn consumed(&self, i: usize) -> f32 {
+        self.consumed.get(i).copied().unwrap_or(0.0)
+    }
+
+    /// Pay out the hold being ridden up to `t`, or end it (done, or left).
+    fn ride_hold(&mut self, t: f32) {
+        let Some(mut h) = self.holding else { return };
+        let n = self.map.notes[h.i];
+        let NoteKind::Colour(c) = n.kind else {
+            self.holding = None;
+            return;
+        };
+        let upto = t.min(n.end());
+        if (self.x - lane_x(n.lane)).abs() > HOLD_STAY {
+            self.states[h.i] = NoteState::Broken;
+            self.consumed[h.i] = upto;
+            self.events.push(Event::HoldBroken { t: upto, lane: n.lane });
+            self.holding = None;
+            return;
+        }
+        let tick = (POINTS[c as usize] / 10).max(1) * self.multiplier();
+        while h.ticked_to + TICK <= upto + 1e-4 {
+            h.ticked_to += TICK;
+            h.earned += tick;
+            self.score += tick as u64;
+        }
+        self.consumed[h.i] = upto;
+        if t >= n.end() {
+            let bonus = POINTS[c as usize] * self.multiplier();
+            h.earned += bonus;
+            self.score += bonus as u64;
+            self.combo += 1;
+            self.best_combo = self.best_combo.max(self.combo);
+            self.states[h.i] = NoteState::Held;
+            self.events.push(Event::HoldDone { t: n.end(), lane: n.lane, colour: c, points: h.earned });
+            self.holding = None;
+        } else {
+            self.holding = Some(h);
+        }
     }
 
     /// Advance to song time `t`, steering with `input` over `dt` seconds of frame time.
@@ -119,12 +218,17 @@ impl Ride {
         self.x += (self.target - self.x) * (1.0 - (-18.0 * dt).exp());
         self.vx = if dt > 0.0 { (self.x - old) / dt } else { 0.0 };
 
-        // A seek or a long stall: skip what was jumped over without judging it.
+        // A seek or a long stall: skip what was jumped over without judging it (a hold being
+        // ridden ends there, unpaid).
         if t < self.last_t - 0.3 || t > self.last_t + 1.0 {
             self.next = self.map.notes.partition_point(|n| n.t < t + 0.5);
+            if let Some(h) = self.holding.take() {
+                self.states[h.i] = NoteState::Broken;
+            }
         }
         self.last_t = t;
         self.events.retain(|e| t - event_t(e) < 1.0 && event_t(e) <= t + 0.1);
+        self.ride_hold(t);
 
         while let Some(n) = self.map.notes.get(self.next).copied() {
             if n.t > t {
@@ -140,19 +244,26 @@ impl Ride {
                     self.best_combo = self.best_combo.max(self.combo);
                     self.caught += 1;
                     self.score += points as u64;
-                    self.collected[i] = true;
                     self.events.push(Event::Caught { t: n.t, lane: n.lane, colour: c, points });
+                    if n.is_hold() {
+                        self.states[i] = NoteState::Holding;
+                        self.holding = Some(Holding { i, ticked_to: n.t, earned: points });
+                        self.ride_hold(t);
+                    } else {
+                        self.states[i] = NoteState::Caught;
+                    }
                 }
                 NoteKind::Colour(_) => {
                     self.combo = 0;
                     self.missed += 1;
+                    self.states[i] = NoteState::Missed;
                     self.events.push(Event::Missed { t: n.t, lane: n.lane });
                 }
                 NoteKind::Grey if close => {
                     self.combo = 0;
                     self.greys += 1;
                     self.score = self.score.saturating_sub(GREY_PENALTY as u64);
-                    self.collected[i] = true;
+                    self.states[i] = NoteState::GreyHit;
                     self.events.push(Event::Grey { t: n.t, lane: n.lane });
                 }
                 NoteKind::Grey => {}
@@ -163,7 +274,7 @@ impl Ride {
 
 fn event_t(e: &Event) -> f32 {
     match *e {
-        Event::Caught { t, .. } | Event::Missed { t, .. } | Event::Grey { t, .. } => t,
+        Event::Caught { t, .. } | Event::Missed { t, .. } | Event::Grey { t, .. } | Event::HoldDone { t, .. } | Event::HoldBroken { t, .. } => t,
     }
 }
 
@@ -177,7 +288,7 @@ mod tests {
     }
 
     fn note(t: f32, lane: u8, kind: NoteKind) -> Note {
-        Note { t, lane, kind }
+        Note { t, lane, kind, len: 0.0 }
     }
 
     /// Ride from 0 to `until` at 60 fps, pointing at `lane` the whole time.
@@ -209,7 +320,7 @@ mod tests {
         ride_on_lane(&mut r, 0.0, 6.5, 4);
         // The neighbouring lane is missed: the lanes don't overlap.
         assert_eq!((r.caught, r.missed, r.greys, r.combo), (2, 1, 1, 0));
-        assert!(r.collected(0) && r.collected(1) && !r.collected(2) && r.collected(3), "caught and hit notes leave the road; missed ones stay");
+        assert_eq!([r.state(0), r.state(1), r.state(2), r.state(3)], [NoteState::Caught, NoteState::Caught, NoteState::Missed, NoteState::GreyHit]);
         assert_eq!(r.score, 0, "20 points minus the grey's 50 stays at zero");
         assert!(r.events.iter().any(|e| matches!(e, Event::Grey { .. })));
     }
@@ -227,6 +338,45 @@ mod tests {
         // Judging resumes half a second past the jump: 46 and 47 count.
         ride_on_lane(&mut r, 44.6, 47.5, 1);
         assert_eq!(r.caught, 4);
+    }
+
+    fn hold(t: f32, lane: u8, len: f32) -> Note {
+        Note { t, lane, kind: NoteKind::Colour(4), len }
+    }
+
+    #[test]
+    fn a_hold_ridden_to_the_end_pays_as_it_goes_and_a_bonus() {
+        let mut r = Ride::new(map(vec![hold(3.0, 2, 1.0)]), 0.0);
+        ride_on_lane(&mut r, 0.0, 3.5, 2);
+        assert_eq!(r.state(0), NoteState::Holding);
+        assert!(r.holding.is_some() && (r.consumed(0) - 3.5).abs() < 0.02, "ribbon ridden to {}", r.consumed(0));
+        let mid = r.score;
+        assert!(mid > 100, "head plus ticks so far: {mid}");
+        ride_on_lane(&mut r, 3.5, 4.5, 2);
+        assert_eq!(r.state(0), NoteState::Held);
+        assert!(r.holding.is_none());
+        // Head 100, ten ticks of 10, bonus 100.
+        assert_eq!(r.score, 300);
+        assert_eq!((r.caught, r.combo), (1, 2), "the head and the finished hold both count for the combo");
+        assert!(r.events.iter().any(|e| matches!(e, Event::HoldDone { points: 300, .. })));
+    }
+
+    #[test]
+    fn leaving_a_hold_breaks_it_without_breaking_the_combo() {
+        let mut r = Ride::new(map(vec![hold(3.0, 2, 2.0), note(6.0, 2, NoteKind::Colour(4))]), 0.0);
+        ride_on_lane(&mut r, 0.0, 3.6, 2);
+        let before = r.score;
+        ride_on_lane(&mut r, 3.6, 4.0, 0);
+        assert_eq!(r.state(0), NoteState::Broken);
+        assert!(r.score < before + 60, "no more pay once off the lane");
+        assert!(r.consumed(0) > 3.5 && r.consumed(0) < 4.0);
+        assert_eq!(r.combo, 1);
+        ride_on_lane(&mut r, 4.0, 6.5, 2);
+        assert_eq!(r.combo, 2);
+        // Missing a hold's head is an ordinary miss; nothing is paid.
+        let mut m = Ride::new(map(vec![hold(3.0, 0, 1.0)]), 0.0);
+        ride_on_lane(&mut m, 0.0, 4.5, 4);
+        assert_eq!((m.state(0), m.score, m.missed), (NoteState::Missed, 0, 1));
     }
 
     #[test]

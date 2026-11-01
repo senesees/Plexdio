@@ -115,13 +115,16 @@ Ride in a hover ship, a car or a plane:
   about a quarter of one CPU core.
 - **Ride**: an Audiosurf-style game on the song that is playing, over the visualiser. Press `G`
   (or the Ride button) on the Now playing page at any point in a song; the music never stops.
-  - The song is analysed in the background (about a second): onsets in three bands, a steady
-    beat grid, loudness and sections. The **Beat This!** AI model (ISMIR 2024, built into the exe,
+  - The song is analysed in the background (about a second): onsets in three bands, sustained
+    sounds, a steady beat grid, loudness and sections. The **Beat This!** AI model (ISMIR 2024, built into the exe,
     runs on the CPU) then refines the beats in a few more seconds.
   - The analysis becomes a road that climbs through calm parts and drops fast through loud ones,
     turning at section changes, with notes on the beats in five lanes. Bass, mids and highs each
     get a home lane per section and walk around it, and every other phrase mirrors the layout.
-    Notes are coloured cool to hot by intensity; grey blocks are to be avoided.
+    Notes are coloured cool to hot by intensity; grey blocks are to be avoided. **Hold notes** come
+    from sustained sounds (held chords, synths, sung notes): a glowing ribbon down the lane. Catch
+    its head and stay in the lane to earn points as you go, plus a bonus for riding it to the end;
+    steering off early breaks it, but not your combo.
   - Steer with the mouse (its position across the view) or `←`/`→`. Catch notes, avoid greys and
     build a combo for a ×2–×4 multiplier. A catch flashes, throws sparks and a shockwave ring and
     pops up its points; a grey flashes red and shakes the camera; missed notes fly past. You can't
@@ -384,7 +387,7 @@ memory under Wine.
 ## Testing
 
 ```sh
-cargo test --workspace                                  # 180 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, Ride, ...
+cargo test --workspace                                  # 185 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, Ride, ...
 cargo test --workspace --target x86_64-pc-windows-gnu   # same suite under Wine
 semgrep scan --config p/default --metrics off crates     # 0 findings
 cargo run --release -p plexdio --example retrovis_preview # renders every Now playing look to target/retrovis/*.png

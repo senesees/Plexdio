@@ -1,6 +1,34 @@
 # Plan: "Ride" — an Audiosurf-style game mode
 
-**Status (2026-11-01): built: spike and steps 2–5 all done, plus a round of feedback fixes.**
+**Status (2026-11-01): built: spike and steps 2–5 all done, plus a round of feedback fixes and hold notes.**
+
+Hold notes:
+- Analysis (VERSION 2) finds `sustains`.
+  - A clear onset (strength ≥ 0.25, peak ≥ 35 % of the band's range) whose band energy stays
+    within 45 % of the way down to the band's quiet floor.
+  - It ends at the next strong attack (≥ 0.6) in that band, or after 4 s; it must last ≥ 0.5 s.
+  - An onset floor of 5 % of the band's loudest attack keeps steady tones in sparse music from
+    producing fake onsets.
+  - Drums never qualify.
+- Map generator:
+  - Any onset at a note slot that starts a sustain makes the note a hold, in that sound's band
+    (a chord over a louder kick still counts).
+  - `settle_holds` puts the end on the half-beat grid (0.45–3 s). Notes inside are dropped,
+    unless stronger by 0.2, which shortens the hold instead.
+  - Lane jumps count from the hold's end, and greys avoid its lane for its whole length.
+  - Real songs on Pro: a hold every 5–9 s, holding 10–20 % of the time (most on the orchestral
+    piece).
+- Play:
+  - `NoteState` per note (Pending, Caught, Missed, GreyHit, Holding, Held, Broken), a `Holding`
+    state, and `consumed` time per ribbon.
+  - The head scores as a normal note. Each 0.1 s ridden within 0.26 of the lane pays a tenth of
+    the note's points (times the multiplier). The end pays a bonus and +1 combo (`HoldDone`).
+  - Leaving early is `HoldBroken`, with no combo loss. Seeks end an active hold unpaid.
+- Look:
+  - A 1.1 m ribbon in the note's colour along the lane, under the blocks, eaten from the craft
+    and pulsing while held; it dims when missed or broken. The tail gets a low cap.
+  - Sparks stream back from the craft while holding, and a big burst comes at the end.
+  - The HUD shows a live "+N" over the craft and "Hold +N" at the end.
 
 Feedback round (after first play):
 - The cursor is hidden only over the game surface (`resp.hovered()`), not over controls.
