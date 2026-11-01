@@ -1,6 +1,18 @@
 # Plan: "Ride" — an Audiosurf-style game mode
 
-**Status (2026-11-01): plan agreed, spike done (results below). Next: analysis and map generator.**
+**Status (2026-11-01): spike done; step 2 done (analysis, map generator, preview tool, in
+`crates/plexdio/src/game/` and `examples/ride_preview.rs`). Next: step 3, the game core.**
+
+Step 2 notes:
+- The classic analysis is fast: a 2:35 song decodes in 0.36 s and analyses in 0.15 s (Linux).
+- The beat grid is steady (interval variation 1–5 %).
+- Lessons:
+  - The onset envelope must be smoothed (±2 frames) before the tempo autocorrelation.
+  - The tempo comb scores a period together with its multiples (not halves).
+  - Bass is weighted up, and a half-beat shift check catches grids locked onto off-beat hats.
+  - Onset and beat times need +20 ms (`LAG`), because frames are centred.
+- Known weak spots, which the AI tier (step 5) should fix: a 4:3 tempo error on an orchestral
+  piece (126 vs the model's 95 bpm), and the grid sitting half a beat off for part of one song.
 
 **Decisions:**
 - Gameplay: collect and dodge. Coloured notes give points, grey blocks are to be avoided, and

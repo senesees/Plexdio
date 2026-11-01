@@ -3,6 +3,7 @@ pub mod cache;
 pub mod config;
 pub mod cover_art;
 pub mod discord;
+pub mod game;
 pub mod library_model;
 pub mod logging;
 pub mod paths;
