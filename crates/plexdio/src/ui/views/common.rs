@@ -30,6 +30,8 @@ pub enum Route {
     Mix(String),
     /// The station started last (kept in [`RadioStation`] on the app).
     Radio,
+    /// Full-screen Now playing page with the retro visualiser.
+    NowPlaying,
     Settings,
 }
 

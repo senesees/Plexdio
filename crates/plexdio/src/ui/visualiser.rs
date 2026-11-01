@@ -27,7 +27,7 @@ impl VisMode {
 }
 
 /// Points per FFT (about 43 ms at 48 kHz).
-const N: usize = 2048;
+pub(crate) const N: usize = 2048;
 pub const BANDS: usize = 32;
 const LOW_HZ: f32 = 40.0;
 const HIGH_HZ: f32 = 16_000.0;
@@ -48,7 +48,7 @@ pub struct Visualiser {
 }
 
 /// In-place iterative radix-2 FFT; `re.len()` must be a power of two.
-fn fft(re: &mut [f32], im: &mut [f32]) {
+pub(crate) fn fft(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
     let mut j = 0;
     for i in 1..n {
@@ -87,7 +87,7 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
 }
 
 /// Band levels (0..=1) of `samples` (N points) at `rate`.
-fn spectrum(samples: &[f32], rate: u32, re: &mut Vec<f32>, im: &mut Vec<f32>) -> [f32; BANDS] {
+pub(crate) fn spectrum(samples: &[f32], rate: u32, re: &mut Vec<f32>, im: &mut Vec<f32>) -> [f32; BANDS] {
     re.clear();
     im.clear();
     // Hann window.

@@ -73,6 +73,8 @@ pub struct Config {
     pub visualiser: crate::ui::visualiser::VisMode,
     /// Download songs for offline listening only over a local (home network) connection.
     pub downloads_lan_only: bool,
+    /// The Now playing page's retro visualiser.
+    pub retro: crate::ui::retrovis::RetroPrefs,
 }
 
 impl Default for Config {
@@ -108,6 +110,7 @@ impl Default for Config {
             zoom: 1.0,
             visualiser: Default::default(),
             downloads_lan_only: false,
+            retro: Default::default(),
         }
     }
 }

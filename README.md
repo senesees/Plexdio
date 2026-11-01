@@ -84,6 +84,13 @@ Mini-player:
   [Discord setup](#discord-setup).
 - **Visualiser** (optional): spectrum bars or a waveform behind the player controls and along
   the mini-player, from the audio actually being heard.
+- **Now playing visualiser**: a full-window (or full-screen, `F11`) page with nine retro looks in
+  the style of the original Xbox dashboard, Windows Media Player 7–10, the PlayStation's Sound
+  Scope and the console light synths: Scope, Rings, Dashboard, Ambient, Kaleido, Polygon,
+  Terrain, Tunnel and Cloud. Low-resolution feedback effects and simple 3D, reacting to bass,
+  mid, treble and beats; they change by themselves on a beat (or with `↑`/`↓`). The song's cover
+  and title fade in on track changes, Xbox style. On pause the picture fades out (the Dashboard
+  into a starfield) and drawing stops. Open it with the bar's visualiser button or `V`.
 - **Zoom**: 80–150 % (`Ctrl+=`, `Ctrl+−`, `Ctrl+0`, or Settings), remembered.
 - **Windows integration**: a themed title bar (drag, double-click to maximise, resize from any
   edge, live redraw while resizing), tray icon with menu, minimise/close to tray, media keys
@@ -169,6 +176,7 @@ real account.
 | Downloads (pins, resume, offline play, pending scrobbles) | ✅ integration tests + Linux build offline; download on Windows 11 VM |
 | Cast / multi-cast (discovery, play queue, commands, timeline) | ✅ against the mock's fake players only |
 | Visualiser, zoom, track info | ✅ unit tests + Linux build screenshots |
+| Now playing visualiser (9 looks, full screen, pause fade) | ✅ unit tests, preview tool, Linux build, Windows 11 VM full screen (~25 fps) |
 | Discord Rich Presence protocol | ✅ test against a fake Discord socket; Wine (no Discord → retries quietly) |
 | Themed title bar, mini-player, settings layout | ✅ Wine screenshots |
 | Off-screen window rescue (display change, sleep) | ✅ unit tests + Windows 11 VM (window pushed to 5000,5000 came back in 3 s) |
@@ -239,7 +247,8 @@ crates/plexdio
   player/            mixes, radio, similar artists, reporting, session resume, lyrics
                      parser, cast sessions
   ui/                CPU-rendered egui: runner, app state, views, title bar, EQ editor,
-                     icons, artwork cache, visualiser (FFT)
+                     icons, artwork cache, visualiser (FFT), retrovis/ (Now playing
+                     visualiser: canvas, feedback warps, palettes, analysis, 3D, presets)
   win/               tray + media keys, SMTC, autostart, single instance, Wine workarounds
 crates/mockplex      mock plex.tv + Plex Media Server (tiny_http), including playlist writes,
                      lyric streams and fake remote-controllable players
@@ -266,7 +275,7 @@ Data locations: `%APPDATA%\Plexdio\config.json` (settings, resume queue),
 
 ## Footprint
 
-Release exe: **10 563 072 bytes (10.07 MiB)**, PE32+ x86-64, system DLLs only.
+Release exe: **10 645 504 bytes (10.15 MiB)**, PE32+ x86-64, system DLLs only.
 
 | Environment | Library | Idle working set | Idle CPU | Playing CPU |
 |---|---|---|---|---|
@@ -275,8 +284,14 @@ Release exe: **10 563 072 bytes (10.07 MiB)**, PE32+ x86-64, system DLLs only.
 | Wine on Linux | 25 tracks | 84 MB (includes Wine) | 0.10 % of a core | 2.6 % of a core (mini-player, EQ on) |
 
 ¹ Measured on the Plexify build before the equaliser, Discord and the new UI; not re-measured
-yet. The visualiser redraws at 30 frames a second while on and playing (it is off by default);
-its CPU cost has not been measured on the VM yet.
+yet. The small visualiser redraws at 30 frames a second while on and playing (it is off by
+default); its CPU cost has not been measured on the VM yet.
+
+The **Now playing visualiser** costs about 1–5 ms per frame for the effect at 320 px wide, but the
+software renderer then scales that image to the whole view every frame: on the Windows 11 VM in
+full screen (1280×800) that is about 25 fps and **~70 % of one core** (~35–50 % in a normal
+window). It only runs while the page is open and music plays; after a pause fades out it uses
+nothing. The log reports the frame rate every 10 s while the page is open.
 
 The 100 000-track case is the stress case: the compact in-memory index plus the 24 MB SQLite
 cache push the *working set* past 100 MB, while private memory stays under it. A library of a
@@ -310,9 +325,10 @@ memory under Wine.
 ## Testing
 
 ```sh
-cargo test --workspace                                  # 132 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, ...
+cargo test --workspace                                  # 152 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, ...
 cargo test --workspace --target x86_64-pc-windows-gnu   # same suite under Wine
 semgrep scan --config p/default --metrics off crates     # 0 findings
+cargo run --release -p plexdio --example retrovis_preview # renders every Now playing look to target/retrovis/*.png
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

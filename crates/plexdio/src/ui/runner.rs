@@ -33,6 +33,8 @@ pub enum WindowCmd {
     MinSize(u32, u32),
     Hide,
     Show,
+    /// Borderless full screen on the window's monitor, or back to a normal window.
+    Fullscreen(bool),
 }
 
 /// Implemented by the application.
@@ -292,6 +294,9 @@ impl<A: UiApp> Runner<A> {
                 }
                 WindowCmd::Hide => {
                     gfx.window.set_visible(false);
+                }
+                WindowCmd::Fullscreen(on) => {
+                    gfx.window.set_fullscreen(on.then_some(winit::window::Fullscreen::Borderless(None)));
                 }
                 WindowCmd::Show => {
                     gfx.window.set_minimized(false);

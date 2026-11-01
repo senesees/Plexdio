@@ -4,6 +4,7 @@ pub mod eq_editor;
 pub mod fonts;
 pub mod icons;
 pub mod jobs;
+pub mod retrovis;
 pub mod runner;
 pub mod theme;
 pub mod titlebar;

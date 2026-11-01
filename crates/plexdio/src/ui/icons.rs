@@ -36,6 +36,10 @@ pub enum Icon {
     Download,
     /// Screen with signal arcs (play on another device).
     Cast,
+    /// Screen with a wave (the Now playing visualiser).
+    Visualiser,
+    /// Four corner brackets (full screen).
+    Fullscreen,
     Trash,
     Up,
     Down,
@@ -195,6 +199,17 @@ pub fn paint(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Plus => {
             p.line_segment([at(12.0, 5.0), at(12.0, 19.0)], stroke);
             p.line_segment([at(5.0, 12.0), at(19.0, 12.0)], stroke);
+        }
+        Icon::Visualiser => {
+            p.rect_stroke(egui::Rect::from_min_max(at(3.0, 4.0), at(21.0, 18.0)), 2.0 * u, stroke, egui::StrokeKind::Middle);
+            let wave: Vec<Pos2> = (0..=12).map(|i| at(6.0 + i as f32, 11.0 - 3.5 * (i as f32 * 0.9).sin())).collect();
+            p.add(Shape::line(wave, stroke));
+            p.line_segment([at(8.0, 21.0), at(16.0, 21.0)], stroke);
+        }
+        Icon::Fullscreen => {
+            for (x, y, dx, dy) in [(4.0, 4.0, 1.0, 1.0), (20.0, 4.0, -1.0, 1.0), (4.0, 20.0, 1.0, -1.0), (20.0, 20.0, -1.0, -1.0)] {
+                p.add(Shape::line(vec![at(x, y + 5.0 * dy), at(x, y), at(x + 5.0 * dx, y)], stroke));
+            }
         }
         Icon::Cast => {
             // Screen outline open at the bottom-left, where the signal arcs sit.

@@ -35,6 +35,8 @@ use super::jobs::Jobs;
 use super::runner::UiApp;
 use super::theme;
 
+mod now_playing;
+
 pub const TOKEN_NAME: &str = "plex-token";
 /// Client size of the mini-player window (logical points).
 const MINI_SIZE: [u32; 2] = [520, 84];
@@ -191,6 +193,7 @@ enum BarCmd {
     Repeat,
     Queue,
     Lyrics,
+    NowPlaying,
     Rate(u8),
     /// Open the album or artist of the playing track.
     Go(Route),
@@ -324,6 +327,8 @@ pub struct PlexdioApp {
     downloader: Option<crate::cache::offline::Downloader>,
     /// Spectrum/waveform state for the visualiser.
     vis: super::visualiser::Visualiser,
+    /// The Now playing page (retro visualiser, overlay, full screen).
+    np: now_playing::NowPlayingState,
     /// Short note shown over the window ("Zoom 120 %") and when it goes away (egui time).
     toast: Option<(String, f64)>,
     /// Zoom the window's minimum size was last set for.
@@ -456,6 +461,7 @@ impl PlexdioApp {
             last_played_id: None,
             queue_open: false,
             vis: Default::default(),
+            np: Default::default(),
             offline_dl: Default::default(),
             cast: None,
             cast_players: None,
@@ -901,6 +907,7 @@ impl PlexdioApp {
     fn shortcuts(&mut self, ui: &mut egui::Ui) {
         let (mut toggle, mut seek, mut skip, mut volume, mut mini) = (false, 0i64, 0i32, 0.0f32, false);
         let mut zoom: Option<i32> = None;
+        let mut np = false;
         ui.input_mut(|i| {
             toggle = i.consume_key(egui::Modifiers::NONE, egui::Key::Space);
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
@@ -922,6 +929,7 @@ impl PlexdioApp {
                 volume -= 0.05;
             }
             mini = i.consume_key(egui::Modifiers::COMMAND, egui::Key::M);
+            np = i.consume_key(egui::Modifiers::NONE, egui::Key::V);
             for (key, step) in [(egui::Key::Plus, 1), (egui::Key::Equals, 1), (egui::Key::Minus, -1), (egui::Key::Num0, 0)] {
                 if i.consume_key(egui::Modifiers::COMMAND, key) || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, key) {
                     zoom = Some(step);
@@ -946,6 +954,13 @@ impl PlexdioApp {
         }
         if mini {
             self.toggle_mini();
+        }
+        if np {
+            if self.route == Route::NowPlaying {
+                self.back();
+            } else {
+                self.navigate(Route::NowPlaying);
+            }
         }
     }
 
@@ -1436,6 +1451,9 @@ impl PlexdioApp {
     }
 
     pub fn navigate(&mut self, r: Route) {
+        if r != Route::NowPlaying {
+            self.np.fullscreen = false;
+        }
         if r != self.route {
             self.selection.clear();
             let prev = std::mem::replace(&mut self.route, r);
@@ -1451,6 +1469,7 @@ impl PlexdioApp {
 
     pub fn back(&mut self) {
         self.selection.clear();
+        self.np.fullscreen = false;
         if let Some(r) = self.history.pop() {
             self.route = r;
         }
@@ -2775,8 +2794,8 @@ impl PlexdioApp {
         let info_w = (full * 0.24).clamp(130.0, 260.0);
         let vol_w = if wide { 90.0 } else { 64.0 };
         let gap = ui.spacing().item_spacing.x;
-        // Stars (wide only), queue, lyrics, cast, mute, volume slider; each followed by item spacing.
-        let right_w = if wide { 5.0 * (14.0 + gap) + 8.0 } else { 0.0 } + (18.0 + gap) * 4.0 + vol_w + gap;
+        // Stars (wide only), queue, lyrics, visualiser, cast, mute, volume slider; each followed by item spacing.
+        let right_w = if wide { 5.0 * (14.0 + gap) + 8.0 } else { 0.0 } + (18.0 + gap) * 5.0 + vol_w + gap;
         let left_w = 48.0 + 10.0 + info_w + 3.0 * gap;
         let center_w = (full - left_w - right_w - 2.0 * gap).max(160.0);
 
@@ -2922,6 +2941,10 @@ impl PlexdioApp {
                 {
                     cmds.push(BarCmd::Mute(!st.muted));
                 }
+                let on_np = self.route == Route::NowPlaying;
+                if icons::button(ui, Icon::Visualiser, 18.0, on_np).on_hover_text("Now playing visualiser (V)").clicked() {
+                    cmds.push(BarCmd::NowPlaying);
+                }
                 let cast = icons::button(ui, Icon::Cast, 18.0, self.cast.is_some()).on_hover_text(match &self.cast {
                     Some(c) => format!("Playing on {}", c.label()),
                     None => "Play on another device".to_string(),
@@ -3027,6 +3050,7 @@ impl PlexdioApp {
                         self.lyrics_open = !self.lyrics_open;
                         self.queue_open &= !self.lyrics_open;
                     }
+                    BarCmd::NowPlaying => go = Some(Route::NowPlaying),
                     BarCmd::Rate(r) => {
                         // Re-borrow after the loop's immutable borrows; deferred below.
                         rate = Some(r);
@@ -3039,7 +3063,11 @@ impl PlexdioApp {
             self.rate_track(track.id, r);
         }
         if let Some(r) = go {
-            self.navigate(r);
+            if r == Route::NowPlaying && self.route == Route::NowPlaying {
+                self.back();
+            } else {
+                self.navigate(r);
+            }
         }
         if save {
             self.save_config();
@@ -3438,7 +3466,7 @@ impl PlexdioApp {
                 Route::Mix(key) => detail::mix_view(ui, &mut vc, key),
                 Route::Radio => detail::radio_view(ui, &mut vc, self.radio_station.as_ref()),
                 Route::Search => search::search_view(ui, &mut vc, &mut self.search, self.library_ver),
-                Route::Settings => {}
+                Route::Settings | Route::NowPlaying => {}
             }
             let bottom = ui.clip_rect().center_bottom();
             super::views::common::selection_bar(ui, &mut vc, bottom);
@@ -3523,6 +3551,7 @@ impl PlexdioApp {
                     settings_card(&mut cols[0], "Playback", |ui| self.settings_playback(ui, &mut changed));
                     settings_card(&mut cols[0], "Equalizer", |ui| self.settings_equalizer(ui, &mut changed));
                     settings_card(&mut cols[0], "Window", |ui| self.settings_window(ui, &mut changed));
+                    settings_card(&mut cols[0], "Now playing visualiser", |ui| self.settings_now_playing(ui, &mut changed));
                     settings_card(&mut cols[0], "Discord", |ui| self.settings_discord(ui, &mut changed));
                     settings_card(&mut cols[1], "Downloads", |ui| self.settings_downloads(ui, &mut changed));
                     settings_card(&mut cols[1], "Storage", |ui| self.settings_storage(ui, &mut changed));
@@ -3535,6 +3564,7 @@ impl PlexdioApp {
                 settings_card(ui, "Playback", |ui| self.settings_playback(ui, &mut changed));
                 settings_card(ui, "Equalizer", |ui| self.settings_equalizer(ui, &mut changed));
                 settings_card(ui, "Window", |ui| self.settings_window(ui, &mut changed));
+                settings_card(ui, "Now playing visualiser", |ui| self.settings_now_playing(ui, &mut changed));
                 settings_card(ui, "Discord", |ui| self.settings_discord(ui, &mut changed));
                 settings_card(ui, "Downloads", |ui| self.settings_downloads(ui, &mut changed));
                 settings_card(ui, "Storage", |ui| self.settings_storage(ui, &mut changed));
@@ -3987,8 +4017,8 @@ fn route_category(r: &Route) -> u8 {
         Route::Library(_) | Route::Artist(_) | Route::Album(_) | Route::Genre(_) => 2,
         Route::Playlists | Route::Playlist(_) => 3,
         Route::Settings => 4,
-        // Not a sidebar entry; nothing is highlighted.
-        Route::Radio => 5,
+        // Not sidebar entries; nothing is highlighted.
+        Route::Radio | Route::NowPlaying => 5,
     }
 }
 
@@ -4242,7 +4272,8 @@ impl UiApp for PlexdioApp {
         }
         // The mini-player has no title bar: it is dragged by its background and has its own
         // close button.
-        if !self.mini {
+        let fullscreen = self.np.fullscreen && self.route == Route::NowPlaying && self.screen == Screen::Main && !self.mini;
+        if !self.mini && !fullscreen {
             let title = self.window_title.clone();
             match super::titlebar::show(ui, &title, true) {
                 super::titlebar::TitleAction::Close => self.close_window(ui.ctx()),
@@ -4255,6 +4286,10 @@ impl UiApp for PlexdioApp {
             Screen::Login => self.login_screen(ui),
             Screen::ServerSelect => self.server_screen(ui),
             Screen::Main if self.mini => self.mini_player(ui),
+            Screen::Main if fullscreen => {
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(egui::Color32::BLACK)).show(ui, |ui| self.now_playing_view(ui));
+                self.draw_toast(ui.ctx());
+            }
             Screen::Main => {
                 if self.mixes_dirty && self.route == Route::Home {
                     self.refresh_mixes();
@@ -4282,15 +4317,19 @@ impl UiApp for PlexdioApp {
                         .frame(egui::Frame::new().fill(theme::BAR).inner_margin(egui::Margin::symmetric(10, 6)))
                         .show(ui, |ui| self.queue_panel(ui));
                 }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(24, 8)))
-                    .show(ui, |ui| self.content(ui));
+                if self.route == Route::NowPlaying {
+                    egui::CentralPanel::default().frame(egui::Frame::new().fill(egui::Color32::BLACK)).show(ui, |ui| self.now_playing_view(ui));
+                } else {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(24, 8)))
+                        .show(ui, |ui| self.content(ui));
+                }
                 self.dialogs(&ui.ctx().clone());
                 self.draw_toast(ui.ctx());
                 self.maybe_search_server(ui.ctx().input(|i| i.time));
             }
         }
-        if !self.mini {
+        if !self.mini && !fullscreen {
             super::titlebar::resize_edges(ui);
         }
     }
@@ -4309,6 +4348,11 @@ impl UiApp for PlexdioApp {
     /// runner about mini-player geometry changes.
     fn take_window_cmds(&mut self) -> Vec<WindowCmd> {
         let mut cmds = Vec::new();
+        let full = self.np.fullscreen && !self.mini && self.route == Route::NowPlaying;
+        if full != self.np.fullscreen_applied {
+            cmds.push(WindowCmd::Fullscreen(full));
+            self.np.fullscreen_applied = full;
+        }
         let mut events = Vec::new();
         if let Some(tray) = &self.tray {
             while let Some(e) = tray.try_recv() {
