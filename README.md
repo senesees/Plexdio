@@ -18,6 +18,15 @@ Mini-player:
 
 ![Mini-player](docs/mini.png)
 
+Now playing visualiser (`V`, `F11` for full screen):
+
+![Now playing page with the Tunnel visualiser and the song overlay](docs/now-playing.png)
+
+Its nine retro looks, inspired by the Xbox dashboard, Windows Media Player and the PlayStation's
+Sound Scope:
+
+![The nine visualiser looks: Scope, Rings, Dashboard, Ambient, Kaleido, Polygon, Terrain, Tunnel and Cloud](docs/visualiser-looks.png)
+
 ## What it does
 
 - **Sign in** with the Plex PIN flow: the code is shown in the app, the browser opens the
@@ -90,7 +99,11 @@ Mini-player:
   Terrain, Tunnel and Cloud. Low-resolution feedback effects and simple 3D, reacting to bass,
   mid, treble and beats; they change by themselves on a beat (or with `↑`/`↓`). The song's cover
   and title fade in on track changes, Xbox style. On pause the picture fades out (the Dashboard
-  into a starfield) and drawing stops. Open it with the bar's visualiser button or `V`.
+  into a starfield) and drawing stops. Open it with the bar's visualiser button or `V`; `A`
+  toggles the automatic changes, a double-click or `F11` toggles full screen, `Esc` leaves.
+  Settings → Now playing visualiser picks the look, change interval, resolution, sharp or smooth pixels,
+  dithering and frame rate. The picture is scaled straight into the window, so full screen costs
+  about a quarter of one CPU core.
 - **Zoom**: 80–150 % (`Ctrl+=`, `Ctrl+−`, `Ctrl+0`, or Settings), remembered.
 - **Windows integration**: a themed title bar (drag, double-click to maximise, resize from any
   edge, live redraw while resizing), tray icon with menu, minimise/close to tray, media keys
