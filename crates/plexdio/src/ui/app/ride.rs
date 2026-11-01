@@ -4,7 +4,8 @@
 
 use super::PlexdioApp;
 use crate::audio::source::{AudioCache, SourceSpec};
-use crate::game::analysis::Analysis;
+use crate::cache::db::{LibraryDb, RideScore};
+use crate::game::analysis::{Analysis, VERSION};
 use crate::game::build::Build;
 use crate::game::clock::SongClock;
 use crate::game::mapgen::{generate, seed_for};
@@ -14,7 +15,7 @@ use crate::ui::retrovis::canvas::Canvas;
 use crate::ui::runner::VideoFrame;
 use crate::ui::theme;
 use egui::{Align2, Color32, FontId, Rect};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use symphonia::core::io::MediaSource;
 
@@ -25,6 +26,10 @@ const WIDTH: usize = 480;
 const KEEP: usize = 8;
 /// How long the end-of-song result stays up.
 const RESULT_SECS: f64 = 6.0;
+/// Saved analyses kept in the library database (about 125 KB for a 4-minute song).
+const SAVED: usize = 300;
+/// Rides shorter than this many notes reached aren't saved as scores.
+const MIN_NOTES: u32 = 5;
 
 #[derive(Default)]
 pub struct RideState {
@@ -40,8 +45,12 @@ pub struct RideState {
     pending: Input,
     /// Where the pointer last was across the view (a new ride starts steering there).
     pointer_x: Option<f32>,
-    /// A message under the HUD (an error, or the last song's result) and when it appeared.
+    /// A message under the HUD (an error) and when it appeared.
     notice: Option<(String, f64)>,
+    /// The last song's result and when it appeared.
+    result: Option<(ResultCard, f64)>,
+    /// Songs whose track could not be built (not tried again this session).
+    failed: HashSet<i64>,
     /// Game frames and drawing time since the last log line (every 10 s).
     stats: (u32, f64, Option<std::time::Instant>),
     /// Fine timer resolution while a ride is on screen (60 fps frame timing on Windows).
@@ -73,8 +82,24 @@ impl Drop for FineTimer {
     }
 }
 
+/// What the end-of-song card shows.
+struct ResultCard {
+    title: String,
+    difficulty: &'static str,
+    score: u64,
+    accuracy: f32,
+    best_combo: u32,
+    /// The best score before this ride (None: first ride of this song at this level).
+    best_before: Option<u64>,
+    /// Place among this song's rides at this level (1 = best).
+    rank: usize,
+}
+
 struct Session {
     track: i64,
+    title: String,
+    /// Best saved score for this song and level when the ride started.
+    best: Option<u64>,
     ride: Ride,
     geom: RoadGeom,
     clock: SongClock,
@@ -157,8 +182,73 @@ impl PlexdioApp {
             r.build = None;
             r.session = None;
             r.notice = None;
+            r.result = None;
             r.timer = None;
         }
+    }
+
+    /// The open library's database (where analyses and scores are kept).
+    fn ride_db(&self) -> Option<LibraryDb> {
+        self.db_path.as_ref().and_then(|p| LibraryDb::open(p).map_err(|e| log::warn!("ride: database: {e}")).ok())
+    }
+
+    /// A song's analysis from memory or the database (None: it has to be built).
+    fn ride_analysis(&mut self, track: i64) -> Option<Rc<Analysis>> {
+        if let Some(a) = self.np.ride.analyses.get(&track) {
+            return Some(a.clone());
+        }
+        let json = self.ride_db()?.ride_map(track, VERSION, unix_now()).ok().flatten()?;
+        match serde_json::from_str::<Analysis>(&json) {
+            Ok(a) => {
+                log::info!("ride: track {track} loaded from the database");
+                Some(self.remember_analysis(track, a))
+            }
+            Err(e) => {
+                log::warn!("ride: saved analysis of {track} is unreadable ({e}); building it again");
+                None
+            }
+        }
+    }
+
+    /// Keep an analysis in memory (dropping an old one beyond `KEEP`).
+    fn remember_analysis(&mut self, track: i64, a: Analysis) -> Rc<Analysis> {
+        let current = self.playback.track.as_ref().map(|t| t.id);
+        let r = &mut self.np.ride;
+        if r.analyses.len() >= KEEP {
+            if let Some(&old) = r.analyses.keys().find(|&&k| Some(k) != current) {
+                r.analyses.remove(&old);
+            }
+        }
+        let a = Rc::new(a);
+        r.analyses.insert(track, a.clone());
+        a
+    }
+
+    /// Settings → Storage: saved Ride tracks, with a button to forget them (scores stay).
+    pub(super) fn ride_storage_row(&mut self, ui: &mut egui::Ui) {
+        let (n, bytes) = self.ride_db().and_then(|db| db.ride_maps_size().ok()).unwrap_or((0, 0));
+        let desc = format!("{n} {} · {} · your scores are kept", if n == 1 { "song" } else { "songs" }, super::human_bytes(bytes));
+        let mut clear = false;
+        super::setting_row(ui, "Ride tracks", Some(&desc), |ui| {
+            clear = theme::secondary_button(ui, "Clear").on_hover_text("Forget the analysed songs; they are built again when you ride them").clicked();
+        });
+        if clear {
+            match self.ride_db().map(|db| db.clear_ride_maps()) {
+                Some(Ok(())) => {
+                    self.np.ride.analyses.clear();
+                    self.banner = Some(("Ride tracks cleared.".into(), false));
+                }
+                Some(Err(e)) => self.banner = Some((format!("Could not clear the Ride tracks: {e}"), true)),
+                None => {}
+            }
+        }
+    }
+
+    /// The song after the current one in the play order, if any.
+    fn next_in_queue(&self) -> Option<i64> {
+        let q = &self.playback.queue;
+        let i = q.iter().position(|e| e.current)?;
+        q.get(i + 1).map(|e| e.info.id)
     }
 
     /// Keep ride mode in step with what is playing: build the song's track, start the ride,
@@ -184,17 +274,21 @@ impl PlexdioApp {
                 self.np.ride.build = None;
                 match result {
                     Ok(a) => {
-                        let r = &mut self.np.ride;
-                        if r.analyses.len() >= KEEP {
-                            if let Some(&old) = r.analyses.keys().find(|&&k| k != track) {
-                                r.analyses.remove(&old);
+                        match (serde_json::to_string(&a), self.ride_db()) {
+                            (Ok(json), Some(db)) => {
+                                if let Err(e) = db.set_ride_map(id, VERSION, &json, unix_now(), SAVED) {
+                                    log::warn!("ride: cannot save the analysis of {id}: {e}");
+                                }
                             }
+                            (Err(e), _) => log::warn!("ride: cannot save the analysis of {id}: {e}"),
+                            _ => {}
                         }
-                        r.analyses.insert(id, Rc::new(a));
+                        self.remember_analysis(id, a);
                     }
                     Err(e) => {
-                        self.np.ride.notice = Some((format!("Couldn't build a track for this song ({e})."), now));
+                        self.np.ride.failed.insert(id);
                         if id == track {
+                            self.np.ride.notice = Some((format!("Couldn't build a track for this song ({e})."), now));
                             self.np.ride.on = false;
                             return;
                         }
@@ -203,20 +297,35 @@ impl PlexdioApp {
             }
         }
 
-        // The song changed: the old ride is over.
-        if self.np.ride.session.as_ref().is_some_and(|s| s.track != track) {
+        // The song changed, or restarted from the top: the old ride is over (a restart rides
+        // again from the start).
+        let restarted = |s: &Session| s.track == track && position < 1.0 && s.clock.now() > 3.0;
+        if self.np.ride.session.as_ref().is_some_and(|s| s.track != track || restarted(s)) {
             self.finish_ride(now);
             self.np.ride.session = None;
         }
         if self.np.ride.session.is_none() {
-            if let Some(a) = self.np.ride.analyses.get(&track).cloned() {
+            if let Some(a) = self.ride_analysis(track) {
                 let difficulty = self.config.ride.difficulty;
                 let map = generate(&a, difficulty, seed_for(&track.to_string()));
                 let geom = RoadGeom::new(&map);
+                let best = self.ride_db().and_then(|db| db.top_rides(track, difficulty.label(), 1).ok()).and_then(|v| v.first().map(|r| r.score));
+                let title = self.playback.track.as_ref().map(|t| t.title.clone()).unwrap_or_default();
                 log::info!("ride: starting track {track} at {position:.1} s ({}, {} notes)", difficulty.label(), map.colour_notes());
-                self.np.ride.session = Some(Session { track, ride: Ride::new(map, position), geom, clock: SongClock::default(), reported: false, fresh: true });
+                self.np.ride.session =
+                    Some(Session { track, title, best, ride: Ride::new(map, position), geom, clock: SongClock::default(), reported: false, fresh: true });
+            } else if self.np.ride.failed.contains(&track) {
+                // Already tried; the notice said so.
             } else if self.np.ride.build.as_ref().is_none_or(|b| b.track != track) {
                 self.start_build(track, ctx);
+            }
+        }
+        // While riding, get the next song's track ready so the ride carries straight on.
+        if self.np.ride.session.is_some() && self.np.ride.build.is_none() {
+            if let Some(next) = self.next_in_queue().filter(|n| !self.np.ride.failed.contains(n)) {
+                if self.ride_analysis(next).is_none() {
+                    self.start_build(next, ctx);
+                }
             }
         }
         // Report the result once the song's map has played out (the next song follows).
@@ -227,17 +336,27 @@ impl PlexdioApp {
         }
     }
 
-    /// Put the finished (or interrupted) ride's result up.
+    /// Save the finished (or interrupted) ride and put its result up.
     fn finish_ride(&mut self, now: f64) {
         let Some(s) = &mut self.np.ride.session else { return };
-        if s.reported || s.ride.caught + s.ride.missed == 0 {
+        if s.reported || s.ride.caught + s.ride.missed < MIN_NOTES {
             return;
         }
         s.reported = true;
+        let difficulty = s.ride.map.difficulty.label();
         let r = &s.ride;
-        let msg = format!("{} points · {:.0} % caught · best combo {}", group(r.score), r.accuracy() * 100.0, r.best_combo);
-        log::info!("ride: track {} finished: {msg}", s.track);
-        self.np.ride.notice = Some((msg, now));
+        let score = RideScore { track_id: s.track, difficulty: difficulty.to_string(), score: r.score, accuracy: r.accuracy(), best_combo: r.best_combo, played_at: unix_now() };
+        let (title, best_before) = (s.title.clone(), s.best);
+        log::info!("ride: track {} finished: {} points, {:.0} % caught, best combo {} ({difficulty})", score.track_id, score.score, score.accuracy * 100.0, score.best_combo);
+        let mut rank = 1;
+        if let Some(db) = self.ride_db() {
+            if let Err(e) = db.record_ride(&score) {
+                log::warn!("ride: cannot save the score: {e}");
+            }
+            rank = db.top_rides(score.track_id, difficulty, 100).map_or(1, |all| all.iter().position(|x| *x == score).map_or(all.len() + 1, |i| i + 1));
+        }
+        let card = ResultCard { title, difficulty, score: score.score, accuracy: score.accuracy, best_combo: score.best_combo, best_before, rank };
+        self.np.ride.result = Some((card, now));
     }
 
     /// Start analysing `track` from the same source the player uses.
@@ -287,6 +406,11 @@ impl PlexdioApp {
                 let mult = ride.multiplier();
                 let line = if ride.combo > 0 { format!("×{mult}   combo {}", ride.combo) } else { format!("×{mult}") };
                 text(egui::pos2(rect.left() + 30.0, top + 38.0), Align2::LEFT_TOP, &line, 15.0, if mult > 1 { theme::ACCENT } else { theme::TEXT_DIM });
+                if let Some(best) = s.best {
+                    let beaten = ride.score > best;
+                    let label = if beaten { "New best!".to_string() } else { format!("Best {}", group(best)) };
+                    text(egui::pos2(rect.left() + 30.0, top + 60.0), Align2::LEFT_TOP, &label, 13.0, if beaten { theme::ACCENT } else { theme::TEXT_DIM });
+                }
                 // Progress through the song along the top edge.
                 let f = (s.clock.now() as f32 / ride.map.duration.max(1.0)).clamp(0.0, 1.0);
                 let bar = Rect::from_min_size(rect.left_top() + egui::vec2(0.0, 2.0), egui::vec2(rect.width() * f, 3.0));
@@ -301,6 +425,14 @@ impl PlexdioApp {
             }
             (None, None) => {}
         }
+        if let Some((card, at)) = &r.result {
+            let age = now - at;
+            if age < RESULT_SECS {
+                let a = (1.0 - ((age - RESULT_SECS + 1.0).max(0.0)) as f32).clamp(0.0, 1.0);
+                result_card(&p, rect, card, a);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
         if let Some((msg, at)) = &r.notice {
             let age = now - at;
             if age < RESULT_SECS {
@@ -310,6 +442,30 @@ impl PlexdioApp {
             }
         }
     }
+}
+
+/// The end-of-song card, centred near the top.
+fn result_card(p: &egui::Painter, rect: Rect, c: &ResultCard, alpha: f32) {
+    let size = egui::vec2(360.0, 150.0);
+    let card = Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + 70.0 + size.y / 2.0), size);
+    p.rect_filled(card, 12.0, Color32::from_black_alpha((190.0 * alpha) as u8));
+    let x = card.center().x;
+    let col = |c: Color32| c.gamma_multiply(alpha);
+    let title = if c.title.is_empty() { "Ride complete".to_string() } else { c.title.clone() };
+    p.text(egui::pos2(x, card.top() + 22.0), Align2::CENTER_CENTER, title, FontId::proportional(15.0), col(theme::TEXT_DIM));
+    p.text(egui::pos2(x, card.top() + 58.0), Align2::CENTER_CENTER, group(c.score), FontId::proportional(36.0), col(Color32::WHITE));
+    let (line, accent) = match c.best_before {
+        Some(b) if c.score > b => ("New personal best!".to_string(), true),
+        None => ("First ride of this song".to_string(), false),
+        Some(b) => (format!("Best {} · this ride #{}", group(b), c.rank), false),
+    };
+    p.text(egui::pos2(x, card.top() + 94.0), Align2::CENTER_CENTER, line, FontId::proportional(15.0), col(if accent { theme::ACCENT } else { theme::TEXT }));
+    let stats = format!("{:.0} % caught · best combo {} · {}", c.accuracy * 100.0, c.best_combo, c.difficulty);
+    p.text(egui::pos2(x, card.top() + 124.0), Align2::CENTER_CENTER, stats, FontId::proportional(13.0), col(theme::TEXT_DIM));
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 /// 12345 → "12 345".

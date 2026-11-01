@@ -3914,6 +3914,7 @@ impl PlexdioApp {
                 *changed = true;
             }
         });
+        self.ride_storage_row(ui);
     }
 
     fn settings_account(&mut self, ui: &mut egui::Ui) {

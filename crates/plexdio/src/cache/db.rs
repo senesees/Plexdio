@@ -48,6 +48,20 @@ pub fn db_path(server_id: &str, section_key: &str) -> PathBuf {
     crate::paths::db_dir().join(db_file_name(server_id, section_key))
 }
 
+/// One finished Ride, as saved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RideScore {
+    pub track_id: i64,
+    /// "Casual", "Pro" or "Elite".
+    pub difficulty: String,
+    pub score: u64,
+    /// Share of the notes reached that were caught, 0..=1.
+    pub accuracy: f32,
+    pub best_combo: u32,
+    /// Unix seconds.
+    pub played_at: i64,
+}
+
 impl LibraryDb {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(d) = path.parent() {
@@ -112,7 +126,7 @@ impl LibraryDb {
         self.conn.execute_batch(
             "DELETE FROM artists; DELETE FROM albums; DELETE FROM tracks; DELETE FROM playlists;
              DELETE FROM playlist_items; DELETE FROM play_history; DELETE FROM lyrics; DELETE FROM offline_pins;
-             DELETE FROM offline_tracks; DELETE FROM pending_scrobbles; DELETE FROM meta;",
+             DELETE FROM offline_tracks; DELETE FROM pending_scrobbles; DELETE FROM ride_maps; DELETE FROM meta;",
         )?;
         self.set_meta("schema_version", SCHEMA_VERSION)
     }
@@ -358,6 +372,71 @@ impl LibraryDb {
     }
 
     /// Largest addedAt/updatedAt seen in the cache: the delta-sync watermark (server clock).
+    /// A song's saved Ride analysis (JSON) if it was made by analyser `version`; marks it used.
+    pub fn ride_map(&self, track_id: i64, version: u32, now: i64) -> rusqlite::Result<Option<String>> {
+        let data: Option<String> = self
+            .conn
+            .query_row("SELECT data FROM ride_maps WHERE track_id = ?1 AND version = ?2", params![track_id, version], |r| r.get(0))
+            .optional()?;
+        if data.is_some() {
+            self.conn.execute("UPDATE ride_maps SET used_at = ?2 WHERE track_id = ?1", params![track_id, now])?;
+        }
+        Ok(data)
+    }
+
+    /// Save a song's Ride analysis, keeping only the `keep` most recently used.
+    pub fn set_ride_map(&self, track_id: i64, version: u32, data: &str, now: i64, keep: usize) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO ride_maps(track_id, version, data, built_at, used_at) VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(track_id) DO UPDATE SET version = excluded.version, data = excluded.data, built_at = excluded.built_at, used_at = excluded.used_at",
+            params![track_id, version, data, now],
+        )?;
+        self.conn.execute(
+            "DELETE FROM ride_maps WHERE track_id NOT IN (SELECT track_id FROM ride_maps ORDER BY used_at DESC, built_at DESC LIMIT ?1)",
+            [keep as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Saved Ride analyses: how many, and their size in bytes.
+    pub fn ride_maps_size(&self) -> rusqlite::Result<(usize, u64)> {
+        self.conn.query_row("SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM ride_maps", [], |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as u64)))
+    }
+
+    /// Forget every saved Ride analysis (scores stay).
+    pub fn clear_ride_maps(&self) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM ride_maps", [])?;
+        Ok(())
+    }
+
+    /// Record a finished Ride.
+    pub fn record_ride(&self, s: &RideScore) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO ride_scores(track_id, difficulty, score, accuracy, best_combo, played_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![s.track_id, s.difficulty, s.score as i64, s.accuracy as f64, s.best_combo as i64, s.played_at],
+        )?;
+        Ok(())
+    }
+
+    /// The best `n` Ride scores for a song at a difficulty, highest first.
+    pub fn top_rides(&self, track_id: i64, difficulty: &str, n: usize) -> rusqlite::Result<Vec<RideScore>> {
+        let mut st = self.conn.prepare(
+            "SELECT track_id, difficulty, score, accuracy, best_combo, played_at FROM ride_scores
+             WHERE track_id = ?1 AND difficulty = ?2 ORDER BY score DESC, played_at ASC LIMIT ?3",
+        )?;
+        let rows = st.query_map(params![track_id, difficulty, n as i64], |r| {
+            Ok(RideScore {
+                track_id: r.get(0)?,
+                difficulty: r.get(1)?,
+                score: r.get::<_, i64>(2)? as u64,
+                accuracy: r.get::<_, f64>(3)? as f32,
+                best_combo: r.get::<_, i64>(4)? as u32,
+                played_at: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn watermark(&self) -> rusqlite::Result<i64> {
         self.conn.query_row(
             "SELECT MAX(m) FROM (SELECT MAX(updated_at) m FROM artists UNION ALL SELECT MAX(updated_at) FROM albums
@@ -403,5 +482,31 @@ mod tests {
         assert_eq!(plays, 1, "local play history survives the upgrade");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ride_maps_are_versioned_pruned_and_cleared_with_the_cache_but_scores_stay() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        db.set_ride_map(1, 1, "{\"a\":1}", 100, 2).unwrap();
+        db.set_ride_map(2, 1, "{}", 101, 2).unwrap();
+        assert_eq!(db.ride_map(1, 1, 102).unwrap().as_deref(), Some("{\"a\":1}"));
+        assert_eq!(db.ride_map(1, 2, 102).unwrap(), None, "another analyser version doesn't count");
+        // A third map pushes out the least recently used (track 2; track 1 was just read).
+        db.set_ride_map(3, 1, "{}", 103, 2).unwrap();
+        assert!(db.ride_map(2, 1, 104).unwrap().is_none());
+        assert_eq!(db.ride_maps_size().unwrap().0, 2);
+
+        let ride = |score, at| RideScore { track_id: 1, difficulty: "Pro".into(), score, accuracy: 0.9, best_combo: 12, played_at: at };
+        for (s, at) in [(500, 1), (900, 2), (700, 3)] {
+            db.record_ride(&ride(s, at)).unwrap();
+        }
+        db.record_ride(&RideScore { difficulty: "Elite".into(), ..ride(5000, 4) }).unwrap();
+        let top = db.top_rides(1, "Pro", 2).unwrap();
+        assert_eq!(top.iter().map(|r| r.score).collect::<Vec<_>>(), vec![900, 700]);
+        assert_eq!(top[0], ride(900, 2));
+
+        db.clear().unwrap();
+        assert_eq!(db.ride_maps_size().unwrap(), (0, 0));
+        assert_eq!(db.top_rides(1, "Pro", 5).unwrap().len(), 3, "scores survive clearing the cache");
     }
 }

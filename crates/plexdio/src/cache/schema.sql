@@ -123,3 +123,23 @@ CREATE TABLE IF NOT EXISTS pending_scrobbles (
     track_id  INTEGER NOT NULL,
     played_at INTEGER NOT NULL
 );
+
+-- Ride (the game on the Now playing page): each song's analysis, rebuilt when the analyser
+-- version changes and pruned to the most recently used (see game/), and the local scores.
+CREATE TABLE IF NOT EXISTS ride_maps (
+    track_id INTEGER PRIMARY KEY,
+    version  INTEGER NOT NULL,
+    data     TEXT NOT NULL,
+    built_at INTEGER NOT NULL,
+    used_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ride_scores (
+    track_id   INTEGER NOT NULL,
+    difficulty TEXT NOT NULL,
+    score      INTEGER NOT NULL,
+    accuracy   REAL NOT NULL,
+    best_combo INTEGER NOT NULL,
+    played_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ride_scores_track ON ride_scores(track_id, difficulty);

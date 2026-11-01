@@ -36,8 +36,10 @@ pub struct Onset {
     /// Seconds from the start of the song.
     pub t: f32,
     /// 0 bass, 1 mids, 2 highs.
+    #[serde(rename = "b")]
     pub band: u8,
-    /// 0..=1, relative to the song's own loud onsets.
+    /// 0..=1 in steps of 0.01, relative to the song's own loud onsets.
+    #[serde(rename = "s")]
     pub strength: f32,
 }
 
@@ -223,7 +225,9 @@ fn pick_onsets(flux: &[f32], band: u8, out: &mut Vec<Onset>) {
             continue;
         }
         last = Some(i);
-        out.push(Onset { t: i as f32 / FPS + LAG, band, strength: (v / 2.0).min(1.0) });
+        // Two decimals are plenty, and keep the saved analysis small.
+        let strength = ((v / 2.0).min(1.0) * 100.0).round() / 100.0;
+        out.push(Onset { t: i as f32 / FPS + LAG, band, strength });
     }
 }
 
@@ -424,7 +428,7 @@ pub fn analyse(samples: &[f32], ai: Option<&AiBeats>) -> Analysis {
     let norm = |v: f32, lo: f32, hi: f32| if hi - lo > 1e-6 { ((v - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 0.5 };
     let per_frame: Vec<f32> = (0..n).map(|i| 0.7 * norm(loud[i], l5, l95) + 0.3 * norm(activity[i], a5, a95)).collect();
     let step = (FPS / INTENSITY_HZ) as usize;
-    let intensity: Vec<f32> = per_frame.iter().step_by(step).copied().collect();
+    let intensity: Vec<f32> = per_frame.iter().step_by(step).map(|v| (v * 1000.0).round() / 1000.0).collect();
 
     let sections = find_sections(&f, &intensity, &downbeats, duration);
 

@@ -1,6 +1,22 @@
 # Plan: "Ride" — an Audiosurf-style game mode
 
-**Status (2026-11-01): spike, step 2 and step 3 done. Next: step 4 (caching, scores, results).**
+**Status (2026-11-01): spike and steps 2–4 done. Next: step 5 (AI tier, car and plane, settings, README).**
+
+Step 4 notes (integration):
+- Analyses are saved in the library database (`ride_maps`, JSON, about 125 KB for a 4-minute
+  song after rounding and short onset keys). They are keyed by track and analyser `VERSION`, and
+  only the 300 most recently used are kept.
+  - "Clear" on the library cache removes them; Settings → Storage → Ride tracks shows them and
+    can clear them on its own.
+- Scores go in `ride_scores` (track, difficulty, score, accuracy, best combo, time). They survive
+  cache clears. A ride is saved once at least 5 notes were reached.
+- While riding, the next song in the queue is built in the background, so each ride starts at
+  0.0 s. Failed builds are remembered and not retried.
+- An end-of-song card shows the title and score, then "New personal best!", "First ride of this
+  song" or the best score and this ride's place, plus accuracy, combo and level. The HUD shows the
+  song's best score while riding.
+- Restarting the song (Previous, or seeking to the start) scores the interrupted ride and rides
+  again from the top. This is the "retry".
 
 Step 3 notes (game core):
 - Modules: `game/clock.rs` (smoothed audible-position clock), `game/play.rs` (steering, catch and

@@ -66,6 +66,7 @@ fn main() {
             a.onsets.iter().filter(|o| o.band == 2).count(),
             a.sections.len()
         );
+        println!("    analysis as JSON: {} KB", serde_json::to_string(&a).map_or(0, |j| j.len()) / 1024);
         for s in &a.sections {
             println!("    section {:6.1}–{:6.1} s, intensity {:.2}", s.start, s.end, s.intensity);
         }
