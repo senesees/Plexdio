@@ -7,11 +7,12 @@ use super::mapgen::{Map, NoteKind, COLOURS, LANES};
 /// Where the lanes are, across the road (-1 left edge … 1 right edge of the steerable range).
 pub fn lane_x(lane: u8) -> f32 {
     let mid = (LANES - 1) as f32 / 2.0;
-    (lane as f32 - mid) / mid * 0.7
+    (lane as f32 - mid) / mid * 0.8
 }
 
-/// How close (in steering units) the craft must be to a lane to catch its note.
-const CATCH: f32 = 0.24;
+/// How close (in steering units) the craft must be to a lane to catch its note: a little under
+/// half the lane spacing, so between two lanes catches neither.
+const CATCH: f32 = 0.18;
 /// Notes this soon after the ride starts are left out: a run-up to get the feel.
 pub const RUN_UP: f32 = 2.0;
 /// Points per colour, cool to hot.
@@ -56,13 +57,17 @@ pub struct Ride {
     last_t: f32,
     /// Recent events (the renderer draws bursts for a moment).
     pub events: Vec<Event>,
+    /// Per note: caught (or a grey that was hit), so it is gone from the road. Missed notes stay
+    /// and fly past.
+    collected: Vec<bool>,
 }
 
 impl Ride {
     /// Start riding `map` at song time `t` (mid-song is fine).
     pub fn new(map: Map, t: f32) -> Self {
         let next = map.notes.partition_point(|n| n.t < t + RUN_UP);
-        Ride { map, x: 0.0, target: 0.0, vx: 0.0, score: 0, combo: 0, best_combo: 0, caught: 0, missed: 0, greys: 0, next, start: t, last_t: t, events: Vec::new() }
+        let collected = vec![false; map.notes.len()];
+        Ride { map, x: 0.0, target: 0.0, vx: 0.0, score: 0, combo: 0, best_combo: 0, caught: 0, missed: 0, greys: 0, next, start: t, last_t: t, events: Vec::new(), collected }
     }
 
     /// Score multiplier from the current combo: ×2 at 10, ×3 at 25, ×4 at 50.
@@ -95,6 +100,11 @@ impl Ride {
         self.next
     }
 
+    /// Note `i` was caught (or hit, for a grey) and is no longer on the road.
+    pub fn collected(&self, i: usize) -> bool {
+        self.collected.get(i).copied().unwrap_or(false)
+    }
+
     /// Advance to song time `t`, steering with `input` over `dt` seconds of frame time.
     pub fn update(&mut self, t: f32, input: Input, dt: f32) {
         // Steering: the pointer sets the target directly; keys move it.
@@ -120,6 +130,7 @@ impl Ride {
             if n.t > t {
                 break;
             }
+            let i = self.next;
             self.next += 1;
             let close = (self.x - lane_x(n.lane)).abs() < CATCH;
             match n.kind {
@@ -129,6 +140,7 @@ impl Ride {
                     self.best_combo = self.best_combo.max(self.combo);
                     self.caught += 1;
                     self.score += points as u64;
+                    self.collected[i] = true;
                     self.events.push(Event::Caught { t: n.t, lane: n.lane, colour: c, points });
                 }
                 NoteKind::Colour(_) => {
@@ -140,6 +152,7 @@ impl Ride {
                     self.combo = 0;
                     self.greys += 1;
                     self.score = self.score.saturating_sub(GREY_PENALTY as u64);
+                    self.collected[i] = true;
                     self.events.push(Event::Grey { t: n.t, lane: n.lane });
                 }
                 NoteKind::Grey => {}
@@ -191,10 +204,12 @@ mod tests {
 
     #[test]
     fn misses_and_greys_break_the_combo() {
-        let notes = vec![note(3.0, 2, NoteKind::Colour(0)), note(4.0, 2, NoteKind::Colour(0)), note(5.0, 0, NoteKind::Colour(0)), note(6.0, 2, NoteKind::Grey)];
+        let notes = vec![note(3.0, 4, NoteKind::Colour(0)), note(4.0, 4, NoteKind::Colour(0)), note(5.0, 3, NoteKind::Colour(0)), note(6.0, 4, NoteKind::Grey)];
         let mut r = Ride::new(map(notes), 0.0);
-        ride_on_lane(&mut r, 0.0, 6.5, 2);
+        ride_on_lane(&mut r, 0.0, 6.5, 4);
+        // The neighbouring lane is missed: the lanes don't overlap.
         assert_eq!((r.caught, r.missed, r.greys, r.combo), (2, 1, 1, 0));
+        assert!(r.collected(0) && r.collected(1) && !r.collected(2) && r.collected(3), "caught and hit notes leave the road; missed ones stay");
         assert_eq!(r.score, 0, "20 points minus the grey's 50 stays at zero");
         assert!(r.events.iter().any(|e| matches!(e, Event::Grey { .. })));
     }
@@ -221,6 +236,7 @@ mod tests {
             r.update(k as f32 / 60.0, Input { right: true, ..Default::default() }, 1.0 / 60.0);
         }
         assert!(r.x > 0.95 && r.x <= 1.0);
-        assert!(lane_x(0) < 0.0 && lane_x(1) == 0.0 && lane_x(2) > 0.0);
+        assert!(lane_x(0) < lane_x(1) && lane_x(1) < 0.0 && lane_x(2) == 0.0 && lane_x(4) > lane_x(3));
+        assert!((lane_x(4) - 0.8).abs() < 1e-6);
     }
 }

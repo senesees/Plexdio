@@ -268,7 +268,9 @@ fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
         let s0 = ((t * RATE as f32) as usize).min(samples.len());
         let audio = &samples[s0.saturating_sub(2048)..s0];
         vis.frame(Some((audio, RATE)), true, dt, w as f32 / h as f32);
-        if t >= shots[shot] {
+        // Grab each shot just after a catch, so the hit effects show.
+        let just_caught = ride.events.iter().any(|e| matches!(e, plexdio::game::play::Event::Caught { t: te, .. } if (0.08..0.2).contains(&(t - te))));
+        if t >= shots[shot] && just_caught {
             let clock = Instant::now();
             let craft = Craft::ALL[shot % Craft::ALL.len()];
             draw(&mut out, vis.canvas(), &ride, &geom, t, craft);

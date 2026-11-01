@@ -20,6 +20,8 @@ pub struct NowPlayingState {
     vis: Option<RetroVis>,
     /// egui time of the last visualiser frame.
     last_frame: f64,
+    /// egui time the last frame was actually drawn (`last_frame` is when it was due).
+    last_drawn: f64,
     /// egui time of the last visualiser frame drawn under a ride (which runs faster).
     last_vis: f64,
     /// The visualiser still has something to draw (false once a pause has faded out).
@@ -71,7 +73,9 @@ impl PlexdioApp {
         let fps = if np.ride.riding() { ride_prefs.fps.clamp(30, 60) } else { prefs.fps.clamp(15, 60) };
         let interval = 1.0 / fps as f64;
         if np.video.pixels.is_empty() || (now - np.last_frame >= interval * 0.9 && (np.animating || playing)) {
-            let dt = if np.last_frame == 0.0 { interval } else { (now - np.last_frame).min(0.25) } as f32;
+            // Real time since the last frame (not since it was due), so motion matches the screen.
+            let dt = if np.last_drawn == 0.0 { interval } else { (now - np.last_drawn).min(0.25) } as f32;
+            np.last_drawn = now;
             // Keep a steady cadence: the next frame is due an interval after this one was due.
             np.last_frame = if now - np.last_frame < interval * 2.0 { np.last_frame + interval } else { now };
             let mut rate = 48_000;
@@ -230,7 +234,7 @@ impl PlexdioApp {
         if alpha > 0.0 {
             self.now_playing_card(ui, rect, alpha);
         }
-        self.ride_hud(ui, rect, now);
+        self.ride_hud(ui, rect, now, resp.hovered());
         if toggle_ride {
             self.toggle_ride();
             self.np.activity = now;

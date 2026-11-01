@@ -452,7 +452,9 @@ impl PlexdioApp {
 
     /// Score, multiplier, combo and progress; "building" while the track is made; the last
     /// result for a while.
-    pub(super) fn ride_hud(&mut self, ui: &egui::Ui, rect: Rect, now: f64) {
+    /// `over_game`: the pointer is over the game itself (not a control on top of it), where the
+    /// cursor is hidden.
+    pub(super) fn ride_hud(&mut self, ui: &egui::Ui, rect: Rect, now: f64, over_game: bool) {
         let r = &self.np.ride;
         if !r.on {
             return;
@@ -480,7 +482,23 @@ impl PlexdioApp {
                 let f = (s.clock.now() as f32 / ride.map.duration.max(1.0)).clamp(0.0, 1.0);
                 let bar = Rect::from_min_size(rect.left_top() + egui::vec2(0.0, 2.0), egui::vec2(rect.width() * f, 3.0));
                 p.rect_filled(bar, 0.0, theme::ACCENT.gamma_multiply(0.8));
-                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                if over_game {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                }
+                // "+points" rising from the craft for each catch.
+                let t = s.clock.now() as f32 - self.config.ride.delay_ms as f32 / 1000.0;
+                for e in &ride.events {
+                    if let crate::game::play::Event::Caught { t: te, colour, points, .. } = *e {
+                        let age = t - te;
+                        if (0.0..0.7).contains(&age) {
+                            let a = 1.0 - age / 0.7;
+                            let x = rect.center().x + ride.x * rect.width() * 0.17;
+                            let y = rect.top() + rect.height() * 0.6 - age * 90.0;
+                            let [r, g, b] = crate::game::render::PALETTE[colour as usize].map(|v| (v.min(1.0) * 255.0) as u8);
+                            text(egui::pos2(x, y), Align2::CENTER_CENTER, &format!("+{points}"), 16.0 + age * 10.0, Color32::from_rgb(r, g, b).gamma_multiply(a));
+                        }
+                    }
+                }
             }
             (None, Some(b)) => {
                 let pct = (b.progress() * 100.0).round();

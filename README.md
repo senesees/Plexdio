@@ -119,10 +119,13 @@ Ride in a hover ship, a car or a plane:
     beat grid, loudness and sections. The **Beat This!** AI model (ISMIR 2024, built into the exe,
     runs on the CPU) then refines the beats in a few more seconds.
   - The analysis becomes a road that climbs through calm parts and drops fast through loud ones,
-    turning at section changes, with notes on the beats in three lanes. Notes are coloured cool to
-    hot by intensity; grey blocks are to be avoided.
+    turning at section changes, with notes on the beats in five lanes. Bass, mids and highs each
+    get a home lane per section and walk around it, and every other phrase mirrors the layout.
+    Notes are coloured cool to hot by intensity; grey blocks are to be avoided.
   - Steer with the mouse (its position across the view) or `←`/`→`. Catch notes, avoid greys and
-    build a combo for a ×2–×4 multiplier. You can't fail: every ride goes to the end of the song.
+    build a combo for a ×2–×4 multiplier. A catch flashes, throws sparks and a shockwave ring and
+    pops up its points; a grey flashes red and shakes the camera; missed notes fly past. You can't
+    fail: every ride goes to the end of the song.
   - The ride starts wherever the song is (with a 2 s run-up) and carries on into the next song,
     whose track is built while you ride. Each song ends with a results card (score, accuracy,
     best combo, personal best).

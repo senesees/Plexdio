@@ -1,6 +1,21 @@
 # Plan: "Ride" — an Audiosurf-style game mode
 
-**Status (2026-11-01): built: spike and steps 2–5 all done.**
+**Status (2026-11-01): built: spike and steps 2–5 all done, plus a round of feedback fixes.**
+
+Feedback round (after first play):
+- The cursor is hidden only over the game surface (`resp.hovered()`), not over controls.
+- There are 5 lanes (2 m apart, catch window 0.18). Bands get per-section home lanes plus a
+  walking pattern, and every other phrase (4 bars) mirrors the layout. Quick successions may move
+  ≤ 2 lanes within 0.3 s and ≤ 1 within 0.2 s.
+- Judder: the old `SongClock` stepped 15 % towards each stale report, often backwards. The new
+  clock estimates the position as the report plus its age and follows it with a slew of at most
+  ±10 % speed, never backwards while playing; it snaps only past 0.25 s. Frame `dt` is now real
+  time since the last drawn frame, not since it was due.
+- Missed notes stay on the road, dimmed, until behind the camera; caught ones and hit greys are
+  gone (`Ride::collected`).
+- Hit effects: a flash, 18 sparks and a shockwave ring travelling with the craft, an edge flash
+  and a "+points" pop-up. A grey hit gives a red wash and a camera shake.
+- The road is 96 % opaque (was 80 %).
 
 Step 5 notes (AI tier, craft, settings, README):
 - The Beat This! small model and its mel front end live in `assets/models/` and are embedded with
@@ -81,7 +96,7 @@ Step 2 notes:
 - Songs: the ride **continues into the next song**, whose map is built in the background, with a
   score toast between songs.
 - Steering: **free**. The mouse's horizontal position is the road position and the arrow keys
-  move smoothly; notes sit in 3 lanes.
+  move smoothly; notes sit in 5 lanes (3 in the first version).
 - Failing: **never**. Every ride reaches the end of the song.
 - Difficulty: Casual, Pro and Elite, with scores kept per level.
 - Windows mouse and keyboard only (no gamepad).

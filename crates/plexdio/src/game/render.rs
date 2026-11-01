@@ -2,7 +2,7 @@
 //! road in 3D with a chase camera, the notes as glowing blocks, the craft and hit bursts. Flat
 //! shading and painter's order, PS1 style, all on the CPU.
 
-use super::mapgen::{Map, NoteKind, COLOURS, ROAD_HZ};
+use super::mapgen::{Map, NoteKind, COLOURS, LANES, ROAD_HZ};
 use super::play::{lane_x, Event, Ride};
 use crate::ui::retrovis::canvas::{Canvas, Rgb};
 use crate::ui::retrovis::math3d::{v3, Camera, V3};
@@ -12,9 +12,14 @@ use serde::{Deserialize, Serialize};
 pub const PALETTE: [Rgb; COLOURS as usize] = [[0.25, 0.4, 1.0], [0.7, 0.3, 1.0], [0.15, 0.95, 0.5], [1.0, 0.8, 0.15], [1.0, 0.25, 0.15]];
 const GREY: Rgb = [0.45, 0.45, 0.5];
 
-/// Road half-width in metres, and metres per unit of steering (lanes sit at ±0.7 of it).
-const HALF_WIDTH: f32 = 5.0;
-const STEER_M: f32 = 4.2;
+/// Road half-width in metres, and metres per unit of steering (the five lanes sit 2 m apart,
+/// out to ±0.8 of it).
+const HALF_WIDTH: f32 = 5.6;
+const STEER_M: f32 = 5.0;
+/// How opaque the road is over the visualiser.
+const ROAD_ALPHA: f32 = 0.96;
+/// How long hit effects last, in seconds.
+const BURST: f32 = 0.6;
 /// How far ahead and behind the craft the road is drawn, and the segment length.
 const AHEAD: f32 = 230.0;
 const BEHIND: f32 = 12.0;
@@ -107,14 +112,23 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
     // The camera sits behind the craft, follows its steering a little and looks along the road.
     let behind = geom.at(d_ship - CAM_BACK);
     let lat = ride.x * STEER_M;
-    let cam_pos = behind.pos.add(v3(0.0, CAM_UP, 0.0)).add(behind.right().mul(lat * 0.55));
+    // Hitting a grey shakes the camera for a moment.
+    let shake = ride
+        .events
+        .iter()
+        .filter_map(|e| if let Event::Grey { t: te, .. } = *e { Some(t - te) } else { None })
+        .filter(|age| (0.0..0.35).contains(age))
+        .map(|age| (1.0 - age / 0.35) * 0.25 * (age * 70.0).sin())
+        .sum::<f32>();
+    let cam_pos = behind.pos.add(v3(0.0, CAM_UP + shake * 0.5, 0.0)).add(behind.right().mul(lat * 0.55 + shake));
     let view = View { cam: Camera { focal: 1.25, ..Camera::new(out.w, out.h) }, pos: cam_pos, yaw: ship.heading, pitch: ship.pitch - CAM_TILT };
 
     let road = map.road_at(t);
     let tint = intensity_colour(road.intensity);
-    // The edges flash on every beat.
+    // The edges flash on every beat, and brighter on every catch.
     let since_beat = map.beats.iter().rev().find(|&&b| b <= t).map_or(9.0, |b| t - b);
-    let pulse = (-since_beat * 7.0).exp();
+    let since_catch = ride.events.iter().rev().find_map(|e| if let Event::Caught { t: te, .. } = *e { Some(t - te) } else { None }).filter(|a| *a >= 0.0).unwrap_or(9.0);
+    let pulse = (-since_beat * 7.0).exp() + 1.5 * (-since_catch * 9.0).exp();
 
     // Road, far to near.
     let first = ((d_ship - BEHIND) / SEG).floor() as i64;
@@ -137,14 +151,14 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
         // Alternate shades give a sense of speed.
         let shade = if k.rem_euclid(2) == 0 { 1.0 } else { 0.7 };
         let c = [(0.03 + tint[0] * 0.12) * shade * fog, (0.03 + tint[1] * 0.12) * shade * fog, (0.06 + tint[2] * 0.14) * shade * fog];
-        out.tri_flat([(p[0].0, p[0].1), (p[1].0, p[1].1), (p[2].0, p[2].1)], c, 0.8);
-        out.tri_flat([(p[0].0, p[0].1), (p[2].0, p[2].1), (p[3].0, p[3].1)], c, 0.8);
+        out.tri_flat([(p[0].0, p[0].1), (p[1].0, p[1].1), (p[2].0, p[2].1)], c, ROAD_ALPHA);
+        out.tri_flat([(p[0].0, p[0].1), (p[2].0, p[2].1), (p[3].0, p[3].1)], c, ROAD_ALPHA);
         edges_l.push((p[0].0, p[0].1));
         edges_r.push((p[1].0, p[1].1));
-        // Lane dividers, dashed.
+        // Lane dividers (halfway between lanes), dashed.
         if k.rem_euclid(3) != 0 {
-            for side in [-0.35f32, 0.35] {
-                let m = side * STEER_M * 2.0;
+            for i in 0..LANES - 1 {
+                let m = (lane_x(i) + lane_x(i + 1)) / 2.0 * STEER_M;
                 if let (Some(a), Some(b)) = (view.project(f0.pos.add(f0.right().mul(m))), view.project(f1.pos.add(f1.right().mul(m)))) {
                     out.line(a.0, a.1, b.0, b.1, tint, 0.5 * fog, 1.0);
                 }
@@ -155,10 +169,12 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
     out.polyline(&edges_l, tint, edge, 2.0, false);
     out.polyline(&edges_r, tint, edge, 2.0, false);
 
-    // Notes, far to near.
-    let from = ride.next_note();
-    let ahead: Vec<_> = map.notes[from..].iter().take_while(|n| map.distance_at(n.t) < d_ship + AHEAD).collect();
-    for n in ahead.iter().rev() {
+    // Notes, far to near: everything ahead, plus missed notes until they are behind the camera
+    // (caught ones are gone).
+    let from = ride.next_note().min(map.notes.partition_point(|n| map.distance_at(n.t) < d_ship - CAM_BACK + 1.0));
+    let visible: Vec<usize> = (from..map.notes.len()).take_while(|&i| map.distance_at(map.notes[i].t) < d_ship + AHEAD).filter(|&i| !ride.collected(i)).collect();
+    for &i in visible.iter().rev() {
+        let n = map.notes[i];
         let d = map.distance_at(n.t);
         let f = geom.at(d);
         let centre = f.pos.add(f.right().mul(lane_x(n.lane) * STEER_M));
@@ -167,24 +183,81 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
             NoteKind::Grey => (GREY, true),
         };
         let far = ((d - d_ship) / AHEAD).clamp(0.0, 1.0);
-        draw_block(out, &view, centre, f, c, 1.0 - far * 0.6, grey);
+        // Missed notes dim as they go past.
+        let light = if d < d_ship { 0.45 } else { 1.0 - far * 0.6 };
+        draw_block(out, &view, centre, f, c, light, grey);
     }
 
-    // Bursts for what was just caught.
+    // Hit effects travel with the craft (a burst left where the note was would fall behind the
+    // camera within a tenth of a second).
     let ship_pos = ship.pos.add(ship.right().mul(lat));
+    let fx = geom.at(d_ship + 1.5);
     for e in &ride.events {
-        if let Event::Caught { t: te, colour, .. } = *e {
-            let age = t - te;
-            if (0.0..0.4).contains(&age) {
-                if let Some((x, y, z)) = view.project(ship_pos.add(v3(0.0, 0.8, 1.5))) {
-                    let r = (6.0 + age * 60.0) * 8.0 / z.max(1.0);
-                    out.glow(x, y, r, PALETTE[colour as usize], 1.2 * (1.0 - age / 0.4));
+        match *e {
+            Event::Caught { t: te, lane, colour, .. } => {
+                let age = t - te;
+                if (0.0..BURST).contains(&age) {
+                    let at = fx.pos.add(fx.right().mul(lane_x(lane) * STEER_M)).add(v3(0.0, 0.6, 0.0));
+                    burst(out, &view, at, fx, age, PALETTE[colour as usize], te, 1.0);
                 }
             }
+            Event::Grey { t: te, lane } => {
+                let age = t - te;
+                if (0.0..BURST).contains(&age) {
+                    let at = fx.pos.add(fx.right().mul(lane_x(lane) * STEER_M)).add(v3(0.0, 0.8, 0.0));
+                    burst(out, &view, at, fx, age, [1.0, 0.2, 0.15], te, 0.7);
+                    // A red flash over the whole picture.
+                    let k = (1.0 - age / BURST).powi(2) * 0.18;
+                    out.wash([1.0, 0.1, 0.05], k);
+                }
+            }
+            Event::Missed { .. } => {}
         }
     }
 
     draw_craft(out, &view, ship, ship_pos, ride.vx, tint, craft, t);
+}
+
+/// A hit: a flash, sparks flying out and falling, and a shockwave ring on the road. `seed`
+/// (the note's time) makes each burst different but the same on every frame.
+#[allow(clippy::too_many_arguments)]
+fn burst(out: &mut Canvas, view: &View, at: V3, f: Frame, age: f32, c: Rgb, seed: f32, strength: f32) {
+    let k = 1.0 - age / BURST;
+    let Some((x, y, z)) = view.project(at) else { return };
+    let scale = 8.0 / z.max(1.0);
+    // Flash.
+    if age < 0.15 {
+        out.glow(x, y, (14.0 + age * 120.0) * scale, [1.0, 1.0, 1.0], 1.6 * (1.0 - age / 0.15) * strength);
+    }
+    out.glow(x, y, (10.0 + age * 40.0) * scale, c, 1.1 * k * strength);
+    // Sparks: 18 per hit, out and up, then falling.
+    let mut h = (seed * 1000.0) as u32 ^ 0x9e37_79b9;
+    let mut rnd = || {
+        h ^= h << 13;
+        h ^= h >> 17;
+        h ^= h << 5;
+        (h >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let (r, fwd) = (f.right(), v3(f.heading.sin(), 0.0, f.heading.cos()));
+    for _ in 0..18 {
+        let (a, up, speed) = (rnd() * std::f32::consts::TAU, 2.0 + rnd() * 5.0, 4.0 + rnd() * 8.0);
+        let v = r.mul(a.cos() * speed).add(fwd.mul(a.sin() * speed * 0.6));
+        let p = at.add(v.mul(age)).add(v3(0.0, up * age - 9.0 * age * age, 0.0));
+        if let Some((sx, sy, _)) = view.project(p) {
+            out.glow(sx, sy, 1.6 + 2.0 * k, c, 1.4 * k * strength);
+        }
+    }
+    // Shockwave ring on the road surface.
+    let radius = 0.5 + age * 9.0;
+    let ring: Vec<(f32, f32)> = (0..24)
+        .filter_map(|i| {
+            let a = i as f32 / 24.0 * std::f32::consts::TAU;
+            view.project(at.add(r.mul(a.cos() * radius)).add(fwd.mul(a.sin() * radius)).add(v3(0.0, -0.5, 0.0))).map(|q| (q.0, q.1))
+        })
+        .collect();
+    if ring.len() == 24 {
+        out.polyline(&ring, c, 0.9 * k * strength, 1.0, true);
+    }
 }
 
 /// The background, darkened so the road reads on top (scaled when sizes differ).
@@ -213,7 +286,7 @@ fn intensity_colour(v: f32) -> Rgb {
 
 /// A note block: a box sitting on the road, flat-shaded, with a glow (greys don't glow).
 fn draw_block(out: &mut Canvas, view: &View, centre: V3, f: Frame, c: Rgb, light: f32, grey: bool) {
-    let (w, h, l) = (2.2, if grey { 2.0 } else { 1.1 }, 1.6);
+    let (w, h, l) = (1.6, if grey { 1.8 } else { 1.0 }, 1.5);
     let r = f.right();
     let fwd = v3(f.heading.sin(), 0.0, f.heading.cos());
     let up = v3(0.0, 1.0, 0.0);
@@ -399,8 +472,11 @@ mod tests {
         }
         let lit = out.px.iter().filter(|p| p[0] + p[1] + p[2] > 0.05).count();
         assert!(lit > out.px.len() / 10, "only {lit} pixels drawn");
-        // The craft sits low in the middle of the picture.
-        let mid = out.px[(out.h * 3 / 4) * out.w + out.w / 2];
-        assert!(mid.iter().sum::<f32>() > 0.3, "{mid:?}");
+        // The craft sits low in the middle of the picture: bright pixels there.
+        let craft = (out.h * 55 / 100..out.h * 85 / 100)
+            .flat_map(|y| (out.w * 40 / 100..out.w * 60 / 100).map(move |x| (x, y)))
+            .filter(|&(x, y)| out.px[y * out.w + x].iter().sum::<f32>() > 1.5)
+            .count();
+        assert!(craft > 200, "only {craft} bright pixels where the craft should be");
     }
 }

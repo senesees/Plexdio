@@ -9,7 +9,7 @@ use super::analysis::{sample_curve, smooth, Analysis, INTENSITY_HZ};
 use serde::{Deserialize, Serialize};
 
 /// Lanes across the road (steering is free; notes sit on these).
-pub const LANES: u8 = 3;
+pub const LANES: u8 = 5;
 /// Note colours, from cool (few points) to hot (many points).
 pub const COLOURS: u8 = 5;
 /// Samples per second of the road curves.
@@ -149,6 +149,17 @@ impl Rng {
     }
 }
 
+/// The most lanes a note may be from the previous one, `gap` seconds later.
+fn max_jump(gap: f32) -> u8 {
+    if gap < 0.2 {
+        1
+    } else if gap < 0.3 {
+        2
+    } else {
+        LANES
+    }
+}
+
 /// A stable seed from a text key (e.g. the track's key), so maps don't change between runs.
 pub fn seed_for(key: &str) -> u64 {
     // FNV-1a.
@@ -217,8 +228,22 @@ fn place_notes(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<Note> {
     }
     cands.sort_by(|x, y| x.0.total_cmp(&y.0));
 
-    // Lane per band, reshuffled each section so the patterns vary.
-    let perms: Vec<[u8; 3]> = a.sections.iter().map(|_| [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]][rng.below(6) as usize]).collect();
+    // Each section gives the three bands a home lane on the left, in the middle and on the right
+    // (shuffled), and a walking pattern: successive notes of a band step around their home lane,
+    // so runs move like a melody instead of hammering one lane.
+    const ORDERS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    const WALKS: [[i8; 4]; 4] = [[0, 1, 0, -1], [0, -1, 0, 1], [0, 0, 1, 1], [0, 1, 1, 0]];
+    let homes: Vec<[u8; 3]> = a
+        .sections
+        .iter()
+        .map(|_| {
+            let order = ORDERS[rng.below(6) as usize];
+            let spots = [rng.below(2) as u8, LANES / 2, LANES - 1 - rng.below(2) as u8];
+            [spots[order[0]], spots[order[1]], spots[order[2]]]
+        })
+        .collect();
+    let walks: Vec<[i8; 4]> = a.sections.iter().map(|_| WALKS[rng.below(4) as usize]).collect();
+    let mut steps = [0usize; 3];
 
     let mut scored: Vec<(Note, f32)> = Vec::new();
     let mut oi = 0;
@@ -240,7 +265,14 @@ fn place_notes(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<Note> {
             continue;
         }
         let section = a.section_at(t);
-        let lane = perms.get(section).map_or(band, |perm| perm[band as usize]);
+        let home = homes.get(section).map_or(band * 2, |h| h[band as usize]);
+        let walk = walks.get(section).map_or(0, |w| w[steps[band as usize] % 4]);
+        steps[band as usize] += 1;
+        let lane = (home as i8 + walk).clamp(0, LANES as i8 - 1) as u8;
+        // Every other phrase (four bars) mirrors the layout, so one busy band doesn't keep you
+        // on one side of the road.
+        let phrase = a.downbeats.partition_point(|&d| d <= t + 1e-3) / 4;
+        let lane = if phrase % 2 == 1 { LANES - 1 - lane } else { lane };
         let colour = ((0.7 * intensity + 0.3 * strength) * COLOURS as f32).clamp(0.0, (COLOURS - 1) as f32) as u8;
         scored.push((Note { t, lane, kind: NoteKind::Colour(colour) }, score));
     }
@@ -255,11 +287,13 @@ fn place_notes(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<Note> {
             notes.insert(i, note);
         }
     }
-    // Quick successions only move one lane at a time.
+    // Quick successions move at most two lanes (one when very quick), towards where they were
+    // going.
     for i in 1..notes.len() {
         let (prev, cur) = (notes[i - 1], notes[i]);
-        if cur.t - prev.t < 0.3 && cur.lane.abs_diff(prev.lane) > 1 {
-            notes[i].lane = 1;
+        let max = max_jump(cur.t - prev.t);
+        if cur.lane.abs_diff(prev.lane) > max {
+            notes[i].lane = if cur.lane > prev.lane { prev.lane + max } else { prev.lane - max };
         }
     }
 
@@ -315,9 +349,7 @@ mod tests {
             assert!(!colour.is_empty(), "{d:?} has notes");
             for w in colour.windows(2) {
                 assert!(w[1].t - w[0].t >= gap - 1e-4, "{d:?}: notes {:.3}s apart", w[1].t - w[0].t);
-                if w[1].t - w[0].t < 0.3 {
-                    assert!(w[1].lane.abs_diff(w[0].lane) <= 1, "{d:?}: lane jump at {}", w[1].t);
-                }
+                assert!(w[1].lane.abs_diff(w[0].lane) <= max_jump(w[1].t - w[0].t), "{d:?}: lane jump at {}", w[1].t);
             }
             for n in &m.notes {
                 assert!(n.lane < LANES && n.t >= 0.0 && n.t <= m.duration);
@@ -330,6 +362,8 @@ mod tests {
                 assert!(!colour.iter().any(|n| n.lane == g.lane && (n.t - g.t).abs() < 0.5), "{d:?}: grey on a note's lane at {}", g.t);
             }
             assert!(m.notes.windows(2).all(|w| w[0].t <= w[1].t));
+            let used: std::collections::HashSet<u8> = colour.iter().map(|n| n.lane).collect();
+            assert!(used.len() >= 4, "{d:?}: notes only on lanes {used:?}");
         }
     }
 
