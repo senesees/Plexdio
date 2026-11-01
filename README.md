@@ -168,9 +168,7 @@ works for testing. An ID entered in Settings always wins.
 ## Status
 
 Tested against **mockplex**, the mock Plex server in this repository, under Wine and on a
-real Windows 11 VM. **It has never talked to a real Plex server or plex.tv** — see
-[What is not verified](#what-is-not-verified), which also has the manual checklist for a
-real account.
+real Windows 11 VM. **It has never talked to a real Plex server or plex.tv.**
 
 | Area | Verified |
 |---|---|
@@ -357,71 +355,3 @@ and failing) and casting to the mock's fake players. Unit tests cover the equali
 bypass, band gain, drawn response), the Discord IPC exchange against a fake Discord socket,
 the LRC parser, the visualiser's FFT, the cache schema migration, selection and the library
 filters.
-
-## What is not verified
-
-- **A real Plex account and a real server.** Everything was tested against `mockplex`. The
-  real plex.tv PIN page, real token formats, real library quirks and Plex Pass features
-  (`nearest` sonic data, related-artist hubs, transcoder variants) are untested.
-- **Real audio output.** Neither Wine nor the Windows VM has an audio device, so playback ran
-  through the null sink. Decoding, mixing, the equaliser and caching are covered by tests and
-  the engine logs, but nobody has heard it yet.
-- **Discord with a real Discord client and a real application ID** (none is built in; users
-  enter their own in Settings).
-- **Windows desktop behaviour of the custom frame**: live redraw while dragging an edge,
-  Aero Snap, and the 760×480 minimum size coming back after the mini-player were only seen
-  under Wine.
-- **Download reconnect** has no automated test that cuts a connection mid-stream yet.
-- **The tray icon and menu** were only exercised on the Windows VM (the icon appears and the
-  log confirms registration); the popup menu's look and the tooltip were not photographed.
-- **Hardware media keys** were verified through SMTC (`TryTogglePlayPauseAsync`) and through
-  `xdotool` under Wine; an actual keyboard's media keys were not pressed.
-- **Long-running behaviour** (hours of playback, cache eviction under real use, sleep/resume)
-  is not covered.
-- **Queue restore while the server is unreachable.** A normal start resumes the saved queue, track
-  and position. If the app starts offline it opens the cached library without restoring the queue;
-  downloaded songs can be played, and the queue comes back on the next start once the server is
-  reachable.
-- **Endpoints taken from python-plexapi but not tried on a real server**: renaming a playlist
-  (`PUT /playlists/{id}?title=`), the lyrics stream content (`/library/streams/{id}`, text or
-  JSON is accepted) and the whole remote-control (cast) protocol. Not every player accepts
-  remote control, and Plexamp on the desktop may not show up as a target.
-- **Downloaded album art** lives in the normal image cache and can be evicted when it is full;
-  offline pages then show the placeholder art.
-
-### Manual checklist for a real Plex account
-
-1. Start `plexdio.exe` on Windows 10/11; click **Sign in with Plex**, complete the browser
-   flow, and confirm the server list appears with your own and shared servers.
-2. Open a music library; let the first sync finish (progress shows in the sidebar). Restart
-   the app and confirm it opens on the library without asking again.
-3. Play an MP3, a FLAC and an ALAC/M4A track; check sound, the seek bar moving, gapless
-   between tracks of an album, seek, next/previous and the volume slider.
-4. Enable crossfade (5 s) in Settings and confirm the tracks overlap; toggle normalisation and
-   compare loudness between a loud and a quiet album.
-5. Turn the equaliser on, pick *Bass boost*, then drag a band while a song plays; the change
-   should be audible at once and survive a restart.
-6. Set a bitrate cap (e.g. 192 kbps) and confirm the log reports `(transcode)` for the next
-   track; set it back to Original.
-7. While a song plays, briefly disconnect the network; it should carry on after reconnecting
-   (the log shows `reconnecting at byte …`).
-8. Press play/pause/next on the keyboard's media keys; open the Windows media flyout (volume
-   keys) and confirm the title/artist and the seek bar; use the flyout's buttons.
-9. Drag the title bar, double-click it, resize from an edge and a corner (content should follow
-   the mouse), snap to a screen edge; minimise to tray, close to tray, restore from the tray
-   icon; open the mini-player (`Ctrl+M`), drag it, return to the full window.
-10. Search (`Ctrl+F`) for an artist with accents; check the results match the server.
-11. Start a radio from a track and from an artist (the Radio page opens); let a queue run out
-    with autoplay on. Open an artist page and check *Fans also like*.
-12. Create a playlist, add songs from three places (right-click, a selection, an album page),
-    reorder by dragging, remove one and rename it; check the result in Plex Web.
-13. Open the lyrics panel on a song with an `.lrc` file (or LyricFind lyrics with Plex Pass):
-    the lines should follow the music; click a line to jump.
-14. Download an album, switch the network off, restart the app and play it; switch the network
-    back on and check the play shows up in Plex.
-15. Open Plexamp or a Plex app on a phone, cast to it from the bar's cast button (then to two
-    players at once), pause/skip from Plexdio, and take the music back with *This computer*.
-16. Follow [Discord setup](#discord-setup) (the link in *Settings → Discord* opens it), then play a
-    song and check your Discord status; pause and confirm it clears.
-17. Rate a track 5 stars and check it appears in Most played after a while; sign out and back in
-    to confirm the token is cleared and re-stored.
