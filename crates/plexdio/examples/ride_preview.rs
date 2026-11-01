@@ -15,6 +15,10 @@
 
 use plexdio::game::analysis::{analyse, decode_mono, Analysis, RATE};
 use plexdio::game::mapgen::{generate, seed_for, Difficulty, Map, NoteKind, LANES};
+use plexdio::game::play::{lane_x, Input, Ride};
+use plexdio::game::render::{draw, RoadGeom};
+use plexdio::ui::retrovis::canvas::Canvas;
+use plexdio::ui::retrovis::{RetroPrefs, RetroVis};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -26,6 +30,7 @@ const ROW_H: u32 = 150;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let clicks = args.iter().any(|a| a == "--clicks");
+    let frames = args.iter().any(|a| a == "--frames");
     let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let out = Path::new("target/ride");
     std::fs::create_dir_all(out).expect("create target/ride");
@@ -39,7 +44,7 @@ fn main() {
                 let file = std::fs::File::open(p).map_err(|e| eprintln!("{f}: {e}")).ok()?;
                 let ext = p.extension().and_then(|e| e.to_str()).map(str::to_lowercase);
                 let t = Instant::now();
-                let samples = decode_mono(Box::new(file), ext.as_deref(), &AtomicBool::new(false)).map_err(|e| eprintln!("{f}: {e}")).ok()?;
+                let samples = decode_mono(Box::new(file), ext.as_deref(), &AtomicBool::new(false), None).map_err(|e| eprintln!("{f}: {e}")).ok()?;
                 let name = p.file_stem().map_or("song".into(), |s| s.to_string_lossy().into_owned());
                 Some((name, samples, t.elapsed().as_secs_f64()))
             })
@@ -73,6 +78,12 @@ fn main() {
         println!("    → {}", png.display());
         let beats_txt = out.join(format!("{name}.beats.txt"));
         std::fs::write(&beats_txt, a.beats.iter().map(|b| format!("{b:.3}\n")).collect::<String>()).expect("write beats");
+        if frames {
+            let png = out.join(format!("{name}-ride.png"));
+            let (img, stats) = ride_frames(&samples, maps[1].clone());
+            img.save(&png).expect("write png");
+            println!("    → {} ({stats})", png.display());
+        }
         if clicks {
             let wav = out.join(format!("{name}-clicks.wav"));
             write_wav(&wav, &with_clicks(&samples, &a)).expect("write wav");
@@ -214,4 +225,49 @@ fn synthetic() -> Vec<f32> {
             }
         })
         .collect()
+}
+
+/// Ride the whole song with an autopilot and grab six frames (2 × 3 grid of 480×270).
+fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
+    let (w, h) = (480usize, 270usize);
+    let geom = RoadGeom::new(&map);
+    let duration = map.duration;
+    let mut ride = Ride::new(map, 0.0);
+    let mut vis = RetroVis::new(RetroPrefs { preset: Some("Tunnel".into()), cycle_secs: 0, ..Default::default() });
+    let mut out = Canvas::new(w, h);
+    let mut sheet = image::RgbImage::new(w as u32 * 3, h as u32 * 2);
+    let shots: Vec<f32> = (1..=6).map(|k| duration * k as f32 / 7.0).collect();
+    let (dt, mut t, mut shot) = (1.0 / 60.0, 0.0f32, 0);
+    let mut render_ms = 0.0;
+    let mut frames = 0;
+    let mut pixels = Vec::new();
+    while t < duration && shot < shots.len() {
+        t += dt;
+        // Autopilot: head for the next coloured note's lane.
+        let target = ride.map.notes[ride.next_note()..].iter().find(|n| matches!(n.kind, NoteKind::Colour(_))).map_or(0.0, |n| lane_x(n.lane));
+        ride.update(t, Input { pointer: Some(target / 2.4 + 0.5), ..Default::default() }, dt);
+        let s0 = ((t * RATE as f32) as usize).min(samples.len());
+        let audio = &samples[s0.saturating_sub(2048)..s0];
+        vis.frame(Some((audio, RATE)), true, dt, w as f32 / h as f32);
+        if t >= shots[shot] {
+            let clock = Instant::now();
+            draw(&mut out, vis.canvas(), &ride, &geom, t);
+            render_ms += clock.elapsed().as_secs_f64() * 1000.0;
+            frames += 1;
+            out.to_rgb_u32(&mut pixels, false);
+            let (ox, oy) = ((shot % 3 * w) as u32, (shot / 3 * h) as u32);
+            for (i, p) in pixels.iter().enumerate() {
+                sheet.put_pixel(ox + (i % w) as u32, oy + (i / w) as u32, image::Rgb([(p >> 16) as u8, (p >> 8) as u8, *p as u8]));
+            }
+            shot += 1;
+        }
+    }
+    // Time a few more frames for a steadier figure.
+    let clock = Instant::now();
+    for _ in 0..60 {
+        draw(&mut out, vis.canvas(), &ride, &geom, t);
+    }
+    let per = clock.elapsed().as_secs_f64() * 1000.0 / 60.0;
+    let stats = format!("score {}, caught {}, missed {}, greys {}, best combo {}; draw {:.2} ms/frame ({:.2} for the shots)", ride.score, ride.caught, ride.missed, ride.greys, ride.best_combo, per, render_ms / frames.max(1) as f64);
+    (sheet, stats)
 }

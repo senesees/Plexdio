@@ -9,7 +9,7 @@
 use crate::audio::decode::{DecodeError, TrackDecoder};
 use crate::ui::visualiser::fft;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use symphonia::core::io::MediaSource;
 
 /// Sample rate the analysis works at.
@@ -103,16 +103,21 @@ pub(crate) fn sample_curve(curve: &[f32], x: f32) -> f32 {
     a + (b - a) * f
 }
 
-/// Decode a whole song to mono at [`RATE`]. `cancel` stops early (returns what was decoded).
-pub fn decode_mono(source: Box<dyn MediaSource>, ext_hint: Option<&str>, cancel: &AtomicBool) -> Result<Vec<f32>, DecodeError> {
+/// Decode a whole song to mono at [`RATE`]. `cancel` stops early (returns what was decoded);
+/// `progress` receives 0..=1000 (per mille of the song) when the length is known.
+pub fn decode_mono(source: Box<dyn MediaSource>, ext_hint: Option<&str>, cancel: &AtomicBool, progress: Option<&AtomicU32>) -> Result<Vec<f32>, DecodeError> {
     let mut dec = TrackDecoder::open(source, ext_hint, RATE)?;
-    let mut out = Vec::with_capacity(dec.total_frames().unwrap_or(0) as usize);
+    let total = dec.total_frames().unwrap_or(0) as usize;
+    let mut out = Vec::with_capacity(total);
     while !cancel.load(Ordering::Relaxed) {
         let block = dec.next_block(16_384)?;
         if block.is_empty() {
             break;
         }
         out.extend(block.as_chunks::<2>().0.iter().map(|[l, r]| (l + r) * 0.5));
+        if let (Some(p), true) = (progress, total > 0) {
+            p.store((out.len() * 1000 / total).min(1000) as u32, Ordering::Relaxed);
+        }
     }
     Ok(out)
 }

@@ -183,6 +183,46 @@ impl Canvas {
         }
     }
 
+    /// Filled triangle in one colour, blended over what is there with opacity `a`. Much faster
+    /// than [`Canvas::tri`]: each row is one span, with no per-pixel weights. Covers the pixels
+    /// whose centres are inside.
+    pub fn tri_flat(&mut self, p: [(f32, f32); 3], c: Rgb, a: f32) {
+        let mut v = p;
+        v.sort_by(|m, n| m.1.total_cmp(&n.1));
+        let [(x0, y0), (x1, y1), (x2, y2)] = v;
+        if y2 - y0 < 1e-6 || !(x0.is_finite() && x1.is_finite() && x2.is_finite()) {
+            return;
+        }
+        let (w, h) = (self.w as i32, self.h as i32);
+        let ys = ((y0 - 0.5).ceil() as i32).max(0);
+        let ye = ((y2 - 0.5).ceil() as i32).min(h);
+        let (cr, cg, cb) = (c[0] * a, c[1] * a, c[2] * a);
+        let keep = 1.0 - a;
+        for y in ys..ye {
+            let fy = y as f32 + 0.5;
+            let xa = x0 + (x2 - x0) * (fy - y0) / (y2 - y0);
+            let xb = if fy < y1 {
+                if y1 - y0 > 1e-6 { x0 + (x1 - x0) * (fy - y0) / (y1 - y0) } else { x1 }
+            } else if y2 - y1 > 1e-6 {
+                x1 + (x2 - x1) * (fy - y1) / (y2 - y1)
+            } else {
+                x1
+            };
+            let (l, r) = if xa < xb { (xa, xb) } else { (xb, xa) };
+            let xs = ((l - 0.5).ceil() as i32).max(0);
+            let xe = ((r - 0.5).ceil() as i32).min(w);
+            if xs >= xe {
+                continue;
+            }
+            let row = y as usize * self.w;
+            for px in &mut self.px[row + xs as usize..row + xe as usize] {
+                px[0] = px[0] * keep + cr;
+                px[1] = px[1] * keep + cg;
+                px[2] = px[2] * keep + cb;
+            }
+        }
+    }
+
     /// `self = self * (1 - k) + other * k` (crossfading two presets of the same size).
     pub fn mix_from(&mut self, other: &Canvas, k: f32) {
         if other.px.len() != self.px.len() {
@@ -230,6 +270,25 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_triangles_cover_what_gouraud_ones_do() {
+        let tris = [[(3.2, 4.1), (60.7, 10.3), (20.5, 44.9)], [(-10.0, -5.0), (70.0, 20.0), (5.0, 80.0)], [(10.0, 10.0), (40.0, 10.0), (25.0, 10.0)], [(50.0, 2.0), (51.0, 60.0), (49.5, 30.0)]];
+        for p in tris {
+            let (mut a, mut b) = (Canvas::new(64, 48), Canvas::new(64, 48));
+            a.tri(p, [[1.0; 3]; 3], 1.0, false);
+            b.tri_flat(p, [1.0; 3], 1.0);
+            let (ca, cb) = (a.px.iter().filter(|q| q[0] > 0.5).count(), b.px.iter().filter(|q| q[0] > 0.5).count());
+            let differ = a.px.iter().zip(&b.px).filter(|(x, y)| (x[0] > 0.5) != (y[0] > 0.5)).count();
+            // Only edge pixels may differ.
+            assert!(differ <= (ca.max(cb) / 20).max(3), "{p:?}: {ca} vs {cb} pixels, {differ} differ");
+        }
+        // Blending: half over a lit canvas.
+        let mut c = Canvas::new(8, 8);
+        c.wash([1.0, 0.0, 0.0], 1.0);
+        c.tri_flat([(0.0, 0.0), (8.0, 0.0), (0.0, 8.0)], [0.0, 0.0, 1.0], 0.5);
+        assert_eq!(c.px[0], [0.5, 0.0, 0.5]);
+    }
 
     #[test]
     fn drawing_is_clipped_and_additive() {

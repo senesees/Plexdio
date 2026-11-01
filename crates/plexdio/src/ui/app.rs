@@ -36,6 +36,7 @@ use super::runner::UiApp;
 use super::theme;
 
 mod now_playing;
+mod ride;
 
 pub const TOKEN_NAME: &str = "plex-token";
 /// Client size of the mini-player window (logical points).
@@ -908,12 +909,14 @@ impl PlexdioApp {
         let (mut toggle, mut seek, mut skip, mut volume, mut mini) = (false, 0i64, 0i32, 0.0f32, false);
         let mut zoom: Option<i32> = None;
         let mut np = false;
+        let steering = self.route == Route::NowPlaying && self.np.ride.on;
         ui.input_mut(|i| {
             toggle = i.consume_key(egui::Modifiers::NONE, egui::Key::Space);
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+            // While riding, ← → steer instead of seeking.
+            if !steering && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
                 seek += 5_000;
             }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+            if !steering && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
                 seek -= 5_000;
             }
             if i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowRight) {
@@ -4291,6 +4294,10 @@ impl UiApp for PlexdioApp {
                 self.draw_toast(ui.ctx());
             }
             Screen::Main => {
+                // Ride mode lives on the Now playing page only.
+                if self.np.ride.on && self.route != Route::NowPlaying {
+                    self.toggle_ride();
+                }
                 if self.mixes_dirty && self.route == Route::Home {
                     self.refresh_mixes();
                 }

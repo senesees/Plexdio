@@ -1,7 +1,8 @@
 //! The Now playing page: the retro visualiser filling the view (or the whole screen), with the
 //! song's cover and title fading in on track changes and mouse movement, like the Xbox
-//! dashboard. Keys: ↑/↓ change the preset, A toggles automatic changes, F11 or a double-click
-//! toggles full screen, Esc leaves full screen (then the page).
+//! dashboard. Keys: ↑/↓ change the preset, A toggles automatic changes, G rides the song (see
+//! [`super::ride`]), F11 or a double-click toggles full screen, Esc leaves the ride, then full
+//! screen, then the page.
 
 use super::{PlexdioApp, Route};
 use crate::audio::engine::PlayState;
@@ -19,6 +20,8 @@ pub struct NowPlayingState {
     vis: Option<RetroVis>,
     /// egui time of the last visualiser frame.
     last_frame: f64,
+    /// egui time of the last visualiser frame drawn under a ride (which runs faster).
+    last_vis: f64,
     /// The visualiser still has something to draw (false once a pause has faded out).
     animating: bool,
     samples: Vec<f32>,
@@ -39,17 +42,23 @@ pub struct NowPlayingState {
     pub video: crate::ui::runner::VideoFrame,
     /// There is a frame to show this frame (the page was drawn).
     pub video_on: bool,
+    /// Ride mode (the game over the visualiser).
+    pub ride: super::ride::RideState,
 }
 
 impl PlexdioApp {
     pub(super) fn now_playing_view(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
+        let pass_start = std::time::Instant::now();
         let now = ui.input(|i| i.time);
         let ctx = ui.ctx().clone();
         let prefs = self.config.retro.clone();
         let playing = self.playback.state == PlayState::Playing && self.cast.is_none();
         let track = self.playback.track.as_ref().map(|t| t.id);
+        let position_ms = self.playback.position_ms;
+        self.ride_manage(now, &ctx);
         let np = &mut self.np;
+        np.ride.input(ui, rect);
         if track != np.track {
             np.track = track;
             np.activity = now;
@@ -57,11 +66,13 @@ impl PlexdioApp {
         let vis = np.vis.get_or_insert_with(|| RetroVis::new(prefs.clone()));
         vis.prefs = prefs.clone();
 
-        // A new visualiser frame at the chosen rate.
-        let interval = 1.0 / prefs.fps.clamp(15, 60) as f64;
+        // A new visualiser frame at the chosen rate (a ride always runs at 60).
+        let fps = if np.ride.riding() { 60 } else { prefs.fps.clamp(15, 60) };
+        let interval = 1.0 / fps as f64;
         if np.video.pixels.is_empty() || (now - np.last_frame >= interval * 0.9 && (np.animating || playing)) {
             let dt = if np.last_frame == 0.0 { interval } else { (now - np.last_frame).min(0.25) } as f32;
-            np.last_frame = now;
+            // Keep a steady cadence: the next frame is due an interval after this one was due.
+            np.last_frame = if now - np.last_frame < interval * 2.0 { np.last_frame + interval } else { now };
             let mut rate = 48_000;
             let have = match self.engine.as_ref().filter(|_| playing) {
                 Some(e) => e.scope().lock().map(|sc| {
@@ -71,10 +82,16 @@ impl PlexdioApp {
                 None => false,
             };
             let audio = have.then_some((np.samples.as_slice(), rate));
-            let clock = std::time::Instant::now();
-            np.animating = vis.frame(audio, playing, dt, rect.aspect_ratio());
-            np.stats_ms += clock.elapsed().as_secs_f64() * 1000.0;
-            np.stats_frames += 1;
+            // Under a ride the visualiser is only the backdrop: it keeps its own frame rate.
+            let vis_interval = 1.0 / prefs.fps.clamp(15, 60) as f64;
+            if !np.ride.riding() || now - np.last_vis >= vis_interval * 0.9 || np.last_vis == 0.0 {
+                let vis_dt = if np.ride.riding() && np.last_vis > 0.0 { (now - np.last_vis).min(0.25) as f32 } else { dt };
+                np.last_vis = now;
+                let clock = std::time::Instant::now();
+                np.animating = vis.frame(audio, playing, vis_dt, rect.aspect_ratio());
+                np.stats_ms += clock.elapsed().as_secs_f64() * 1000.0;
+                np.stats_frames += 1;
+            }
             if now - np.stats_since >= 10.0 {
                 if np.stats_frames > 1 && np.stats_since > 0.0 {
                     let (w, h) = vis.size();
@@ -89,13 +106,19 @@ impl PlexdioApp {
                 np.stats_frames = 0;
                 np.stats_ms = 0.0;
             }
-            let (w, h) = vis.size();
-            vis.pixels_u32(&mut np.video.pixels);
-            np.video.w = w;
-            np.video.h = h;
+            if !np.ride.frame(vis.canvas(), position_ms, playing, dt, rect.aspect_ratio(), prefs.dither, &mut np.video) {
+                let (w, h) = vis.size();
+                vis.pixels_u32(&mut np.video.pixels);
+                np.video.w = w;
+                np.video.h = h;
+            }
         }
         if np.animating || playing {
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(interval));
+            // Wake when the next frame is due, not a whole interval after this pass (extra
+            // passes in between would otherwise halve the frame rate).
+            // The delay counts from now, partway through this pass.
+            let due = (np.last_frame + interval - now - pass_start.elapsed().as_secs_f64()).clamp(0.0, interval);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(due));
         }
 
         // Input: mouse movement shows the overlay; double-click toggles full screen.
@@ -107,15 +130,18 @@ impl PlexdioApp {
             np.fullscreen = !np.fullscreen;
         }
         let typing = ctx.egui_wants_keyboard_input();
-        let (up, down, auto, f11, esc) = ui.input_mut(|i| {
+        let (up, down, auto, f11, esc, ride_key) = ui.input_mut(|i| {
             (
                 !typing && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
                 !typing && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
                 !typing && i.consume_key(egui::Modifiers::NONE, egui::Key::A),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F11),
                 !typing && i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                !typing && i.consume_key(egui::Modifiers::NONE, egui::Key::G),
             )
         });
+        let mut toggle_ride = ride_key;
+        let ride_on = np.ride.on;
         let mut step = 0;
         if up {
             step = -1;
@@ -128,7 +154,9 @@ impl PlexdioApp {
         }
         let mut leave = false;
         if esc {
-            if np.fullscreen {
+            if ride_on {
+                toggle_ride = true;
+            } else if np.fullscreen {
                 np.fullscreen = false;
             } else {
                 leave = true;
@@ -170,6 +198,12 @@ impl PlexdioApp {
                         self.np.fullscreen = !self.np.fullscreen;
                     }
                     ui.add_space(8.0);
+                    let ride_text = RichText::new(if ride_on { "Stop riding" } else { "Ride" }).size(13.0).color(if ride_on { Color32::BLACK } else { theme::TEXT });
+                    let fill = if ride_on { theme::ACCENT } else { Color32::from_black_alpha(140) };
+                    if ui.add(egui::Button::new(ride_text).fill(fill).corner_radius(12)).on_hover_text("Ride the song: steer with the mouse or ← → and catch the notes (G)").clicked() {
+                        toggle_ride = true;
+                    }
+                    ui.add_space(8.0);
                     let auto_text = RichText::new("Auto").size(13.0).color(if auto_on { Color32::BLACK } else { theme::TEXT });
                     let fill = if auto_on { theme::ACCENT } else { Color32::from_black_alpha(140) };
                     if ui.add(egui::Button::new(auto_text).fill(fill).corner_radius(12)).on_hover_text("Change the look by itself (A)").clicked() {
@@ -194,6 +228,11 @@ impl PlexdioApp {
         }
         if alpha > 0.0 {
             self.now_playing_card(ui, rect, alpha);
+        }
+        self.ride_hud(ui, rect, now);
+        if toggle_ride {
+            self.toggle_ride();
+            self.np.activity = now;
         }
 
         if step != 0 {

@@ -44,7 +44,7 @@ pub struct TrackSpec {
 }
 
 impl TrackSpec {
-    fn ext_hint(&self) -> Option<&str> {
+    pub(crate) fn ext_hint(&self) -> Option<&str> {
         match &self.source {
             SourceSpec::Local(path) => Path::new(path).extension().and_then(|e| e.to_str()),
             // The server transcoder always produces MP3; direct streams keep their part extension.

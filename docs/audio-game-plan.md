@@ -1,7 +1,26 @@
 # Plan: "Ride" — an Audiosurf-style game mode
 
-**Status (2026-11-01): spike done; step 2 done (analysis, map generator, preview tool, in
-`crates/plexdio/src/game/` and `examples/ride_preview.rs`). Next: step 3, the game core.**
+**Status (2026-11-01): spike, step 2 and step 3 done. Next: step 4 (caching, scores, results).**
+
+Step 3 notes (game core):
+- Modules: `game/clock.rs` (smoothed audible-position clock), `game/play.rs` (steering, catch and
+  miss, greys, combo ×1–×4, seek skip, 2 s run-up), `game/render.rs` (road geometry, chase camera,
+  road, notes, craft, bursts over the dimmed visualiser), `game/build.rs` (background analysis
+  through a second `AudioCache` reader, below-normal priority on Windows) and `ui/app/ride.rs`
+  (ride mode: `G` or the Ride button, HUD, carrying on into the next song).
+- In the app:
+  - ← → steer instead of seek while riding.
+  - Leaving the page ends ride mode.
+  - The visualiser backdrop keeps its own 30 fps while the game runs at 60.
+- Performance: the game draw is 0.42 ms per frame on Linux and ~2.7 ms on the VM (480×300). That
+  needed `Canvas::tri_flat`, a scanline fill; the Polygon look uses it too.
+  - Full screen on the VM is a steady 60 fps at ~50–55 % of a core. That figure is inflated by the
+    mock's 8 s songs, which keep fading the song overlay in; real songs are estimated in the high
+    30s %.
+- Frame pacing lessons: on Windows the timer resolution is raised to 1 ms (`timeBeginPeriod`)
+  while riding. The repaint delay must be counted from when it is requested, keeping a steady
+  frame cadence; otherwise frames run at 40–45 fps.
+- Preview: `ride_preview --frames` renders six moments of an autopilot ride.
 
 Step 2 notes:
 - The classic analysis is fast: a 2:35 song decodes in 0.36 s and analyses in 0.15 s (Linux).

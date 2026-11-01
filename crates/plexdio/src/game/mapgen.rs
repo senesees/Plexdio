@@ -15,9 +15,10 @@ pub const COLOURS: u8 = 5;
 /// Samples per second of the road curves.
 pub const ROAD_HZ: f32 = 10.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Difficulty {
     Casual,
+    #[default]
     Pro,
     Elite,
 }
@@ -175,7 +176,7 @@ fn build_road(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<RoadSample> {
     // ±1.5 s: the road reacts to the music but doesn't jitter.
     let level = smooth(&raw, (1.5 * ROAD_HZ) as usize);
     // Each section turns one way (or runs straight), eased in and out.
-    let turns: Vec<f32> = a.sections.iter().map(|_| [-0.22, -0.12, 0.0, 0.12, 0.22][rng.below(5) as usize]).collect();
+    let turns: Vec<f32> = a.sections.iter().map(|_| [-0.11, -0.06, 0.0, 0.06, 0.11][rng.below(5) as usize]).collect();
     let turn: Vec<f32> = (0..n)
         .map(|i| {
             let t = i as f32 / ROAD_HZ;
@@ -189,7 +190,7 @@ fn build_road(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<RoadSample> {
             let t = i as f32 / ROAD_HZ;
             let l = level[i];
             // A slow sway on top, so straight sections aren't dead straight.
-            let sway = 0.05 * (t * 0.37).sin();
+            let sway = 0.03 * (t * 0.37).sin();
             RoadSample { slope: (0.5 - l) * 0.5, curve: turn[i] + sway, speed: p.speed * (0.7 + 0.6 * l), intensity: l }
         })
         .collect()

@@ -75,6 +75,8 @@ pub struct Config {
     pub downloads_lan_only: bool,
     /// The Now playing page's retro visualiser.
     pub retro: crate::ui::retrovis::RetroPrefs,
+    /// Ride (the game on the Now playing page).
+    pub ride: crate::game::RidePrefs,
 }
 
 impl Default for Config {
@@ -111,6 +113,7 @@ impl Default for Config {
             visualiser: Default::default(),
             downloads_lan_only: false,
             retro: Default::default(),
+            ride: Default::default(),
         }
     }
 }

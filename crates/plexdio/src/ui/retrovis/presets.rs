@@ -445,7 +445,7 @@ impl Preset for Polygon {
             let shade = 0.35 + 0.85 * (-n.dot(light)).max(0.0);
             let col = scale(pal.at(f.t * 0.03 + fi as f32 / self.faces.len() as f32 * 0.35), shade);
             let tri = [(s0.0, s0.1), (s1.0, s1.1), (s2.0, s2.1)];
-            cv.tri(tri, [col; 3], 1.0, false);
+            cv.tri_flat(tri, col, 1.0);
             // Bright edges, PS1 wireframe style.
             cv.polyline(&tri, scale(col, 1.6), 0.25, 1.0, true);
         }
