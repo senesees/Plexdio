@@ -1,11 +1,59 @@
 # Plan: "Ride" — an Audiosurf-style game mode
 
-**Status (2026-11-01): plan, waiting for answers to the questions at the end.**
+**Status (2026-11-01): plan agreed, spike done (results below). Next: analysis and map generator.**
+
+**Decisions:**
+- Gameplay: collect and dodge. Coloured notes give points, grey blocks are to be avoided, and
+  streaks build a combo multiplier. There is no match-3 grid and there are no ship rules.
+- Models: a choice of hover ship, car or plane, all with the same gameplay (no runner).
+- AI: Beat This! small is **built into the exe** (about 23 MB in total), so it works offline.
+- Songs: the ride **continues into the next song**, whose map is built in the background, with a
+  score toast between songs.
+- Steering: **free**. The mouse's horizontal position is the road position and the arrow keys
+  move smoothly; notes sit in 3 lanes.
+- Failing: **never**. Every ride reaches the end of the song.
+- Difficulty: Casual, Pro and Elite, with scores kept per level.
+- Windows mouse and keyboard only (no gamepad).
 
 Turn the song that is playing into a track you ride on, Audiosurf style. The track and its notes
 are generated from the song itself. You steer a model (a hover ship, car, plane or runner) with the
 mouse or the arrow keys and collect notes, and the retro visualiser plays behind it. The music
 never stops: the game can be started in the middle of a song and picks up from where the song is.
+
+## Spike results (2026-11-01)
+
+Tested on three real songs (70 s, 100 s and 155 s), on Linux (32 cores) and on the Windows 11 VM
+(4 vCPUs, i9-14900):
+- **Beat This! small via `beat-this` 1.1 on rten** cross-builds to `x86_64-pc-windows-gnu` with
+  system DLLs only. It loads in 0.02 s.
+  - Analysis takes about **2 % of the song's length on the VM**: 1.7 s, 2.1 s and 3.1 s, so about
+    5 s for a 4-minute song. It is effectively single-threaded, so it won't load the PC.
+  - Results are identical on Linux and Windows.
+- **Beat quality:**
+  - On a steady orchestral piece it is excellent: interval variation 6 %, and it lands on hits
+    better than librosa.
+  - On two busy game tracks it **flips between tempo levels** (0.31 s ↔ 0.62 s beats) and jitters
+    in intros. This is expected without the model's "DBN" smoothing step.
+  - librosa's classic tracker picked half or other tempo levels on all three songs.
+  - **Consequence:** the analyser needs its own *steady-grid pass*: pick one tempo level per
+    section from the model's beats plus the onset curve, then fit a regular grid with phase
+    corrections (dynamic programming). Notes snap to that grid, not to the raw beats.
+- **Basic Pitch** (`nmp.onnx`, 230 KB) runs on rten once its tensor names are made unique.
+  - The tf2onnx export gives an operator and its output the same name, which rten keeps in one
+    namespace. A one-off ONNX rename script fixes it, and the fixed file is the one we embed.
+  - Its outputs match ONNX Runtime to 4–5 significant figures.
+  - Speed: about 20 ms per 2 s window, so about 2.5 s per 4-minute song.
+  - So melodic note onsets are affordable too.
+- **Size:** rten adds about 3.3 MB. The models are 10.6 MB (beat), 0.27 MB (mel) and 0.23 MB (notes).
+  The expected exe is about **25 MB**.
+  - **Gotcha:** our release profile is `opt-level = "z"`; rten and the analysis code need
+    `[profile.release.package.rten] opt-level = 3` (and the same for rten's crates) or inference
+    slows down.
+  - `beat-this` only loads models from a file path, so the embedded bytes are written once to the
+    cache dir, or loaded through our own small `Model` implementation on `rten::Model::load`.
+- **Getting the audio:** decoding happens through a second `AudioCache` reader (see below). The
+  crate's own `decode` feature (symphonia 0.6, all codecs) is not used; we pass samples to
+  `analyze_audio`.
 
 ## What Audiosurf does (and what we copy)
 
@@ -18,7 +66,7 @@ never stops: the game can be started in the middle of a song and picks up from w
 - **The analysis is cached.** It took Audiosurf 20–30 s per song in 2008, and a replay of the
   same song loads instantly.
 - Audiosurf also collects blocks into a 3×7 grid and scores match-3 combinations, and ship types
-  change the rules. Both are optional for us (question 1).
+  change the rules. We leave both out (collect and dodge only).
 
 ## Research: music analysis, and whether AI helps
 
@@ -70,7 +118,7 @@ because it needs a native DLL and would break the "one exe, system DLLs only" ru
   the first notes come from the horizon. `Esc` returns to the plain visualiser, and the music
   carries on throughout.
 - **Song changes.** While riding, the next song in the queue is analysed in the background, so
-  the ride continues smoothly into it (question 4). Seeking re-syncs the ride. Pausing the music
+  the ride continues smoothly into it. Seeking re-syncs the ride. Pausing the music
   pauses the ride. Casting turns the game off, because the audio is not local.
 
 ## Parts
@@ -89,7 +137,7 @@ It is versioned, so a better analyser invalidates old caches.
 ### 2. AI tier: `game/ai.rs` (M, can be switched off)
 The `beat-this` crate (rten) with the small model, giving beats and downbeats. It runs at low
 thread priority after the signal-processing pass. Later, optionally, Basic Pitch for melodic
-onsets. How the model ships is question 3.
+onsets. The model is embedded in the exe (`include_bytes!`).
 
 ### 3. Map generator: `game/mapgen.rs` (M)
 `Analysis` becomes a `Map`:
@@ -114,8 +162,8 @@ It is deterministic (the seed is the track key), so a map can be rebuilt from it
 - **State:** the position along the road (from the audio clock), lateral position, collected and
   missed notes, score, combo and multiplier (going up with streaks, reset by a grey), plus
   per-song stats.
-- **Input:** the mouse's horizontal position steers (absolute within the view, smoothed);
-  `←`/`→` or `A`/`D` jump lanes; optional free steering instead of lanes.
+- **Input:** free steering. The mouse's horizontal position is the road position (absolute
+  within the view, smoothed), and `←`/`→` or `A`/`D` steer smoothly.
 - **Rendering**, with `math3d` (already used by the Polygon, Terrain and Tunnel looks):
   - the road ribbon with lane lines and beat pulses;
   - the notes as glowing blocks with additive glow;
@@ -123,7 +171,7 @@ It is deterministic (the seed is the track key), so a map can be rebuilt from it
   - a chase camera that leans into curves;
   - sparks and flashes on collection, which also feed the visualiser's beat input.
 - **Models**, built in code (no asset files): hover ship, car, plane, and a runner with a
-  procedural run cycle. Which ones is question 2.
+  procedural run cycle. We build the ship, car and plane (no runner).
 
 ### 5. Storage (S)
 - Schema v3 (`LibraryDb::migrate`, which keeps existing data).
@@ -181,19 +229,3 @@ It is deterministic (the seed is the track key), so a map can be rebuilt from it
 5. The AI tier, the other models, difficulty, settings, README and screenshots.
 
 Rough size: L to XL overall (about 6–9 days). The spike decides the AI part.
-
-## Questions
-1. **Gameplay depth:** just collect notes, avoid greys and build combos? Or also Audiosurf's 3×7
-   match-3 grid and ship-specific rules (Mono, Vegas…)?
-2. **Models:** which first: hover ship (simplest, closest to Audiosurf), car, plane or runner
-   (needs a run animation)? Should all of them be selectable, with the same gameplay?
-3. **AI model shipping:** embed the Beat This! small model in the exe (about +12 MB with the
-   runtime, so ~23 MB total), download it on first use (~10 MB, one time), or signal processing
-   only for now with AI later?
-4. **Across songs:** should the ride continue into the next song in the queue automatically,
-   or end with a results card after each song?
-5. **Controls:** three lanes, or free steering across the road (mouse position = road position)?
-   Is "mouse X steers absolutely" fine?
-6. **Failing:** can you fail (Audiosurf's Ironmode: too many greys ends the ride, or a health
-   bar)? Or does it always ride to the end and only the score differs?
-7. **Difficulty:** three levels (Casual / Pro / Elite) OK?
