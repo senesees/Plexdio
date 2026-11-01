@@ -216,6 +216,11 @@ impl RetroVis {
         egui::ColorImage::new([self.out.w, self.out.h], std::mem::take(&mut self.rgba))
     }
 
+    /// The current frame as 0x00RRGGBB pixels (the window's direct path).
+    pub fn pixels_u32(&self, out: &mut Vec<u32>) {
+        self.out.to_rgb_u32(out, self.prefs.dither);
+    }
+
     /// The current frame (the preview tool writes it to PNG).
     pub fn canvas(&self) -> &Canvas {
         &self.out
@@ -288,5 +293,47 @@ mod tests {
             v.frame(Some((&audio, 48_000)), true, 1.0 / 30.0, 16.0 / 9.0);
         }
         assert_ne!(v.name(), "Scope");
+    }
+}
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+    use std::time::Instant;
+
+    /// `cargo test --release -p plexdio --lib retrovis::timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn parts() {
+        let n = 300;
+        let mut a = Canvas::new(320, 180);
+        a.px.iter_mut().enumerate().for_each(|(i, p)| *p = [(i % 7) as f32 / 7.0; 3]);
+        let mut b = Canvas::new(320, 180);
+        let polar = feedback::Polar::new(320, 180);
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            let t = Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            println!("{name:<22} {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        };
+        time("feedback zoom", &mut || feedback::apply(&a, &mut b, &feedback::Warp { zoom: 1.02, ..Default::default() }, 0.0, &polar));
+        time("feedback swirl", &mut || feedback::apply(&a, &mut b, &feedback::Warp { zoom: 1.02, swirl: 0.1, ..Default::default() }, 0.0, &polar));
+        time("feedback kaleido", &mut || feedback::apply(&a, &mut b, &feedback::Warp { zoom: 1.02, kaleido: 6, rot: 0.01, ..Default::default() }, 0.0, &polar));
+        time("blur", &mut || feedback::blur(&a, &mut b));
+        let mut out = Vec::new();
+        time("to_rgb_u32", &mut || a.to_rgb_u32(&mut out, true));
+        time("canvas clone", &mut || {
+            let c = a.clone();
+            std::hint::black_box(c);
+        });
+        let audio: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.05).sin()).collect();
+        let mut an = analysis::Analyzer::default();
+        time("analysis (FFT)", &mut || {
+            an.update(Some((&audio[..2048], 48_000)), 1.0 / 30.0);
+        });
+        time("fade", &mut || a.fade(0.99));
+        time("ring glow w3", &mut || b.ring(160.0, 90.0, 60.0, [1.0; 3], 0.5, 3.0, |_| 0.0));
+        time("ring thin", &mut || b.ring(160.0, 90.0, 60.0, [1.0; 3], 0.5, 1.0, |_| 0.0));
     }
 }

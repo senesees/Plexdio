@@ -17,7 +17,6 @@ const OVERLAY_FADE: f64 = 0.6;
 #[derive(Default)]
 pub struct NowPlayingState {
     vis: Option<RetroVis>,
-    tex: Option<egui::TextureHandle>,
     /// egui time of the last visualiser frame.
     last_frame: f64,
     /// The visualiser still has something to draw (false once a pause has faded out).
@@ -33,10 +32,13 @@ pub struct NowPlayingState {
     preset_shown: f64,
     /// Frames drawn and effect time since `stats_since` (logged every 10 s).
     stats_frames: u32,
-    /// Flipped every visualiser frame (see the tint below).
-    flip: bool,
     stats_ms: f64,
     stats_since: f64,
+    /// The current frame, scaled straight into the window by the runner before egui draws
+    /// (the overlay, menus and dialogs land on top of it).
+    pub video: crate::ui::runner::VideoFrame,
+    /// There is a frame to show this frame (the page was drawn).
+    pub video_on: bool,
 }
 
 impl PlexdioApp {
@@ -57,7 +59,7 @@ impl PlexdioApp {
 
         // A new visualiser frame at the chosen rate.
         let interval = 1.0 / prefs.fps.clamp(15, 60) as f64;
-        if np.tex.is_none() || (now - np.last_frame >= interval * 0.9 && (np.animating || playing)) {
+        if np.video.pixels.is_empty() || (now - np.last_frame >= interval * 0.9 && (np.animating || playing)) {
             let dt = if np.last_frame == 0.0 { interval } else { (now - np.last_frame).min(0.25) } as f32;
             np.last_frame = now;
             let mut rate = 48_000;
@@ -87,21 +89,10 @@ impl PlexdioApp {
                 np.stats_frames = 0;
                 np.stats_ms = 0.0;
             }
-            let opts = if prefs.smooth { egui::TextureOptions::LINEAR } else { egui::TextureOptions::NEAREST };
-            np.flip = !np.flip;
-            let img = vis.image();
-            match &mut np.tex {
-                // The software renderer keeps a texture's first size, so a new size (the view
-                // changed shape, e.g. full screen) needs a new texture.
-                Some(t) if t.size() == img.size => t.set(img, opts),
-                _ => np.tex = Some(ctx.load_texture("retrovis", img, opts)),
-            }
-        }
-        if let Some(t) = &np.tex {
-            // The software renderer caches drawn shapes by geometry, colour and texture id, not
-            // by texture contents: alternating an invisible tint makes every new frame count.
-            let tint = if np.flip { Color32::WHITE } else { Color32::from_rgb(254, 254, 254) };
-            ui.painter().image(t.id(), rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+            let (w, h) = vis.size();
+            vis.pixels_u32(&mut np.video.pixels);
+            np.video.w = w;
+            np.video.h = h;
         }
         if np.animating || playing {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(interval));
@@ -160,6 +151,11 @@ impl PlexdioApp {
         let auto_on = prefs.cycle_secs > 0;
         let fullscreen = np.fullscreen;
         let preset_alpha = alpha.max((1.0 - ((now - np.preset_shown - 1.5) / 0.5).clamp(0.0, 1.0)) as f32);
+        // The picture goes straight into the window, under everything egui draws: far cheaper
+        // than an egui image, which the software renderer would redraw in full every frame.
+        np.video_on = !np.video.pixels.is_empty();
+        np.video.rect = rect;
+        np.video.smooth = prefs.smooth;
         if alpha > 0.0 || preset_alpha > 0.0 {
             let mut ov = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(18.0)).layout(egui::Layout::top_down(egui::Align::LEFT)));
             ov.multiply_opacity(alpha);

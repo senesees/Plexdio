@@ -34,28 +34,46 @@ impl Default for Warp {
     }
 }
 
+/// `floor` without a library call (baseline x86-64 has no rounding instruction).
+#[inline(always)]
+fn ffloor(v: f32) -> f32 {
+    let t = v as i32 as f32;
+    if t > v {
+        t - 1.0
+    } else {
+        t
+    }
+}
+
 /// Bilinear sample of `c` at a fractional pixel position; black outside.
-#[inline]
+#[inline(always)]
 fn sample(c: &Canvas, x: f32, y: f32) -> [f32; 3] {
     let (x, y) = (x - 0.5, y - 0.5);
-    let (x0, y0) = (x.floor(), y.floor());
+    let (x0, y0) = (ffloor(x), ffloor(y));
     let (fx, fy) = (x - x0, y - y0);
     let (ix, iy) = (x0 as i32, y0 as i32);
-    let get = |px: i32, py: i32| -> [f32; 3] {
-        if px < 0 || py < 0 || px >= c.w as i32 || py >= c.h as i32 {
-            [0.0; 3]
-        } else {
-            c.px[py as usize * c.w + px as usize]
-        }
+    let (w, h) = (c.w as i32, c.h as i32);
+    let (a, b, d, e) = if ix >= 0 && iy >= 0 && ix + 1 < w && iy + 1 < h {
+        // Fast path (almost every pixel): all four taps inside, one bounds check.
+        let i = iy as usize * c.w + ix as usize;
+        let row = &c.px[i..i + c.w + 2];
+        (row[0], row[1], row[c.w], row[c.w + 1])
+    } else {
+        let get = |px: i32, py: i32| -> [f32; 3] {
+            if px < 0 || py < 0 || px >= w || py >= h {
+                [0.0; 3]
+            } else {
+                c.px[py as usize * c.w + px as usize]
+            }
+        };
+        (get(ix, iy), get(ix + 1, iy), get(ix, iy + 1), get(ix + 1, iy + 1))
     };
-    let (a, b, d, e) = (get(ix, iy), get(ix + 1, iy), get(ix, iy + 1), get(ix + 1, iy + 1));
-    let mut out = [0.0; 3];
-    for k in 0..3 {
-        let top = a[k] + (b[k] - a[k]) * fx;
-        let bot = d[k] + (e[k] - d[k]) * fx;
-        out[k] = top + (bot - top) * fy;
-    }
-    out
+    let (w00, w10, w01, w11) = ((1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy);
+    [
+        a[0] * w00 + b[0] * w10 + d[0] * w01 + e[0] * w11,
+        a[1] * w00 + b[1] * w10 + d[1] * w01 + e[1] * w11,
+        a[2] * w00 + b[2] * w10 + d[2] * w01 + e[2] * w11,
+    ]
 }
 
 /// Each pixel's position in polar form (radius in half-heights and angle), plain and mirrored
@@ -64,20 +82,41 @@ pub struct Polar {
     r: Vec<f32>,
     a: Vec<f32>,
     a_mirror: Vec<f32>,
+    /// Unit direction (cos, sin of the angle), plain and mirrored: lets warps that only
+    /// depend on the radius rotate without any trig per pixel.
+    dir: Vec<(f32, f32)>,
+    dir_mirror: Vec<(f32, f32)>,
+    r_max: f32,
 }
+
+/// Radius steps in the per-frame warp table.
+const RBINS: usize = 2048;
 
 impl Polar {
     pub fn new(w: usize, h: usize) -> Self {
         let half = h as f32 / 2.0;
         let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-        let mut p = Polar { r: Vec::with_capacity(w * h), a: Vec::with_capacity(w * h), a_mirror: Vec::with_capacity(w * h) };
+        let n = w * h;
+        let mut p = Polar {
+            r: Vec::with_capacity(n),
+            a: Vec::with_capacity(n),
+            a_mirror: Vec::with_capacity(n),
+            dir: Vec::with_capacity(n),
+            dir_mirror: Vec::with_capacity(n),
+            r_max: 0.0,
+        };
         for y in 0..h {
             for x in 0..w {
                 let nx = (x as f32 + 0.5 - cx) / half;
                 let ny = (y as f32 + 0.5 - cy) / half;
-                p.r.push((nx * nx + ny * ny).sqrt());
-                p.a.push(ny.atan2(nx));
-                p.a_mirror.push(ny.atan2(nx.abs()));
+                let r = (nx * nx + ny * ny).sqrt();
+                p.r.push(r);
+                p.r_max = p.r_max.max(r);
+                let (a, am) = (ny.atan2(nx), ny.atan2(nx.abs()));
+                p.a.push(a);
+                p.a_mirror.push(am);
+                p.dir.push((a.cos(), a.sin()));
+                p.dir_mirror.push((am.cos(), am.sin()));
             }
         }
         p
@@ -95,21 +134,64 @@ pub fn apply(prev: &Canvas, out: &mut Canvas, w: &Warp, t: f32, polar: &Polar) {
     let (rs, rc) = (-w.rot).sin_cos();
     let seg = if w.kaleido > 1 { std::f32::consts::TAU / w.kaleido as f32 } else { 0.0 };
     let angles = if w.mirror { &polar.a_mirror } else { &polar.a };
+    if !use_polar && !w.mirror {
+        // Zoom, rotation and drift only: the source position moves by a constant step along a
+        // row, so it is stepped instead of recomputed per pixel.
+        let k = inv_zoom;
+        let (step_x, step_y) = (rc * k, rs * k);
+        for y in 0..prev.h {
+            let ny = (y as f32 + 0.5 - cy) / half;
+            let nx0 = (0.5 - cx) / half;
+            let mut sx = ((nx0 * rc - ny * rs) * k - w.dx) * half + cx;
+            let mut sy = ((nx0 * rs + ny * rc) * k - w.dy) * half + cy;
+            let row = &mut out.px[y * prev.w..(y + 1) * prev.w];
+            for p in row {
+                let c = sample(prev, sx, sy);
+                *p = [c[0] * w.decay, c[1] * w.decay, c[2] * w.decay];
+                sx += step_x;
+                sy += step_y;
+            }
+        }
+        return;
+    }
+    // Radius, swirl and ripple depend only on how far a pixel is from the centre: a table per
+    // frame gives each pixel's new radius and its rotation (as cos, sin).
+    let bin = (RBINS - 1) as f32 / polar.r_max.max(1e-3);
+    let table: Vec<(f32, f32, f32, f32)> = if use_polar {
+        (0..RBINS)
+            .map(|k| {
+                let r = k as f32 / bin * inv_zoom;
+                let phi = w.rot + if w.swirl != 0.0 { w.swirl * (1.0 - r.min(1.5) / 1.5) } else { 0.0 };
+                let rr = if w.ripple != 0.0 { r + w.ripple * (r * w.ripple_freq - t * 3.0).sin() } else { r };
+                let (s, c) = phi.sin_cos();
+                (rr, c, s, phi)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let dirs = if w.mirror { &polar.dir_mirror } else { &polar.dir };
+    if use_polar && seg == 0.0 {
+        for (i, p) in out.px.iter_mut().enumerate() {
+            let (rr, c, s, _) = table[((polar.r[i] * bin) as usize).min(RBINS - 1)];
+            let (ux, uy) = dirs[i];
+            // Direction rotated back by the angle from the table.
+            let (ca, sa) = (ux * c + uy * s, uy * c - ux * s);
+            let (sx, sy) = (rr * ca - w.dx, rr * sa - w.dy);
+            let v = sample(prev, sx * half + cx, sy * half + cy);
+            *p = [v[0] * w.decay, v[1] * w.decay, v[2] * w.decay];
+        }
+        return;
+    }
     for y in 0..prev.h {
         for x in 0..prev.w {
             let i = y * prev.w + x;
             let (mut sx, mut sy) = if use_polar {
-                // Zoom and rotation act on the radius and angle directly.
-                let mut r = polar.r[i] * inv_zoom;
-                let mut a = angles[i] - w.rot;
-                if w.swirl != 0.0 {
-                    a -= w.swirl * (1.0 - r.min(1.5) / 1.5);
-                }
-                if w.ripple != 0.0 {
-                    r += w.ripple * (r * w.ripple_freq - t * 3.0).sin();
-                }
+                // Kaleidoscope: the angle itself is folded, so it is needed here.
+                let (r, _, _, phi) = table[((polar.r[i] * bin) as usize).min(RBINS - 1)];
+                let mut a = angles[i] - phi;
                 if seg > 0.0 {
-                    a = a.rem_euclid(seg);
+                    a -= seg * ffloor(a / seg);
                     if a > seg / 2.0 {
                         a = seg - a;
                     }
@@ -194,8 +276,17 @@ mod tests {
         let (mut b, mut c) = (Canvas::new(32, 18), Canvas::new(32, 18));
         apply(&a, &mut b, &Warp { zoom: 1.1, rot: 0.2, decay: 1.0, ..Default::default() }, 0.0, &polar);
         apply(&a, &mut c, &Warp { zoom: 1.1, rot: 0.2, swirl: 1e-7, decay: 1.0, ..Default::default() }, 0.0, &polar);
-        let diff: f32 = b.px.iter().zip(&c.px).map(|(p, q)| (p[0] - q[0]).abs() + (p[1] - q[1]).abs()).sum();
-        assert!(diff < 1e-2, "diff {diff}");
+        // The polar path looks the radius up in a table (steps of ~1/1000 of the half height), so
+        // allow a tiny per-pixel difference.
+        let diff = b.px.iter().zip(&c.px).map(|(p, q)| (p[0] - q[0]).abs().max((p[1] - q[1]).abs())).fold(0.0f32, f32::max);
+        assert!(diff < 0.02, "max diff {diff}");
+    }
+
+    #[test]
+    fn fast_floor_rounds_down() {
+        assert_eq!(ffloor(-1.5), -2.0);
+        assert_eq!(ffloor(-2.0), -2.0);
+        assert_eq!(ffloor(2.0), 2.0);
     }
 
     #[test]

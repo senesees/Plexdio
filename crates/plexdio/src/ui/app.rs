@@ -4287,7 +4287,7 @@ impl UiApp for PlexdioApp {
             Screen::ServerSelect => self.server_screen(ui),
             Screen::Main if self.mini => self.mini_player(ui),
             Screen::Main if fullscreen => {
-                egui::CentralPanel::default().frame(egui::Frame::new().fill(egui::Color32::BLACK)).show(ui, |ui| self.now_playing_view(ui));
+                egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| self.now_playing_view(ui));
                 self.draw_toast(ui.ctx());
             }
             Screen::Main => {
@@ -4318,7 +4318,9 @@ impl UiApp for PlexdioApp {
                         .show(ui, |ui| self.queue_panel(ui));
                 }
                 if self.route == Route::NowPlaying {
-                    egui::CentralPanel::default().frame(egui::Frame::new().fill(egui::Color32::BLACK)).show(ui, |ui| self.now_playing_view(ui));
+                    // No background: the picture covers the page, and an unpainted area costs
+                    // the software renderer nothing.
+                    egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| self.now_playing_view(ui));
                 } else {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(24, 8)))
@@ -4332,6 +4334,11 @@ impl UiApp for PlexdioApp {
         if !self.mini && !fullscreen {
             super::titlebar::resize_edges(ui);
         }
+    }
+
+    fn video(&self) -> Option<&super::runner::VideoFrame> {
+        let on_page = self.screen == Screen::Main && !self.mini && self.route == Route::NowPlaying;
+        (on_page && self.np.video_on).then_some(&self.np.video)
     }
 
     fn on_exit(&mut self) {

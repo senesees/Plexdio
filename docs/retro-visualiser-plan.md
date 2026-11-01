@@ -3,11 +3,14 @@
 **Status (2026-11-01): built.** Answers: only on the Now playing page (the small bars stay as they
 are); all nine looks; on pause it fades (the Dashboard into its starfield) and then stops. Code:
 `ui/retrovis/` (engine and presets) and `ui/app/now_playing.rs` (page, overlay, full screen,
-settings); preview tool `examples/retrovis_preview.rs`. Measured on the Windows 11 VM: about 25 fps in
-full screen at about 70 % of one core, mostly the software renderer scaling the image. The direct
-blit into the window (fallback 3 below) is the remaining option if that is too much. Not done: the
-mini-player option (dropped with the "Now playing only" answer), and rendering on a separate thread
-(the effect itself is 1–5 ms, so it wasn't needed).
+settings); preview tool `examples/retrovis_preview.rs`. First measured on the Windows 11 VM at about
+25 fps in full screen and ~70 % of one core, mostly the software renderer scaling the image. Then
+optimised (2026-11-01): fallback 3 below, generalised. The picture is blitted straight into the
+window buffer *before* egui draws (`VideoFrame`/`blit_video` in `ui/runner.rs`), so the overlay,
+menus and dialogs blend on top, and the egui texture path is gone. The effect got cheaper too
+(cast-based floor/rounding, a stepped affine warp, a per-frame radius table for the polar warps).
+Result: ~26 fps at ~24 % of one core. Not done: the mini-player option (dropped with the "Now
+playing only" answer), and rendering on a separate thread (not needed).
 
 A full-screen visualiser in the style of the early-2000s console and PC players: the original
 Xbox dashboard, Windows Media Player 7–10, the PlayStation CD player's Sound Scope, and Jeff

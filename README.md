@@ -176,7 +176,7 @@ real account.
 | Downloads (pins, resume, offline play, pending scrobbles) | ✅ integration tests + Linux build offline; download on Windows 11 VM |
 | Cast / multi-cast (discovery, play queue, commands, timeline) | ✅ against the mock's fake players only |
 | Visualiser, zoom, track info | ✅ unit tests + Linux build screenshots |
-| Now playing visualiser (9 looks, full screen, pause fade) | ✅ unit tests, preview tool, Linux build, Windows 11 VM full screen (~25 fps) |
+| Now playing visualiser (9 looks, full screen, pause fade) | ✅ unit tests, preview tool, Linux build, Windows 11 VM full screen (~26 fps, ~24 % of a core) |
 | Discord Rich Presence protocol | ✅ test against a fake Discord socket; Wine (no Discord → retries quietly) |
 | Themed title bar, mini-player, settings layout | ✅ Wine screenshots |
 | Off-screen window rescue (display change, sleep) | ✅ unit tests + Windows 11 VM (window pushed to 5000,5000 came back in 3 s) |
@@ -287,11 +287,14 @@ Release exe: **10 645 504 bytes (10.15 MiB)**, PE32+ x86-64, system DLLs only.
 yet. The small visualiser redraws at 30 frames a second while on and playing (it is off by
 default); its CPU cost has not been measured on the VM yet.
 
-The **Now playing visualiser** costs about 1–5 ms per frame for the effect at 320 px wide, but the
-software renderer then scales that image to the whole view every frame: on the Windows 11 VM in
-full screen (1280×800) that is about 25 fps and **~70 % of one core** (~35–50 % in a normal
-window). It only runs while the page is open and music plays; after a pause fades out it uses
-nothing. The log reports the frame rate every 10 s while the page is open.
+The **Now playing visualiser** costs about 0.5–2.5 ms per frame for the effect at 320 px wide
+(3–4 ms on the VM). Its picture is scaled straight into the window buffer (`VideoFrame` in
+`ui/runner.rs`) under egui's shapes, not drawn as an egui image, so the software renderer only
+redraws the overlay. On the Windows 11 VM in full screen (1280×800) that is about 26 fps at
+**~24 % of one core** (it was ~70 % through egui). It only runs while the page is open and music
+plays; after a pause fades out it uses nothing. The log reports its frame rate every 10 s while
+the page is open, and `PLEXDIO_PROFILE=1` logs where each frame's time goes (ui, tessellate,
+fill, egui render, video, present).
 
 The 100 000-track case is the stress case: the compact in-memory index plus the 24 MB SQLite
 cache push the *working set* past 100 MB, while private memory stays under it. A library of a

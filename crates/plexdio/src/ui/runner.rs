@@ -37,6 +37,85 @@ pub enum WindowCmd {
     Fullscreen(bool),
 }
 
+/// A picture the app wants shown in a rectangle of the window without going through egui's
+/// rasteriser (the Now playing visualiser): scaled straight into the window buffer before egui
+/// draws, so egui's shapes (overlays, menus, dialogs) are blended on top. The area under `rect`
+/// should be left unpainted by egui, or it covers the picture.
+pub struct VideoFrame {
+    /// `w × h` pixels, 0x00RRGGBB (softbuffer's format).
+    pub pixels: Vec<u32>,
+    pub w: usize,
+    pub h: usize,
+    /// Where it goes, in egui points.
+    pub rect: egui::Rect,
+    /// Bilinear scaling instead of sharp nearest-neighbour pixels.
+    pub smooth: bool,
+}
+
+impl Default for VideoFrame {
+    fn default() -> Self {
+        Self { pixels: Vec::new(), w: 0, h: 0, rect: egui::Rect::NOTHING, smooth: false }
+    }
+}
+
+/// Scale `v` into `rect` (physical pixels, x, y, w, h) of a `bw × bh` buffer.
+pub fn blit_video(buf: &mut [u32], bw: usize, bh: usize, v: &VideoFrame, rect: (i32, i32, i32, i32)) {
+    let (rx, ry, rw, rh) = rect;
+    if v.w == 0 || v.h == 0 || rw <= 0 || rh <= 0 || v.pixels.len() < v.w * v.h || buf.len() < bw * bh {
+        return;
+    }
+    let x0 = rx.max(0) as usize;
+    let x1 = ((rx + rw) as usize).min(bw);
+    let y0 = ry.max(0) as usize;
+    let y1 = ((ry + rh) as usize).min(bh);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    if !v.smooth {
+        // Nearest neighbour: one source column per destination column, worked out once.
+        let xmap: Vec<usize> = (x0..x1).map(|x| (((x as i64 - rx as i64) * v.w as i64) / rw as i64).clamp(0, v.w as i64 - 1) as usize).collect();
+        let mut last_sy = usize::MAX;
+        for y in y0..y1 {
+            let sy = ((((y as i64 - ry as i64) * v.h as i64) / rh as i64).clamp(0, v.h as i64 - 1)) as usize;
+            let (dst_start, row_len) = (y * bw + x0, x1 - x0);
+            if sy == last_sy {
+                // Same source row as the line above: copy that line.
+                buf.copy_within(dst_start - bw..dst_start - bw + row_len, dst_start);
+                continue;
+            }
+            last_sy = sy;
+            let src = &v.pixels[sy * v.w..(sy + 1) * v.w];
+            for (d, &sx) in buf[dst_start..dst_start + row_len].iter_mut().zip(&xmap) {
+                *d = src[sx];
+            }
+        }
+        return;
+    }
+    // Bilinear, in 8-bit fixed point.
+    let fx: Vec<(usize, usize, u32)> = (x0..x1)
+        .map(|x| {
+            let f = (((x as f32 + 0.5 - rx as f32) * v.w as f32 / rw as f32) - 0.5).clamp(0.0, v.w as f32 - 1.0);
+            let i = f as usize;
+            (i, (i + 1).min(v.w - 1), ((f - i as f32) * 256.0) as u32)
+        })
+        .collect();
+    let mix = |a: u32, b: u32, t: u32| -> u32 {
+        let (it, t) = (256 - t, t);
+        let r = (((a >> 16) & 255) * it + ((b >> 16) & 255) * t) >> 8;
+        let g = (((a >> 8) & 255) * it + ((b >> 8) & 255) * t) >> 8;
+        let bl = ((a & 255) * it + (b & 255) * t) >> 8;
+        (r << 16) | (g << 8) | bl
+    };
+    for y in y0..y1 {
+        let f = (((y as f32 + 0.5 - ry as f32) * v.h as f32 / rh as f32) - 0.5).clamp(0.0, v.h as f32 - 1.0);
+        let (sy0, sy1, ty) = (f as usize, (f as usize + 1).min(v.h - 1), ((f - f.floor()) * 256.0) as u32);
+        let (r0, r1) = (&v.pixels[sy0 * v.w..(sy0 + 1) * v.w], &v.pixels[sy1 * v.w..(sy1 + 1) * v.w]);
+        for (d, &(a, b, tx)) in buf[y * bw + x0..y * bw + x1].iter_mut().zip(&fx) {
+            *d = mix(mix(r0[a], r0[b], tx), mix(r1[a], r1[b], tx), ty);
+        }
+    }
+}
+
 /// Implemented by the application.
 pub trait UiApp {
     /// Build the UI for one frame.
@@ -62,6 +141,10 @@ pub trait UiApp {
     }
     /// Called once on shutdown.
     fn on_exit(&mut self) {}
+    /// A picture to scale straight into the window under egui's shapes (see [`VideoFrame`]).
+    fn video(&self) -> Option<&VideoFrame> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,6 +187,8 @@ struct Runner<A: UiApp> {
     next_repaint: Arc<Mutex<Option<Instant>>>,
     needs_paint: bool,
     exiting: bool,
+    /// Frame timing (only with `PLEXDIO_PROFILE` set).
+    profile: Option<Profile>,
     /// When the window was last checked to still be on a monitor.
     last_screen_check: Instant,
 }
@@ -195,6 +280,7 @@ pub fn run<A: UiApp + 'static>(
         next_repaint,
         needs_paint: true,
         exiting: false,
+        profile: std::env::var_os("PLEXDIO_PROFILE").map(|_| Profile::default()),
         last_screen_check: Instant::now(),
     };
     event_loop
@@ -230,6 +316,59 @@ fn ensure_on_screen(window: &Window) {
         }
         window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
     }
+}
+
+/// Milliseconds spent per frame stage, summed until the next log line.
+#[derive(Default)]
+struct Profile {
+    frames: u32,
+    since: Option<Instant>,
+    ui: f64,
+    tess: f64,
+    fill: f64,
+    render: f64,
+    prims: usize,
+    /// Frames that showed the app's video, and their ui/render share.
+    direct_frames: u32,
+    direct_ui: f64,
+    direct_render: f64,
+    video: f64,
+    present: f64,
+}
+
+impl Profile {
+    fn maybe_log(&mut self) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= Duration::from_secs(10) && self.frames > 0 {
+            let n = self.frames as f64;
+            log::info!(
+                "frame profile: {:.1} fps; per frame ui {:.2} ms, tessellate {:.2}, fill {:.2}, egui render {:.2} ({} shapes), video {:.2}, present {:.2}",
+                n / since.elapsed().as_secs_f64(),
+                self.ui / n,
+                self.tess / n,
+                self.fill / n,
+                self.render / n,
+                self.prims / self.frames as usize,
+                self.video / n,
+                self.present / n
+            );
+            if self.direct_frames > 0 {
+                let d = self.direct_frames as f64;
+                log::info!(
+                    "frame profile, frames with video: {} of {}; per frame ui {:.2} ms, egui render {:.2}",
+                    self.direct_frames,
+                    self.frames,
+                    self.direct_ui / d,
+                    self.direct_render / d
+                );
+            }
+            *self = Profile { since: Some(Instant::now()), ..Default::default() };
+        }
+    }
+}
+
+fn ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
 }
 
 impl<A: UiApp> Runner<A> {
@@ -272,7 +411,9 @@ impl<A: UiApp> Runner<A> {
         raw_input.viewports.insert(ViewportId::ROOT, gfx.viewport_info.clone());
 
         let app = &mut self.app;
+        let t_ui = Instant::now();
         let mut full_output = self.ctx.run_ui(raw_input, |ui| app.ui(ui));
+        let ui_ms = ms(t_ui);
         gfx.pending_textures.append(std::mem::take(&mut full_output.textures_delta));
 
         gfx.state
@@ -334,7 +475,9 @@ impl<A: UiApp> Runner<A> {
         if !visible {
             return;
         }
+        let t_tess = Instant::now();
         let primitives = self.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let tess_ms = ms(t_tess);
         if let Err(e) = gfx.surface.resize(w, h) {
             log::error!("surface resize failed: {e}");
             return;
@@ -348,7 +491,21 @@ impl<A: UiApp> Runner<A> {
         };
         let bg = self.options.background;
         let bg_px = u32::from_be_bytes([0, bg.r(), bg.g(), bg.b()]);
+        let t_fill = Instant::now();
         buffer.fill(bg_px);
+        let fill_ms = ms(t_fill);
+        // The app's video goes in first; egui's layer is blended over it (only its occupied tiles).
+        let t_video = Instant::now();
+        let mut direct = false;
+        if let Some(v) = self.app.video() {
+            direct = true;
+            let ppp = full_output.pixels_per_point;
+            let r = v.rect;
+            let rect = ((r.min.x * ppp).round() as i32, (r.min.y * ppp).round() as i32, (r.width() * ppp).round() as i32, (r.height() * ppp).round() as i32);
+            blit_video(&mut buffer, w.get() as usize, h.get() as usize, v, rect);
+        }
+        let video_ms = ms(t_video);
+        let t_render = Instant::now();
         // softbuffer pixels are 0x00RRGGBB u32s, i.e. bytes B,G,R,0 in memory (little endian).
         let px: &mut [u32] = &mut buffer;
         // SAFETY: [u32] and [[u8; 4]] have the same size and alignment requirements are relaxed.
@@ -356,10 +513,28 @@ impl<A: UiApp> Runner<A> {
             unsafe { std::slice::from_raw_parts_mut(px.as_mut_ptr().cast::<[u8; 4]>(), px.len()) };
         let mut target = BufferMutRef::new(bytes, w.get() as usize, h.get() as usize);
         gfx.renderer.render(&mut target, &primitives, &gfx.pending_textures, full_output.pixels_per_point);
+        let render_ms = ms(t_render);
         // The renderer applies the deltas by reference; epaint panics if they are dropped unapplied.
         gfx.pending_textures.clear();
+        let t_present = Instant::now();
         if let Err(e) = buffer.present() {
             log::error!("present failed: {e}");
+        }
+        if let Some(p) = &mut self.profile {
+            p.frames += 1;
+            p.ui += ui_ms;
+            p.tess += tess_ms;
+            p.fill += fill_ms;
+            p.render += render_ms;
+            p.prims += primitives.len();
+            if direct {
+                p.direct_frames += 1;
+                p.direct_render += render_ms;
+                p.direct_ui += ui_ms;
+            }
+            p.video += video_ms;
+            p.present += ms(t_present);
+            p.maybe_log();
         }
     }
 }
@@ -473,6 +648,35 @@ impl<A: UiApp> ApplicationHandler<RunnerEvent> for Runner<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_is_scaled_into_its_rectangle_only() {
+        // A 2×2 picture (red, green / blue, white) scaled into a 4×4 area of a 6×6 buffer.
+        let v = VideoFrame { pixels: vec![0xff0000, 0x00ff00, 0x0000ff, 0xffffff], w: 2, h: 2, smooth: false, ..Default::default() };
+        let mut buf = vec![7u32; 36];
+        blit_video(&mut buf, 6, 6, &v, (1, 1, 4, 4));
+        assert_eq!(buf[0], 7, "outside untouched");
+        assert_eq!(buf[6 + 1], 0xff0000);
+        assert_eq!(buf[6 * 2 + 2], 0xff0000);
+        assert_eq!(buf[6 + 4], 0x00ff00);
+        assert_eq!(buf[6 * 4 + 1], 0x0000ff);
+        assert_eq!(buf[6 * 4 + 4], 0xffffff);
+        assert_eq!(buf[6 * 5 + 5], 7);
+        // Clipped at the buffer edge without panicking.
+        blit_video(&mut buf, 6, 6, &v, (4, 4, 10, 10));
+        assert_eq!(buf[6 * 5 + 5], 0xff0000);
+    }
+
+    #[test]
+    fn smooth_scaling_blends_neighbours() {
+        let v = VideoFrame { pixels: vec![0x000000, 0xc8c8c8], w: 2, h: 1, smooth: true, ..Default::default() };
+        let mut buf = vec![0u32; 8];
+        blit_video(&mut buf, 8, 1, &v, (0, 0, 8, 1));
+        assert_eq!(buf[0] & 255, 0);
+        assert_eq!(buf[7] & 255, 0xc8);
+        let mid = buf[4] & 255;
+        assert!(mid > 20 && mid < 180, "{mid}");
+    }
 
     const FHD: ScreenRect = (0, 0, 1920, 1080);
 

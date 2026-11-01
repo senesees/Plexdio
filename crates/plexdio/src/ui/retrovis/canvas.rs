@@ -12,6 +12,14 @@ pub struct Canvas {
     pub px: Vec<Rgb>,
 }
 
+/// 0..=1 to 0..=255, adding `bias` (0..1) before truncating: 0.5 rounds, a Bayer value
+/// dithers. No library call (casts truncate; values are clamped first).
+#[inline(always)]
+fn quant(v: f32, bias: f32) -> u8 {
+    let x = v.clamp(0.0, 1.0) * 255.0 + bias;
+    (x as i32).min(255) as u8
+}
+
 /// 4×4 Bayer matrix for ordered dithering (the PS1 look), as offsets in 1/255 steps.
 const BAYER: [[f32; 4]; 4] = [[0.0, 8.0, 2.0, 10.0], [12.0, 4.0, 14.0, 6.0], [3.0, 11.0, 1.0, 9.0], [15.0, 7.0, 13.0, 5.0]];
 
@@ -191,10 +199,25 @@ impl Canvas {
     pub fn to_rgba(&self, out: &mut Vec<egui::Color32>, dither: bool) {
         out.clear();
         out.reserve(self.px.len());
-        for (i, p) in self.px.iter().enumerate() {
-            let d = if dither { BAYER[(i / self.w) & 3][(i % self.w) & 3] / 16.0 - 0.5 } else { 0.0 };
-            let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0 + d).round()).clamp(0.0, 255.0) as u8;
-            out.push(egui::Color32::from_rgb(q(p[0]), q(p[1]), q(p[2])));
+        for (y, row) in self.px.chunks_exact(self.w).enumerate() {
+            let bayer = &BAYER[y & 3];
+            for (x, p) in row.iter().enumerate() {
+                let d = if dither { bayer[x & 3] / 16.0 } else { 0.5 };
+                out.push(egui::Color32::from_rgb(quant(p[0], d), quant(p[1], d), quant(p[2], d)));
+            }
+        }
+    }
+
+    /// 0x00RRGGBB pixels for the window buffer (clamped, with optional ordered dithering).
+    pub fn to_rgb_u32(&self, out: &mut Vec<u32>, dither: bool) {
+        out.clear();
+        out.reserve(self.px.len());
+        for (y, row) in self.px.chunks_exact(self.w).enumerate() {
+            let bayer = &BAYER[y & 3];
+            for (x, p) in row.iter().enumerate() {
+                let d = if dither { bayer[x & 3] / 16.0 } else { 0.5 };
+                out.push(((quant(p[0], d) as u32) << 16) | ((quant(p[1], d) as u32) << 8) | quant(p[2], d) as u32);
+            }
         }
     }
 
