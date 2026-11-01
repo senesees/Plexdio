@@ -54,6 +54,11 @@ pub fn audio_cache_dir() -> PathBuf {
     cache_dir().join("audio")
 }
 
+/// Neural-network models unpacked from the exe (Ride's beat tracker).
+pub fn model_dir() -> PathBuf {
+    cache_dir().join("models")
+}
+
 pub fn db_dir() -> PathBuf {
     cache_dir().join("db")
 }

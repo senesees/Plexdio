@@ -1,7 +1,8 @@
 # Plexdio
 
 A small, native Windows 10/11 x64 music player for Plex — a lean alternative to Plexamp.
-One self-contained exe (9.5 MB), no installer, no runtime, no Electron.
+One self-contained exe (about 25 MB, most of it Ride's beat-tracking model), no installer, no
+runtime, no Electron.
 
 *Formerly **Plexify**, then briefly **PlexDio**. Settings, the library cache, the saved sign-in and the start-with-Windows
 entry carry over automatically on first start.*
@@ -26,6 +27,14 @@ Its nine retro looks, inspired by the Xbox dashboard, Windows Media Player and t
 Sound Scope:
 
 ![The nine visualiser looks: Scope, Rings, Dashboard, Ambient, Kaleido, Polygon, Terrain, Tunnel and Cloud](docs/visualiser-looks.png)
+
+**Ride**, an Audiosurf-style game on the song that is playing (`G` on the Now playing page):
+
+![Riding a song: the road, coloured notes to catch and the hover ship over the Tunnel visualiser](docs/ride.png)
+
+Ride in a hover ship, a car or a plane:
+
+![The hover ship, the car and the plane](docs/ride-craft.png)
 
 ## What it does
 
@@ -104,6 +113,24 @@ Sound Scope:
   Settings → Now playing visualiser picks the look, change interval, resolution, sharp or smooth pixels,
   dithering and frame rate. The picture is scaled straight into the window, so full screen costs
   about a quarter of one CPU core.
+- **Ride**: an Audiosurf-style game on the song that is playing, over the visualiser. Press `G`
+  (or the Ride button) on the Now playing page at any point in a song; the music never stops.
+  - The song is analysed in the background (about a second): onsets in three bands, a steady
+    beat grid, loudness and sections. The **Beat This!** AI model (ISMIR 2024, built into the exe,
+    runs on the CPU) then refines the beats in a few more seconds.
+  - The analysis becomes a road that climbs through calm parts and drops fast through loud ones,
+    turning at section changes, with notes on the beats in three lanes. Notes are coloured cool to
+    hot by intensity; grey blocks are to be avoided.
+  - Steer with the mouse (its position across the view) or `←`/`→`. Catch notes, avoid greys and
+    build a combo for a ×2–×4 multiplier. You can't fail: every ride goes to the end of the song.
+  - The ride starts wherever the song is (with a 2 s run-up) and carries on into the next song,
+    whose track is built while you ride. Each song ends with a results card (score, accuracy,
+    best combo, personal best).
+  - Restarting the song (Previous, or seeking to the start) rides it again. `Esc` stops.
+  - Tracks and scores are kept in the library database. Settings → Storage shows the saved tracks
+    and can clear them; your scores stay.
+  - Settings → Ride: difficulty (Casual, Pro, Elite; scores per level), hover ship, car or plane,
+    30 or 60 fps, an audio delay for wireless headphones, and the AI on or off.
 - **Zoom**: 80–150 % (`Ctrl+=`, `Ctrl+−`, `Ctrl+0`, or Settings), remembered.
 - **Windows integration**: a themed title bar (drag, double-click to maximise, resize from any
   edge, live redraw while resizing), tray icon with menu, minimise/close to tray, media keys
@@ -187,6 +214,7 @@ real Windows 11 VM. **It has never talked to a real Plex server or plex.tv.**
 | Downloads (pins, resume, offline play, pending scrobbles) | ✅ integration tests + Linux build offline; download on Windows 11 VM |
 | Cast / multi-cast (discovery, play queue, commands, timeline) | ✅ against the mock's fake players only |
 | Visualiser, zoom, track info | ✅ unit tests + Linux build screenshots |
+| Ride (analysis, AI beats, maps, steering, scores, carry-on, settings) | ✅ unit tests on synthetic drums, preview tool on real songs, Linux build + Windows 11 VM against the mock (60 fps; Beat This! ~2 % of song length) |
 | Now playing visualiser (9 looks, full screen, pause fade) | ✅ unit tests, preview tool, Linux build, Windows 11 VM full screen (~26 fps, ~24 % of a core) |
 | Discord Rich Presence protocol | ✅ test against a fake Discord socket; Wine (no Discord → retries quietly) |
 | Themed title bar, mini-player, settings layout | ✅ Wine screenshots |
@@ -259,10 +287,14 @@ crates/plexdio
                      parser, cast sessions
   ui/                CPU-rendered egui: runner, app state, views, title bar, EQ editor,
                      icons, artwork cache, visualiser (FFT), retrovis/ (Now playing
-                     visualiser: canvas, feedback warps, palettes, analysis, 3D, presets)
+                     visualiser: canvas, feedback warps, palettes, analysis, 3D, presets),
+                     app/ride.rs (Ride mode on the Now playing page)
+  game/              Ride: song analysis (onsets, beat grid, sections), Beat This! AI tier,
+                     background build, map generator, song clock, ride rules, 3D renderer
   win/               tray + media keys, SMTC, autostart, single instance, Wine workarounds
 crates/mockplex      mock plex.tv + Plex Media Server (tiny_http), including playlist writes,
                      lyric streams and fake remote-controllable players
+assets/models        Ride's beat model (ONNX, embedded; see its README)
 ```
 
 Notable choices:
@@ -281,12 +313,15 @@ Notable choices:
 - **No XML.** Every request asks for `application/json`.
 
 Data locations: `%APPDATA%\Plexdio\config.json` (settings, resume queue),
-`%LOCALAPPDATA%\Plexdio\db\*.sqlite` (library cache), `…\images` (artwork, LRU),
-`…\audio` (audio cache, LRU), `…\logs\plexdio.log`.
+`%LOCALAPPDATA%\Plexdio\db\*.sqlite` (library cache, plus Ride tracks and scores), `…\images`
+(artwork, LRU), `…\audio` (audio cache, LRU), `…\models` (Ride's beat model, unpacked from the
+exe), `…\logs\plexdio.log`.
 
 ## Footprint
 
-Release exe: **10 645 504 bytes (10.15 MiB)**, PE32+ x86-64, system DLLs only.
+Release exe: **25 905 152 bytes (24.7 MiB)**, PE32+ x86-64, system DLLs only. About 11 MB of
+that is Ride's beat model and 3 MB its runtime (rten); the player itself is about 10 MB. The model
+is unpacked once into `…\models` on first use.
 
 | Environment | Library | Idle working set | Idle CPU | Playing CPU |
 |---|---|---|---|---|
@@ -306,6 +341,13 @@ redraws the overlay. On the Windows 11 VM in full screen (1280×800) that is abo
 plays; after a pause fades out it uses nothing. The log reports its frame rate every 10 s while
 the page is open, and `PLEXDIO_PROFILE=1` logs where each frame's time goes (ui, tessellate,
 fill, egui render, video, present).
+
+**Ride** draws its game picture at 480 px wide in about 0.4 ms per frame (2.7 ms on the VM), over
+the visualiser, which stays at its own frame rate. On the Windows 11 VM in full screen it holds
+60 fps at roughly 50 % of one core. That figure is inflated by the mock server's 8-second songs,
+which keep fading the song overlay in; 30 fps (Settings → Ride) roughly halves it. Analysing a
+song takes about a second (decode and analysis). The Beat This! pass takes about 2 % of the song's
+length (about 5 s for a 4-minute song on the VM), at below-normal priority, while the music plays.
 
 The 100 000-track case is the stress case: the compact in-memory index plus the 24 MB SQLite
 cache push the *working set* past 100 MB, while private memory stays under it. A library of a
@@ -339,10 +381,11 @@ memory under Wine.
 ## Testing
 
 ```sh
-cargo test --workspace                                  # 152 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, ...
+cargo test --workspace                                  # 180 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, Ride, ...
 cargo test --workspace --target x86_64-pc-windows-gnu   # same suite under Wine
 semgrep scan --config p/default --metrics off crates     # 0 findings
 cargo run --release -p plexdio --example retrovis_preview # renders every Now playing look to target/retrovis/*.png
+cargo run --release -p plexdio --example ride_preview -- --ai --frames --clicks SONG...  # Ride analysis timelines, ride shots, beat-click WAVs
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

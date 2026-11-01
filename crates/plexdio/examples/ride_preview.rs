@@ -1,7 +1,7 @@
 //! Analyse songs and build their Ride maps without starting the app, to review the beat grid,
 //! sections and note placement:
 //!
-//!     cargo run --release -p plexdio --example ride_preview [-- [--clicks] FILE...]
+//!     cargo run --release -p plexdio --example ride_preview [-- [--ai] [--clicks] [--frames] FILE...]
 //!
 //! Without files it uses a synthetic song. For each song it prints the analysis and writes
 //! `target/ride/<name>.png`, a timeline in rows of 30 s:
@@ -10,13 +10,18 @@
 //! - the beat grid (grey) and downbeats (white);
 //! - the notes for Casual, Pro and Elite (three lanes each; grey blocks in grey).
 //!
-//! It also writes the beat times to `target/ride/<name>.beats.txt`. `--clicks` also writes `target/ride/<name>-clicks.wav`: the song with a click on every beat
-//! (higher on downbeats), to check the grid by ear.
+//! It also writes the beat times to `target/ride/<name>.beats.txt`.
+//! - `--ai` adds the Beat This! model's evidence to the analysis (as the app does).
+//! - `--clicks` writes `target/ride/<name>-clicks.wav`: the song with a click on every beat
+//!   (higher on downbeats), to check the grid by ear.
+//! - `--frames` writes `target/ride/<name>-ride.png`: six moments of a Pro ride (an autopilot
+//!   steers for the notes; ship, car and plane in turn) over the Tunnel visualiser, and prints
+//!   the ride's score and draw time.
 
 use plexdio::game::analysis::{analyse, decode_mono, Analysis, RATE};
 use plexdio::game::mapgen::{generate, seed_for, Difficulty, Map, NoteKind, LANES};
 use plexdio::game::play::{lane_x, Input, Ride};
-use plexdio::game::render::{draw, RoadGeom};
+use plexdio::game::render::{draw, Craft, RoadGeom};
 use plexdio::ui::retrovis::canvas::Canvas;
 use plexdio::ui::retrovis::{RetroPrefs, RetroVis};
 use std::path::Path;
@@ -31,6 +36,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let clicks = args.iter().any(|a| a == "--clicks");
     let frames = args.iter().any(|a| a == "--frames");
+    let use_ai = args.iter().any(|a| a == "--ai");
     let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let out = Path::new("target/ride");
     std::fs::create_dir_all(out).expect("create target/ride");
@@ -52,8 +58,20 @@ fn main() {
     };
     for (name, samples, decode_s) in songs {
         let t = Instant::now();
-        let a = analyse(&samples, None);
-        let analyse_s = t.elapsed().as_secs_f64();
+        let mut a = analyse(&samples, None);
+        let mut analyse_s = t.elapsed().as_secs_f64();
+        if use_ai {
+            let t = Instant::now();
+            match plexdio::game::ai::beats(&samples, &out.join("models"), &AtomicBool::new(false)) {
+                Ok(beats) => {
+                    let classic = a.bpm;
+                    a = analyse(&samples, Some(&beats));
+                    analyse_s = t.elapsed().as_secs_f64();
+                    println!("{name}: beat model {:.2} s, {} beats, {} downbeats; grid {classic:.1} bpm classic → {:.1} bpm with the model", analyse_s, beats.beats.len(), beats.downbeats.len(), a.bpm);
+                }
+                Err(e) => eprintln!("{name}: beat model failed: {e}"),
+            }
+        }
         let maps: Vec<Map> = Difficulty::ALL.iter().map(|&d| generate(&a, d, seed_for(&name))).collect();
         println!(
             "{name}: {:.1} s long, decoded in {decode_s:.2} s, analysed in {analyse_s:.2} s; {:.1} bpm, {} beats, {} downbeats, onsets {}/{}/{} (bass/mid/high), {} sections",
@@ -252,7 +270,8 @@ fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
         vis.frame(Some((audio, RATE)), true, dt, w as f32 / h as f32);
         if t >= shots[shot] {
             let clock = Instant::now();
-            draw(&mut out, vis.canvas(), &ride, &geom, t);
+            let craft = Craft::ALL[shot % Craft::ALL.len()];
+            draw(&mut out, vis.canvas(), &ride, &geom, t, craft);
             render_ms += clock.elapsed().as_secs_f64() * 1000.0;
             frames += 1;
             out.to_rgb_u32(&mut pixels, false);
@@ -266,7 +285,7 @@ fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
     // Time a few more frames for a steadier figure.
     let clock = Instant::now();
     for _ in 0..60 {
-        draw(&mut out, vis.canvas(), &ride, &geom, t);
+        draw(&mut out, vis.canvas(), &ride, &geom, t, Craft::Ship);
     }
     let per = clock.elapsed().as_secs_f64() * 1000.0 / 60.0;
     let stats = format!("score {}, caught {}, missed {}, greys {}, best combo {}; draw {:.2} ms/frame ({:.2} for the shots)", ride.score, ride.caught, ride.missed, ride.greys, ride.best_combo, per, render_ms / frames.max(1) as f64);

@@ -3555,6 +3555,7 @@ impl PlexdioApp {
                     settings_card(&mut cols[0], "Equalizer", |ui| self.settings_equalizer(ui, &mut changed));
                     settings_card(&mut cols[0], "Window", |ui| self.settings_window(ui, &mut changed));
                     settings_card(&mut cols[0], "Now playing visualiser", |ui| self.settings_now_playing(ui, &mut changed));
+                    settings_card(&mut cols[0], "Ride", |ui| self.settings_ride(ui, &mut changed));
                     settings_card(&mut cols[0], "Discord", |ui| self.settings_discord(ui, &mut changed));
                     settings_card(&mut cols[1], "Downloads", |ui| self.settings_downloads(ui, &mut changed));
                     settings_card(&mut cols[1], "Storage", |ui| self.settings_storage(ui, &mut changed));
@@ -3568,6 +3569,7 @@ impl PlexdioApp {
                 settings_card(ui, "Equalizer", |ui| self.settings_equalizer(ui, &mut changed));
                 settings_card(ui, "Window", |ui| self.settings_window(ui, &mut changed));
                 settings_card(ui, "Now playing visualiser", |ui| self.settings_now_playing(ui, &mut changed));
+                settings_card(ui, "Ride", |ui| self.settings_ride(ui, &mut changed));
                 settings_card(ui, "Discord", |ui| self.settings_discord(ui, &mut changed));
                 settings_card(ui, "Downloads", |ui| self.settings_downloads(ui, &mut changed));
                 settings_card(ui, "Storage", |ui| self.settings_storage(ui, &mut changed));

@@ -19,6 +19,38 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# Ride's beat model (rten, see assets/models/README.md) needs real optimisation: the rest of the
+# app is size-optimised, which makes neural-network inference several times slower.
+[profile.release.package.rten]
+opt-level = 3
+
+[profile.release.package.rten-base]
+opt-level = 3
+
+[profile.release.package.rten-gemm]
+opt-level = 3
+
+[profile.release.package.rten-simd]
+opt-level = 3
+
+[profile.release.package.rten-tensor]
+opt-level = 3
+
+[profile.release.package.rten-vecmath]
+opt-level = 3
+
+[profile.release.package.rten-model-file]
+opt-level = 3
+
+[profile.release.package.rten-onnx]
+opt-level = 3
+
+[profile.release.package.rten-shape-inference]
+opt-level = 3
+
+[profile.release.package.beat-this]
+opt-level = 3
+
 # Fast-to-build profile for iterating under Wine.
 [profile.dev-opt]
 inherits = "release"

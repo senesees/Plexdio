@@ -11,6 +11,7 @@ use crate::game::clock::SongClock;
 use crate::game::mapgen::{generate, seed_for};
 use crate::game::play::{Input, Ride};
 use crate::game::render::{draw, RoadGeom};
+use crate::game::RidePrefs;
 use crate::ui::retrovis::canvas::Canvas;
 use crate::ui::runner::VideoFrame;
 use crate::ui::theme;
@@ -51,6 +52,8 @@ pub struct RideState {
     result: Option<(ResultCard, f64)>,
     /// Songs whose track could not be built (not tried again this session).
     failed: HashSet<i64>,
+    /// Songs the beat model was already run on this session (not retried if it failed).
+    refined: HashSet<i64>,
     /// Game frames and drawing time since the last log line (every 10 s).
     stats: (u32, f64, Option<std::time::Instant>),
     /// Fine timer resolution while a ride is on screen (60 fps frame timing on Windows).
@@ -135,7 +138,7 @@ impl RideState {
     /// Advance the ride and draw it into `video` over the visualiser `background`. Returns
     /// false when there is no ride (the caller shows the plain visualiser).
     #[allow(clippy::too_many_arguments)]
-    pub fn frame(&mut self, background: &Canvas, position_ms: u64, playing: bool, dt: f32, aspect: f32, dither: bool, video: &mut VideoFrame) -> bool {
+    pub fn frame(&mut self, background: &Canvas, position_ms: u64, playing: bool, dt: f32, aspect: f32, prefs: &RidePrefs, dither: bool, video: &mut VideoFrame) -> bool {
         let Some(s) = &mut self.session else {
             self.timer = None;
             return false;
@@ -149,7 +152,8 @@ impl RideState {
             s.fresh = false;
             input.pointer = input.pointer.or(self.pointer_x);
         }
-        let t = s.clock.update(position_ms, playing, dt as f64) as f32;
+        // What is heard now: the reported position, less the output's extra delay.
+        let t = s.clock.update(position_ms, playing, dt as f64) as f32 - prefs.delay_ms as f32 / 1000.0;
         s.ride.update(t, if playing { input } else { Input::default() }, dt);
         let h = ((WIDTH as f32 / aspect.max(0.2)).round() as usize).clamp(90, WIDTH * 2);
         let canvas = self.canvas.get_or_insert_with(|| Canvas::new(WIDTH, h));
@@ -157,7 +161,7 @@ impl RideState {
             *canvas = Canvas::new(WIDTH, h);
         }
         let clock = std::time::Instant::now();
-        draw(canvas, background, &s.ride, &s.geom, t);
+        draw(canvas, background, &s.ride, &s.geom, t, prefs.craft);
         canvas.to_rgb_u32(&mut video.pixels, dither);
         let (frames, ms, since) = &mut self.stats;
         *frames += 1;
@@ -224,6 +228,49 @@ impl PlexdioApp {
         a
     }
 
+    /// Settings → Ride.
+    pub(super) fn settings_ride(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        use crate::game::mapgen::Difficulty;
+        use crate::game::render::Craft;
+        let r = &mut self.config.ride;
+        let before = r.clone();
+        super::setting_row(ui, "Difficulty", Some("More notes and a faster road on harder levels; scores are kept per level"), |ui| {
+            egui::ComboBox::from_id_salt("ride-difficulty").selected_text(r.difficulty.label()).width(120.0).show_ui(ui, |ui| {
+                for d in Difficulty::ALL {
+                    ui.selectable_value(&mut r.difficulty, d, d.label());
+                }
+            });
+        });
+        super::setting_row(ui, "Ride in", None, |ui| {
+            egui::ComboBox::from_id_salt("ride-craft").selected_text(r.craft.label()).width(120.0).show_ui(ui, |ui| {
+                for c in Craft::ALL {
+                    ui.selectable_value(&mut r.craft, c, c.label());
+                }
+            });
+        });
+        super::setting_row(ui, "Frame rate", Some("30 uses about half the computer of 60"), |ui| {
+            egui::ComboBox::from_id_salt("ride-fps").selected_text(format!("{} fps", r.fps)).width(120.0).show_ui(ui, |ui| {
+                for f in [30, 60] {
+                    ui.selectable_value(&mut r.fps, f, format!("{f} fps"));
+                }
+            });
+        });
+        super::setting_row(ui, "Audio delay", Some("If notes arrive before you hear them (wireless headphones), raise this"), |ui| {
+            let mut ms = r.delay_ms as f64;
+            super::slider_value(ui, format!("{ms:.0} ms"));
+            ui.spacing_mut().slider_width = 140.0;
+            if ui.add(egui::Slider::new(&mut ms, -100.0..=400.0).step_by(10.0).show_value(false)).changed() {
+                r.delay_ms = ms as i32;
+            }
+        });
+        super::setting_row(ui, "Smarter beats", Some("Refine each song's beat grid with the Beat This! AI model, in the background"), |ui| {
+            theme::toggle(ui, &mut r.ai);
+        });
+        if *r != before {
+            *changed = true;
+        }
+    }
+
     /// Settings → Storage: saved Ride tracks, with a button to forget them (scores stay).
     pub(super) fn ride_storage_row(&mut self, ui: &mut egui::Ui) {
         let (n, bytes) = self.ride_db().and_then(|db| db.ride_maps_size().ok()).unwrap_or((0, 0));
@@ -267,11 +314,10 @@ impl PlexdioApp {
         let Some(track) = self.playback.track.as_ref().map(|t| t.id) else { return };
         let position = self.playback.position_ms as f32 / 1000.0;
 
-        // A finished build.
-        if let Some(b) = &self.np.ride.build {
-            if let Some(result) = b.take() {
-                let id = b.track;
-                self.np.ride.build = None;
+        // Results from the build: the classic analysis, then (with the AI tier) the refined one,
+        // which replaces it for every ride from then on.
+        while let Some((id, result)) = self.np.ride.build.as_ref().and_then(|b| b.take().map(|r| (b.track, r))) {
+            {
                 match result {
                     Ok(a) => {
                         match (serde_json::to_string(&a), self.ride_db()) {
@@ -287,6 +333,7 @@ impl PlexdioApp {
                     }
                     Err(e) => {
                         self.np.ride.failed.insert(id);
+                        self.np.ride.build = None;
                         if id == track {
                             self.np.ride.notice = Some((format!("Couldn't build a track for this song ({e})."), now));
                             self.np.ride.on = false;
@@ -295,6 +342,13 @@ impl PlexdioApp {
                     }
                 }
             }
+        }
+        if self.np.ride.build.as_ref().is_some_and(|b| b.finished()) {
+            self.np.ride.build = None;
+        }
+        // A new difficulty applies straight away: ride on from here at the new level.
+        if self.np.ride.session.as_ref().is_some_and(|s| s.ride.map.difficulty != self.config.ride.difficulty) {
+            self.np.ride.session = None;
         }
 
         // The song changed, or restarted from the top: the old ride is over (a restart rides
@@ -320,11 +374,21 @@ impl PlexdioApp {
                 self.start_build(track, ctx);
             }
         }
-        // While riding, get the next song's track ready so the ride carries straight on.
+        // While riding, get the next song's track ready so the ride carries straight on; with
+        // spare time, let the beat model refine tracks that only have the classic analysis.
         if self.np.ride.session.is_some() && self.np.ride.build.is_none() {
-            if let Some(next) = self.next_in_queue().filter(|n| !self.np.ride.failed.contains(n)) {
-                if self.ride_analysis(next).is_none() {
-                    self.start_build(next, ctx);
+            let ai = self.config.ride.ai;
+            for id in self.next_in_queue().into_iter().chain([track]) {
+                if self.np.ride.failed.contains(&id) {
+                    continue;
+                }
+                let needs = match self.ride_analysis(id) {
+                    None => true,
+                    Some(a) => ai && !a.ai && self.np.ride.refined.insert(id),
+                };
+                if needs {
+                    self.start_build(id, ctx);
+                    break;
                 }
             }
         }
@@ -381,6 +445,7 @@ impl PlexdioApp {
                 };
                 Ok((src, ext))
             }),
+            self.config.ride.ai.then(crate::paths::model_dir),
             move || ctx.request_repaint(),
         ));
     }

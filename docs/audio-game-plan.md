@@ -1,6 +1,30 @@
 # Plan: "Ride" — an Audiosurf-style game mode
 
-**Status (2026-11-01): spike and steps 2–4 done. Next: step 5 (AI tier, car and plane, settings, README).**
+**Status (2026-11-01): built: spike and steps 2–5 all done.**
+
+Step 5 notes (AI tier, craft, settings, README):
+- The Beat This! small model and its mel front end live in `assets/models/` and are embedded with
+  `include_bytes!` (`game/ai.rs`). They are unpacked once into the cache's `models` folder, because
+  the `beat-this` crate loads files.
+  - rten and its crates use per-package `opt-level = 3`; in-app speed is about 2 % of song
+    length on the VM, the same as the spike.
+  - The first run takes ~5 s because it unpacks the model.
+- A build now posts two results: the classic analysis, then the model-refined one, which replaces
+  it in memory and in the database.
+  - The ride in progress keeps its map; the refined one is used from the next ride, and
+    prefetched songs get it before they start.
+  - While riding, idle time also refines saved classic-only tracks (each tried once per session).
+- Results on the three real test songs: the menu theme's tempo went from 125.9 bpm (classic, 4:3
+  error) to 94.8 bpm, with alignment 1.73 → 2.53. One game track went 2.54 → 2.79; the other
+  was unchanged.
+- Basic Pitch (melodic notes) is not used yet. `tools/fix_basic_pitch_onnx.py` makes it
+  rten-loadable if wanted later.
+- Craft: hover ship, car (wheels, cabin, tail lights) and plane (bobbing, banking), built from
+  box meshes in `render.rs`.
+- The Settings → Ride card has difficulty (a change applies at once), craft, 30/60 fps, audio
+  delay (−100…400 ms) and "Smarter beats" (the AI) on or off.
+- The README has Ride's feature section, screenshots (`docs/ride.png`, `docs/ride-craft.png`),
+  status, architecture, footprint and testing. The exe is 24.7 MB.
 
 Step 4 notes (integration):
 - Analyses are saved in the library database (`ride_maps`, JSON, about 125 KB for a 4-minute

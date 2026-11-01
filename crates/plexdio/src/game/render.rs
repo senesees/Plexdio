@@ -6,6 +6,7 @@ use super::mapgen::{Map, NoteKind, COLOURS, ROAD_HZ};
 use super::play::{lane_x, Event, Ride};
 use crate::ui::retrovis::canvas::{Canvas, Rgb};
 use crate::ui::retrovis::math3d::{v3, Camera, V3};
+use serde::{Deserialize, Serialize};
 
 /// Note colours, cool to hot.
 pub const PALETTE: [Rgb; COLOURS as usize] = [[0.25, 0.4, 1.0], [0.7, 0.3, 1.0], [0.15, 0.95, 0.5], [1.0, 0.8, 0.15], [1.0, 0.25, 0.15]];
@@ -98,7 +99,7 @@ impl View {
 }
 
 /// Draw one frame of `ride` at song time `t` into `out`, over `background` (the visualiser).
-pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom, t: f32) {
+pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom, t: f32, craft: Craft) {
     copy_dimmed(out, background, 0.45);
     let map = &ride.map;
     let d_ship = map.distance_at(t);
@@ -183,7 +184,7 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
         }
     }
 
-    draw_craft(out, &view, ship, ship_pos, ride.vx, tint);
+    draw_craft(out, &view, ship, ship_pos, ride.vx, tint, craft, t);
 }
 
 /// The background, darkened so the road reads on top (scaled when sizes differ).
@@ -243,42 +244,122 @@ fn draw_block(out: &mut Canvas, view: &View, centre: V3, f: Frame, c: Rgb, light
     out.tri_flat([xy(0), xy(2), xy(3)], face(0.7), 1.0);
 }
 
-/// The hover craft: a low-poly arrowhead, banking with the steering, with an engine glow.
-fn draw_craft(out: &mut Canvas, view: &View, f: Frame, pos: V3, vx: f32, tint: Rgb) {
-    // Local model: x right, y up, z forward (metres).
-    const V: [(f32, f32, f32); 6] = [(0.0, 0.35, 2.2), (-1.5, 0.15, -1.0), (1.5, 0.15, -1.0), (0.0, 0.75, -0.8), (0.0, 0.0, -1.1), (0.0, 0.3, -1.2)];
-    const FACES: [[usize; 3]; 6] = [[0, 1, 3], [0, 3, 2], [0, 4, 1], [0, 2, 4], [1, 5, 3], [3, 5, 2]];
-    let bank = (-vx * 0.25).clamp(-0.6, 0.6);
+/// What you ride.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Craft {
+    /// A low-poly hover arrowhead (the Audiosurf look).
+    #[default]
+    Ship,
+    Car,
+    Plane,
+}
+
+impl Craft {
+    pub const ALL: [Craft; 3] = [Craft::Ship, Craft::Car, Craft::Plane];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Craft::Ship => "Hover ship",
+            Craft::Car => "Car",
+            Craft::Plane => "Plane",
+        }
+    }
+}
+
+/// A craft model: local vertices (x right, y up, z forward, metres), coloured triangles, how high
+/// it rides, how much it banks, and where its engine glows.
+struct Mesh {
+    v: Vec<V3>,
+    f: Vec<([usize; 3], Rgb)>,
+    hover: f32,
+    bank: f32,
+    engine: V3,
+}
+
+impl Mesh {
+    /// Add an axis-aligned box centred on `c` with size `s`.
+    fn cuboid(&mut self, c: (f32, f32, f32), s: (f32, f32, f32), col: Rgb) {
+        let base = self.v.len();
+        for i in 0..8 {
+            let (dx, dy, dz) = ((i & 1) as f32 - 0.5, ((i >> 1) & 1) as f32 - 0.5, ((i >> 2) & 1) as f32 - 0.5);
+            self.v.push(v3(c.0 + dx * s.0, c.1 + dy * s.1, c.2 + dz * s.2));
+        }
+        for q in [[0, 1, 3, 2], [4, 5, 7, 6], [0, 1, 5, 4], [2, 3, 7, 6], [0, 2, 6, 4], [1, 3, 7, 5]] {
+            self.f.push(([base + q[0], base + q[1], base + q[2]], col));
+            self.f.push(([base + q[0], base + q[2], base + q[3]], col));
+        }
+    }
+}
+
+const BODY: Rgb = [0.85, 0.9, 1.0];
+
+fn mesh(craft: Craft) -> Mesh {
+    match craft {
+        Craft::Ship => {
+            let v = [(0.0, 0.35, 2.2), (-1.5, 0.15, -1.0), (1.5, 0.15, -1.0), (0.0, 0.75, -0.8), (0.0, 0.0, -1.1), (0.0, 0.3, -1.2)];
+            let f = [[0, 1, 3], [0, 3, 2], [0, 4, 1], [0, 2, 4], [1, 5, 3], [3, 5, 2]];
+            Mesh { v: v.iter().map(|&(x, y, z)| v3(x, y, z)).collect(), f: f.iter().map(|&t| (t, BODY)).collect(), hover: 0.6, bank: 0.25, engine: v3(0.0, 0.3, -1.6) }
+        }
+        Craft::Car => {
+            let mut m = Mesh { v: Vec::new(), f: Vec::new(), hover: 0.0, bank: 0.06, engine: v3(0.0, 0.5, -1.95) };
+            let tyre = [0.12, 0.12, 0.14];
+            for (x, z) in [(-0.95, 1.15), (0.95, 1.15), (-0.95, -1.15), (0.95, -1.15)] {
+                m.cuboid((x, 0.32, z), (0.32, 0.64, 0.72), tyre);
+            }
+            m.cuboid((0.0, 0.55, 0.0), (1.8, 0.5, 3.6), BODY);
+            m.cuboid((0.0, 1.0, -0.3), (1.4, 0.45, 1.7), [0.35, 0.5, 0.75]);
+            m
+        }
+        Craft::Plane => {
+            let mut m = Mesh { v: Vec::new(), f: Vec::new(), hover: 1.5, bank: 0.45, engine: v3(0.0, 0.5, -2.0) };
+            m.cuboid((0.0, 0.5, 0.0), (0.7, 0.6, 3.4), BODY);
+            // Nose cone.
+            let base = m.v.len();
+            m.v.extend([v3(-0.35, 0.2, 1.7), v3(0.35, 0.2, 1.7), v3(0.35, 0.8, 1.7), v3(-0.35, 0.8, 1.7), v3(0.0, 0.45, 2.5)]);
+            for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+                m.f.push(([base + a, base + b, base + 4], BODY));
+            }
+            m.cuboid((0.0, 0.5, 0.2), (4.6, 0.1, 1.0), [0.75, 0.8, 0.95]);
+            m.cuboid((0.0, 0.55, -1.5), (1.7, 0.08, 0.5), [0.75, 0.8, 0.95]);
+            m.cuboid((0.0, 1.0, -1.5), (0.1, 0.8, 0.6), [0.75, 0.8, 0.95]);
+            m
+        }
+    }
+}
+
+/// The craft, banking with the steering (the plane also bobs), with an engine glow.
+#[allow(clippy::too_many_arguments)]
+fn draw_craft(out: &mut Canvas, view: &View, f: Frame, pos: V3, vx: f32, tint: Rgb, craft: Craft, t: f32) {
+    let m = mesh(craft);
+    let bank = (-vx * m.bank).clamp(-0.6, 0.6);
     let r = f.right();
     let fwd = v3(f.heading.sin(), 0.0, f.heading.cos());
     let up = v3(0.0, 1.0, 0.0);
-    let hover = 0.6;
-    let world: Vec<V3> = V
-        .iter()
-        .map(|&(x, y, z)| {
-            let m = v3(x, y, z).rot(0.0, 0.0, bank);
-            pos.add(r.mul(m.x)).add(up.mul(m.y + hover)).add(fwd.mul(m.z))
-        })
-        .collect();
+    let hover = m.hover + if craft == Craft::Plane { 0.15 * (t * 2.1).sin() } else { 0.0 };
+    let place = |q: V3| {
+        let q = q.rot(0.0, 0.0, bank);
+        pos.add(r.mul(q.x)).add(up.mul(q.y + hover)).add(fwd.mul(q.z))
+    };
+    let world: Vec<V3> = m.v.iter().map(|&q| place(q)).collect();
     let Some(p): Option<Vec<(f32, f32, f32)>> = world.iter().map(|&q| view.project(q)).collect() else { return };
     let light = v3(0.4, 0.8, -0.45).norm();
-    let mut faces: Vec<(f32, [usize; 3], f32)> = FACES
+    let mut faces: Vec<(f32, [usize; 3], Rgb)> = m
+        .f
         .iter()
-        .map(|&[a, b, c]| {
+        .map(|&([a, b, c], col)| {
             let n = world[b].sub(world[a]).cross(world[c].sub(world[a])).norm();
-            let depth = (p[a].2 + p[b].2 + p[c].2) / 3.0;
-            (depth, [a, b, c], 0.35 + 0.65 * n.dot(light).abs())
+            let k = 0.35 + 0.65 * n.dot(light).abs();
+            ((p[a].2 + p[b].2 + p[c].2) / 3.0, [a, b, c], [col[0] * k, col[1] * k, col[2] * k])
         })
         .collect();
+    // Far faces first.
     faces.sort_by(|x, y| y.0.total_cmp(&x.0));
-    let body: Rgb = [0.85, 0.9, 1.0];
-    for (_, [a, b, c], k) in faces {
-        let col = [body[0] * k, body[1] * k, body[2] * k];
+    for (_, [a, b, c], col) in faces {
         out.tri_flat([(p[a].0, p[a].1), (p[b].0, p[b].1), (p[c].0, p[c].1)], col, 1.0);
     }
-    // Engine glow at the tail, in the road's colour.
-    if let Some((x, y, z)) = view.project(world[5].add(fwd.mul(-0.4))) {
-        out.glow(x, y, 30.0 / z.max(1.0), tint, 0.9);
+    if let Some((x, y, z)) = view.project(place(m.engine)) {
+        let glow = if craft == Craft::Car { [1.0, 0.15, 0.1] } else { tint };
+        out.glow(x, y, 30.0 / z.max(1.0), glow, 0.9);
     }
 }
 
@@ -310,7 +391,12 @@ mod tests {
         let ride = Ride::new(map, 10.0);
         let bg = Canvas::new(320, 180);
         let mut out = Canvas::new(480, 270);
-        draw(&mut out, &bg, &ride, &g, 13.0);
+        draw(&mut out, &bg, &ride, &g, 13.0, Craft::Ship);
+        for craft in [Craft::Car, Craft::Plane] {
+            let mut other = Canvas::new(480, 270);
+            draw(&mut other, &bg, &ride, &g, 13.0, craft);
+            assert_ne!(other.px, out.px, "{craft:?} looks different");
+        }
         let lit = out.px.iter().filter(|p| p[0] + p[1] + p[2] > 0.05).count();
         assert!(lit > out.px.len() / 10, "only {lit} pixels drawn");
         // The craft sits low in the middle of the picture.

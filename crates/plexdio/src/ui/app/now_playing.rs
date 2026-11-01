@@ -56,6 +56,7 @@ impl PlexdioApp {
         let playing = self.playback.state == PlayState::Playing && self.cast.is_none();
         let track = self.playback.track.as_ref().map(|t| t.id);
         let position_ms = self.playback.position_ms;
+        let ride_prefs = self.config.ride.clone();
         self.ride_manage(now, &ctx);
         let np = &mut self.np;
         np.ride.input(ui, rect);
@@ -67,7 +68,7 @@ impl PlexdioApp {
         vis.prefs = prefs.clone();
 
         // A new visualiser frame at the chosen rate (a ride always runs at 60).
-        let fps = if np.ride.riding() { 60 } else { prefs.fps.clamp(15, 60) };
+        let fps = if np.ride.riding() { ride_prefs.fps.clamp(30, 60) } else { prefs.fps.clamp(15, 60) };
         let interval = 1.0 / fps as f64;
         if np.video.pixels.is_empty() || (now - np.last_frame >= interval * 0.9 && (np.animating || playing)) {
             let dt = if np.last_frame == 0.0 { interval } else { (now - np.last_frame).min(0.25) } as f32;
@@ -106,7 +107,7 @@ impl PlexdioApp {
                 np.stats_frames = 0;
                 np.stats_ms = 0.0;
             }
-            if !np.ride.frame(vis.canvas(), position_ms, playing, dt, rect.aspect_ratio(), prefs.dither, &mut np.video) {
+            if !np.ride.frame(vis.canvas(), position_ms, playing, dt, rect.aspect_ratio(), &ride_prefs, prefs.dither, &mut np.video) {
                 let (w, h) = vis.size();
                 vis.pixels_u32(&mut np.video.pixels);
                 np.video.w = w;

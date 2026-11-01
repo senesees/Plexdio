@@ -53,7 +53,7 @@ pub struct Section {
 }
 
 /// Beats from the Beat This! model, used as evidence for the beat grid.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AiBeats {
     pub beats: Vec<f32>,
     pub downbeats: Vec<f32>,

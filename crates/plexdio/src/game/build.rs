@@ -1,7 +1,12 @@
 //! Building a song's analysis in the background while it plays: open a second reader on the
 //! song (sharing the player's download), decode, analyse. The music is never touched.
+//!
+//! Two results come out: the classic analysis first (a second or so, so a ride can start), then,
+//! with the AI tier on, the same analysis with the beat model's evidence (a few seconds more).
 
 use super::analysis::{analyse, decode_mono, Analysis};
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use symphonia::core::io::MediaSource;
@@ -14,47 +19,79 @@ pub struct Build {
     pub track: i64,
     cancel: Arc<AtomicBool>,
     progress: Arc<AtomicU32>,
-    result: Arc<Mutex<Option<Result<Analysis, String>>>>,
+    results: Arc<Mutex<VecDeque<Result<Analysis, String>>>>,
+    done: Arc<AtomicBool>,
 }
 
 impl Build {
-    /// Start analysing `track` on a worker thread; `wake` is called when it is done.
-    pub fn start(track: i64, open: Opener, wake: impl Fn() + Send + 'static) -> Self {
-        let b = Build { track, cancel: Arc::default(), progress: Arc::default(), result: Arc::default() };
-        let (cancel, progress, result) = (b.cancel.clone(), b.progress.clone(), b.result.clone());
+    /// Start analysing `track` on a worker thread; `wake` is called after each result. `ai` is
+    /// the folder for the beat model (None: classic analysis only).
+    pub fn start(track: i64, open: Opener, ai: Option<PathBuf>, wake: impl Fn() + Send + 'static) -> Self {
+        let b = Build { track, cancel: Arc::default(), progress: Arc::default(), results: Arc::default(), done: Arc::default() };
+        let (cancel, progress, results, done) = (b.cancel.clone(), b.progress.clone(), b.results.clone(), b.done.clone());
         let spawned = std::thread::Builder::new().name("ride-build".into()).spawn(move || {
             below_normal_priority();
             let started = std::time::Instant::now();
-            let out = open().and_then(|(source, ext)| {
+            let post = |r: Result<Analysis, String>| {
+                if let Ok(mut q) = results.lock() {
+                    q.push_back(r);
+                }
+                wake();
+            };
+            let samples = open().and_then(|(source, ext)| {
                 let samples = decode_mono(source, ext.as_deref(), &cancel, Some(&progress)).map_err(|e| e.to_string())?;
                 if cancel.load(Ordering::Relaxed) {
-                    return Err("cancelled".into());
+                    return Err("cancelled".to_string());
                 }
-                let decoded = started.elapsed();
-                let a = analyse(&samples, None);
-                log::info!(
-                    "ride: track {track} analysed ({:.0} s of audio; decoded in {:.2} s, analysed in {:.2} s): {:.1} bpm, {} onsets, {} sections",
-                    a.duration,
-                    decoded.as_secs_f64(),
-                    (started.elapsed() - decoded).as_secs_f64(),
-                    a.bpm,
-                    a.onsets.len(),
-                    a.sections.len()
-                );
-                Ok(a)
+                Ok(samples)
             });
-            if let Err(e) = &out {
-                log::warn!("ride: cannot analyse track {track}: {e}");
+            match samples {
+                Err(e) => {
+                    log::warn!("ride: cannot analyse track {track}: {e}");
+                    post(Err(e));
+                }
+                Ok(samples) => {
+                    let decoded = started.elapsed();
+                    let a = analyse(&samples, None);
+                    log::info!(
+                        "ride: track {track} analysed ({:.0} s of audio; decoded in {:.2} s, analysed in {:.2} s): {:.1} bpm, {} onsets, {} sections",
+                        a.duration,
+                        decoded.as_secs_f64(),
+                        (started.elapsed() - decoded).as_secs_f64(),
+                        a.bpm,
+                        a.onsets.len(),
+                        a.sections.len()
+                    );
+                    let classic_bpm = a.bpm;
+                    post(Ok(a));
+                    if let Some(dir) = ai {
+                        let t = std::time::Instant::now();
+                        match super::ai::beats(&samples, &dir, &cancel) {
+                            Ok(beats) => {
+                                let a = analyse(&samples, Some(&beats));
+                                log::info!(
+                                    "ride: track {track} refined by the beat model in {:.2} s: {:.1} bpm (classic {classic_bpm:.1}), {} model beats",
+                                    t.elapsed().as_secs_f64(),
+                                    a.bpm,
+                                    beats.beats.len()
+                                );
+                                post(Ok(a));
+                            }
+                            Err(e) if e == "cancelled" => {}
+                            // The classic analysis stands.
+                            Err(e) => log::warn!("ride: beat model failed on track {track}: {e}"),
+                        }
+                    }
+                }
             }
-            if let Ok(mut r) = result.lock() {
-                *r = Some(out);
-            }
+            done.store(true, Ordering::Relaxed);
             wake();
         });
         if let Err(e) = spawned {
-            if let Ok(mut r) = b.result.lock() {
-                *r = Some(Err(format!("cannot start the analysis: {e}")));
+            if let Ok(mut q) = b.results.lock() {
+                q.push_back(Err(format!("cannot start the analysis: {e}")));
             }
+            b.done.store(true, Ordering::Relaxed);
         }
         b
     }
@@ -64,9 +101,14 @@ impl Build {
         self.progress.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
-    /// The result, once (None while still working).
+    /// The next result, once (None when there is nothing new).
     pub fn take(&self) -> Option<Result<Analysis, String>> {
-        self.result.lock().ok().and_then(|mut r| r.take())
+        self.results.lock().ok().and_then(|mut q| q.pop_front())
+    }
+
+    /// All work is done and every result was taken.
+    pub fn finished(&self) -> bool {
+        self.done.load(Ordering::Relaxed) && self.results.lock().map_or(true, |q| q.is_empty())
     }
 }
 
@@ -116,23 +158,33 @@ mod tests {
         let (song, _) = crate::game::analysis::tests::drums(120.0, 12.0, 0.0);
         let bytes = wav(&song, 22_050);
         let (tx, rx) = std::sync::mpsc::channel();
-        let b = Build::start(7, Box::new(move || Ok((Box::new(Cursor::new(bytes)) as Box<dyn MediaSource>, Some("wav".into())))), move || {
+        let dir = std::env::temp_dir().join(format!("plexdio-build-models-{}", std::process::id()));
+        let b = Build::start(7, Box::new(move || Ok((Box::new(Cursor::new(bytes)) as Box<dyn MediaSource>, Some("wav".into())))), Some(dir.clone()), move || {
             let _ = tx.send(());
         });
-        rx.recv_timeout(std::time::Duration::from_secs(20)).expect("finished");
-        let a = b.take().expect("result").expect("analysis");
-        assert!((a.bpm - 120.0).abs() < 2.0 && (a.duration - 12.0).abs() < 0.1, "{} bpm, {} s", a.bpm, a.duration);
-        assert!(b.take().is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !b.done.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(200));
+        }
+        // Classic first, then refined by the model.
+        let classic = b.take().expect("result").expect("analysis");
+        assert!(!classic.ai && (classic.bpm - 120.0).abs() < 2.0 && (classic.duration - 12.0).abs() < 0.1, "{} bpm, {} s", classic.bpm, classic.duration);
+        let refined = b.take().expect("second result").expect("analysis");
+        assert!(refined.ai);
+        assert!(b.take().is_none() && b.finished());
         assert!((b.progress() - 1.0).abs() < 0.01);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn failures_are_reported() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let b = Build::start(1, Box::new(|| Err("offline".into())), move || {
+        let b = Build::start(1, Box::new(|| Err("offline".into())), None, move || {
             let _ = tx.send(());
         });
         rx.recv_timeout(std::time::Duration::from_secs(5)).expect("finished");
         assert_eq!(b.take(), Some(Err("offline".into())));
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(b.finished());
     }
 }
