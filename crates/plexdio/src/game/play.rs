@@ -10,9 +10,15 @@ pub fn lane_x(lane: u8) -> f32 {
     (lane as f32 - mid) / mid * 0.8
 }
 
-/// How close (in steering units) the craft must be to a lane to catch its note: a little under
-/// half the lane spacing, so between two lanes catches neither.
-const CATCH: f32 = 0.18;
+/// How close (in steering units; 1 = 5 m) the craft must be to a lane to catch its note: 1.3 m,
+/// about where the craft's side meets the block's (the lanes are 2 m apart).
+const CATCH: f32 = 0.26;
+/// Greys are judged narrower (0.9 m): grazing one shouldn't cost you.
+const GREY_CATCH: f32 = 0.18;
+/// A note can be caught from this long before its time to [`LATE`] after: the craft's nose
+/// meets a block before the block's centre reaches the craft.
+const EARLY: f32 = 0.07;
+const LATE: f32 = 0.05;
 /// Notes this soon after the ride starts are left out: a run-up to get the feel.
 pub const RUN_UP: f32 = 2.0;
 /// Points per colour, cool to hot.
@@ -20,7 +26,7 @@ const POINTS: [u32; COLOURS as usize] = [10, 20, 40, 70, 100];
 /// Points lost on a grey block (never below zero).
 const GREY_PENALTY: u32 = 50;
 /// While holding, the craft may drift this far from the lane (a little more than [`CATCH`]).
-const HOLD_STAY: f32 = 0.26;
+const HOLD_STAY: f32 = 0.3;
 /// A hold pays a tenth of its note's points for every tenth of a second, and its note's points
 /// again for riding it to the end.
 const TICK: f32 = 0.1;
@@ -230,44 +236,57 @@ impl Ride {
         self.events.retain(|e| t - event_t(e) < 1.0 && event_t(e) <= t + 0.1);
         self.ride_hold(t);
 
-        while let Some(n) = self.map.notes.get(self.next).copied() {
-            if n.t > t {
+        // Judge every note in its window (see EARLY and LATE). Greys are judged right at their
+        // time; a dodged grey counts as passed.
+        let mut i = self.next;
+        while let Some(n) = self.map.notes.get(i).copied() {
+            if n.t > t + EARLY {
                 break;
             }
-            let i = self.next;
-            self.next += 1;
-            let close = (self.x - lane_x(n.lane)).abs() < CATCH;
-            match n.kind {
-                NoteKind::Colour(c) if close => {
-                    let points = POINTS[c as usize] * self.multiplier();
-                    self.combo += 1;
-                    self.best_combo = self.best_combo.max(self.combo);
-                    self.caught += 1;
-                    self.score += points as u64;
-                    self.events.push(Event::Caught { t: n.t, lane: n.lane, colour: c, points });
-                    if n.is_hold() {
-                        self.states[i] = NoteState::Holding;
-                        self.holding = Some(Holding { i, ticked_to: n.t, earned: points });
-                        self.ride_hold(t);
-                    } else {
-                        self.states[i] = NoteState::Caught;
+            if self.states[i] == NoteState::Pending {
+                let dx = (self.x - lane_x(n.lane)).abs();
+                match n.kind {
+                    NoteKind::Colour(c) if dx < CATCH => self.catch(i, c, t),
+                    NoteKind::Colour(_) if t > n.t + LATE => {
+                        self.combo = 0;
+                        self.missed += 1;
+                        self.states[i] = NoteState::Missed;
+                        self.events.push(Event::Missed { t: n.t, lane: n.lane });
                     }
+                    NoteKind::Grey if n.t <= t && dx < GREY_CATCH => {
+                        self.combo = 0;
+                        self.greys += 1;
+                        self.score = self.score.saturating_sub(GREY_PENALTY as u64);
+                        self.states[i] = NoteState::GreyHit;
+                        self.events.push(Event::Grey { t: n.t, lane: n.lane });
+                    }
+                    NoteKind::Grey if n.t <= t => self.states[i] = NoteState::Missed,
+                    _ => {}
                 }
-                NoteKind::Colour(_) => {
-                    self.combo = 0;
-                    self.missed += 1;
-                    self.states[i] = NoteState::Missed;
-                    self.events.push(Event::Missed { t: n.t, lane: n.lane });
-                }
-                NoteKind::Grey if close => {
-                    self.combo = 0;
-                    self.greys += 1;
-                    self.score = self.score.saturating_sub(GREY_PENALTY as u64);
-                    self.states[i] = NoteState::GreyHit;
-                    self.events.push(Event::Grey { t: n.t, lane: n.lane });
-                }
-                NoteKind::Grey => {}
             }
+            i += 1;
+        }
+        while self.next < self.states.len() && self.states[self.next] != NoteState::Pending {
+            self.next += 1;
+        }
+    }
+
+    /// Note `i` (colour `c`) was caught at song time `t`.
+    fn catch(&mut self, i: usize, c: u8, t: f32) {
+        let n = self.map.notes[i];
+        let points = POINTS[c as usize] * self.multiplier();
+        self.combo += 1;
+        self.best_combo = self.best_combo.max(self.combo);
+        self.caught += 1;
+        self.score += points as u64;
+        self.events.push(Event::Caught { t: n.t, lane: n.lane, colour: c, points });
+        if n.is_hold() {
+            self.states[i] = NoteState::Holding;
+            // Pay from the note's own time, even when caught a moment early.
+            self.holding = Some(Holding { i, ticked_to: n.t, earned: points });
+            self.ride_hold(t);
+        } else {
+            self.states[i] = NoteState::Caught;
         }
     }
 }
@@ -377,6 +396,38 @@ mod tests {
         let mut m = Ride::new(map(vec![hold(3.0, 0, 1.0)]), 0.0);
         ride_on_lane(&mut m, 0.0, 4.5, 4);
         assert_eq!((m.state(0), m.score, m.missed), (NoteState::Missed, 0, 1));
+    }
+
+    #[test]
+    fn a_block_is_caught_when_the_craft_meets_it_not_only_at_its_centre() {
+        // Leaving the lane just before the note's time: the nose already went through it.
+        let mut r = Ride::new(map(vec![note(3.0, 2, NoteKind::Colour(2))]), 0.0);
+        ride_on_lane(&mut r, 0.0, 2.95, 2);
+        ride_on_lane(&mut r, 2.95, 3.5, 4);
+        assert_eq!((r.caught, r.missed), (1, 0));
+        // A wing over the block (1.2 m off its centre) catches it; half a lane further doesn't.
+        let at = |dx: f32| {
+            let mut r = Ride::new(map(vec![note(3.0, 2, NoteKind::Colour(2))]), 0.0);
+            let p = Some((lane_x(2) + dx) / 2.4 + 0.5);
+            let mut t = 0.0;
+            while t < 3.5 {
+                t += 1.0 / 60.0;
+                r.update(t, Input { pointer: p, ..Default::default() }, 1.0 / 60.0);
+            }
+            r.caught
+        };
+        assert_eq!(at(0.24), 1);
+        assert_eq!(at(-0.24), 1);
+        assert_eq!(at(0.4), 0, "the next lane over");
+        // A grey grazed at the same distance is not a hit.
+        let mut g = Ride::new(map(vec![note(3.0, 2, NoteKind::Grey)]), 0.0);
+        let p = Some((lane_x(2) + 0.22) / 2.4 + 0.5);
+        let mut t = 0.0;
+        while t < 3.5 {
+            t += 1.0 / 60.0;
+            g.update(t, Input { pointer: p, ..Default::default() }, 1.0 / 60.0);
+        }
+        assert_eq!((g.greys, g.state(0)), (0, NoteState::Missed));
     }
 
     #[test]

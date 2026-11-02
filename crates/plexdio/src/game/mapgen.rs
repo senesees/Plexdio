@@ -52,7 +52,8 @@ struct Params {
     subdivisions: u8,
     /// Chance of a grey block per beat in lively parts.
     grey_rate: f32,
-    /// Road speed in metres a second at medium intensity.
+    /// Road speed scale in metres a second: 0.6× this when calm, ~0.8× at medium intensity, 1.5×
+    /// at full.
     speed: f32,
 }
 
@@ -253,7 +254,7 @@ fn build_road(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<RoadSample> {
             let l = level[i];
             // A slow sway on top, so straight sections aren't dead straight.
             let sway = 0.03 * (t * 0.37).sin();
-            RoadSample { slope: (0.5 - l) * 0.5, curve: turn[i] + sway, speed: p.speed * (0.7 + 0.6 * l), intensity: l }
+            RoadSample { slope: (0.5 - l) * 0.5, curve: turn[i] + sway, speed: p.speed * (0.6 + 0.9 * l * l), intensity: l }
         })
         .collect()
 }

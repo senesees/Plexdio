@@ -109,8 +109,11 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
     let map = &ride.map;
     let d_ship = map.distance_at(t);
     let ship = geom.at(d_ship);
+    let road = map.road_at(t);
+    // Loud, fast parts rush: a wider view from lower and closer, a fine shake, streaks.
+    let rush = smoothstep(0.5, 0.95, road.intensity);
     // The camera sits behind the craft, follows its steering a little and looks along the road.
-    let behind = geom.at(d_ship - CAM_BACK);
+    let behind = geom.at(d_ship - CAM_BACK + 1.2 * rush);
     let lat = ride.x * STEER_M;
     // Hitting a grey shakes the camera for a moment.
     let shake = ride
@@ -120,10 +123,11 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
         .filter(|age| (0.0..0.35).contains(age))
         .map(|age| (1.0 - age / 0.35) * 0.25 * (age * 70.0).sin())
         .sum::<f32>();
-    let cam_pos = behind.pos.add(v3(0.0, CAM_UP + shake * 0.5, 0.0)).add(behind.right().mul(lat * 0.55 + shake));
-    let view = View { cam: Camera { focal: 1.25, ..Camera::new(out.w, out.h) }, pos: cam_pos, yaw: ship.heading, pitch: ship.pitch - CAM_TILT };
+    let buzz = rush * rush * 0.035 * ((t * 53.0).sin() + 0.6 * (t * 37.0).sin());
+    let cam_pos = behind.pos.add(v3(0.0, CAM_UP - 0.6 * rush + shake * 0.5 + buzz, 0.0)).add(behind.right().mul(lat * 0.55 + shake));
+    let focal = 1.25 - 0.32 * rush;
+    let view = View { cam: Camera { focal, ..Camera::new(out.w, out.h) }, pos: cam_pos, yaw: ship.heading, pitch: ship.pitch - CAM_TILT + 0.03 * rush };
 
-    let road = map.road_at(t);
     let tint = intensity_colour(road.intensity);
     // The edges flash on every beat, and brighter on every catch.
     let since_beat = map.beats.iter().rev().find(|&&b| b <= t).map_or(9.0, |b| t - b);
@@ -168,6 +172,7 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
     let edge = 0.6 + 1.2 * pulse;
     out.polyline(&edges_l, tint, edge, 2.0, false);
     out.polyline(&edges_r, tint, edge, 2.0, false);
+    posts_and_streaks(out, &view, geom, d_ship, rush, tint, pulse);
 
     // Notes, far to near: everything ahead, plus missed notes until they are behind the camera
     // (caught ones are gone). A hold whose head has passed still shows while its tail is ahead.
@@ -275,6 +280,66 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
     }
 
     draw_craft(out, &view, ship, ship_pos, ride.vx, tint, craft, t);
+}
+
+/// 0 below `a`, 1 above `b`, smooth in between.
+fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+    let k = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
+}
+
+/// Light posts along both road edges (always: they give the speed its scale), and, as the song
+/// gets loud, streaks of light rushing past beside and above the road. Both are fixed in the
+/// world, so they stream by at the road's speed.
+fn posts_and_streaks(out: &mut Canvas, view: &View, geom: &RoadGeom, d_ship: f32, rush: f32, tint: Rgb, pulse: f32) {
+    const POST: f32 = 12.0;
+    let up = v3(0.0, 1.0, 0.0);
+    let first = ((d_ship - CAM_BACK) / POST).ceil() as i64;
+    let last = ((d_ship + AHEAD * 0.6).min(geom.length()) / POST) as i64;
+    for k in (first..=last).rev() {
+        let d = k as f32 * POST;
+        let f = geom.at(d);
+        let fog = 1.0 - ((d - d_ship) / (AHEAD * 0.6)).clamp(0.0, 1.0);
+        for side in [-1.0f32, 1.0] {
+            let base = f.pos.add(f.right().mul(side * (HALF_WIDTH + 0.5)));
+            if let (Some(a), Some(b)) = (view.project(base), view.project(base.add(up.mul(2.2)))) {
+                out.line(a.0, a.1, b.0, b.1, tint, (0.35 + 0.4 * rush) * fog, 1.0);
+                out.glow(b.0, b.1, 3.0 + 6.0 * pulse * fog, tint, (0.4 + 0.6 * pulse) * fog);
+            }
+        }
+    }
+    if rush < 0.05 {
+        return;
+    }
+    // Streaks: one candidate per 3 m of road, placed by a hash of its index.
+    const CELL: f32 = 3.0;
+    let length = 3.0 + 14.0 * rush;
+    let first = ((d_ship - CAM_BACK) / CELL) as i64;
+    let last = ((d_ship + 90.0).min(geom.length()) / CELL) as i64;
+    for k in (first..=last).rev() {
+        let mut h = (k as u32).wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995;
+        let mut rnd = || {
+            h ^= h << 13;
+            h ^= h >> 17;
+            h ^= h << 5;
+            (h >> 8) as f32 / (1u32 << 24) as f32
+        };
+        if rnd() > 0.35 + 0.5 * rush {
+            continue;
+        }
+        let d = k as f32 * CELL + rnd() * CELL;
+        let side = if rnd() < 0.5 { -1.0 } else { 1.0 };
+        let off = side * (HALF_WIDTH + 1.0 + rnd() * 5.0);
+        let height = 0.2 + rnd() * 3.8;
+        let (f0, f1) = (geom.at(d), geom.at(d - length));
+        let a = f0.pos.add(f0.right().mul(off)).add(up.mul(height));
+        let b = f1.pos.add(f1.right().mul(off)).add(up.mul(height));
+        if let (Some(p), Some(q)) = (view.project(a), view.project(b)) {
+            let fog = 1.0 - ((d - d_ship) / 90.0).clamp(0.0, 1.0);
+            let c = [0.6 + 0.4 * tint[0], 0.6 + 0.4 * tint[1], 0.6 + 0.4 * tint[2]];
+            out.line(p.0, p.1, q.0, q.1, c, 0.7 * rush * fog, 1.0);
+        }
+    }
 }
 
 /// A hold's ribbon from `d0` to `d1` metres, `off` metres across the road: a glowing strip in

@@ -286,7 +286,8 @@ fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
         // Grab each shot just after a catch, so the hit effects show.
         let just_caught = ride.events.iter().any(|e| matches!(e, plexdio::game::play::Event::Caught { t: te, .. } if (0.08..0.2).contains(&(t - te))));
         // Every other shot is taken mid-hold, to show the ribbons.
-        let want = if shot % 2 == 1 { ride.holding.is_some_and(|h| t - ride.map.notes[h.i].t > 0.2) } else { just_caught };
+        let mid_hold = ride.holding.is_some_and(|h| t - ride.map.notes[h.i].t > 0.2);
+        let want = if shot % 2 == 1 && t < shots[shot] + 4.0 { mid_hold } else { just_caught };
         if t >= shots[shot] && want {
             let clock = Instant::now();
             let craft = Craft::ALL[shot % Craft::ALL.len()];

@@ -2,6 +2,20 @@
 
 **Status (2026-11-01): built: spike and steps 2–5 all done, plus a round of feedback fixes and hold notes.**
 
+Hit registration and speed (2026-11-02):
+- Catching is wider and judged over time. A colour note counts within 1.3 m (CATCH 0.26; the
+  ship is 3 m wide, blocks 1.6 m, lanes 2 m apart), at any moment from 70 ms before to 50 ms
+  after its time. The nose meets a block before its centre arrives; the old single-instant
+  0.9 m check missed those.
+- Greys are judged right at their time within 0.9 m. Dodged greys are marked passed.
+  `HOLD_STAY` is 0.3.
+- Road speed goes from 0.6× to 1.5× of the level's base with intensity² (was 0.7–1.3×).
+- The renderer's "rush" (a smoothstep of intensity from 0.5 to 0.95) gives:
+  - focal length 1.25 → 0.93 (a wider view), with the camera 0.6 m lower and 1.2 m closer;
+  - a fine high-speed shake;
+  - streaks rushing past beside the road (world-fixed, hashed per 3 m).
+- Light posts every 12 m on both edges, always shown, pulse on the beat.
+
 Hold notes:
 - Analysis (VERSION 2) finds `sustains`.
   - A clear onset (strength ≥ 0.25, peak ≥ 35 % of the band's range) whose band energy stays
