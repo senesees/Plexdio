@@ -14,6 +14,9 @@
 //! - `--ai` adds the Beat This! model's evidence to the analysis (as the app does).
 //! - `--clicks` writes `target/ride/<name>-clicks.wav`: the song with a click on every beat
 //!   (higher on downbeats), to check the grid by ear.
+//! - `--gallery` writes `target/ride/<name>-gallery/*.png` at 960×540 (for the README): a curved
+//!   hold arriving, riding a hold, a catch, a calm and a loud stretch, and the hover ship, car and
+//!   plane at the same moment.
 //! - `--frames` writes `target/ride/<name>-ride.png`: six moments of a Pro ride (an autopilot
 //!   steers for the notes; ship, car and plane in turn) over the Tunnel visualiser, and prints
 //!   the ride's score and draw time.
@@ -37,6 +40,7 @@ fn main() {
     let clicks = args.iter().any(|a| a == "--clicks");
     let frames = args.iter().any(|a| a == "--frames");
     let use_ai = args.iter().any(|a| a == "--ai");
+    let gallery = args.iter().any(|a| a == "--gallery");
     let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let out = Path::new("target/ride");
     std::fs::create_dir_all(out).expect("create target/ride");
@@ -114,6 +118,15 @@ fn main() {
             let (img, stats) = ride_frames(&samples, maps[1].clone());
             img.save(&png).expect("write png");
             println!("    → {} ({stats})", png.display());
+        }
+        if gallery {
+            let dir = out.join(format!("{name}-gallery"));
+            std::fs::create_dir_all(&dir).expect("create gallery folder");
+            for (shot, img) in gallery_shots(&samples, maps[1].clone()) {
+                let png = dir.join(format!("{shot}.png"));
+                img.save(&png).expect("write png");
+                println!("    → {}", png.display());
+            }
         }
         if clicks {
             let wav = out.join(format!("{name}-clicks.wav"));
@@ -324,4 +337,64 @@ fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
     let (held, broken) = (count(NoteState::Held), count(NoteState::Broken));
     let stats = format!("holds held {held}, broken {broken}; score {}, caught {}, missed {}, greys {}, best combo {}; draw {:.2} ms/frame ({:.2} for the shots)", ride.score, ride.caught, ride.missed, ride.greys, ride.best_combo, per, render_ms / frames.max(1) as f64);
     (sheet, stats)
+}
+
+/// Named moments of an autopilot ride at 960×540 over the Tunnel visualiser (see `--gallery`).
+fn gallery_shots(samples: &[f32], map: Map) -> Vec<(&'static str, image::RgbImage)> {
+    use plexdio::game::play::{lane_xf, Event};
+    let (w, h) = (960usize, 540usize);
+    let geom = RoadGeom::new(&map);
+    let duration = map.duration;
+    let mut ride = Ride::new(map, 0.0);
+    let mut vis = RetroVis::new(RetroPrefs { preset: Some("Tunnel".into()), cycle_secs: 0, width: 480, ..Default::default() });
+    let mut out = Canvas::new(w, h);
+    let mut shots: Vec<(&'static str, image::RgbImage)> = Vec::new();
+    let mut pixels = Vec::new();
+    let mut grab = |out: &Canvas, name: &'static str, shots: &mut Vec<(&'static str, image::RgbImage)>| {
+        out.to_rgb_u32(&mut pixels, false);
+        let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
+            let p = pixels[y as usize * w + x as usize];
+            image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])
+        });
+        shots.push((name, img));
+    };
+    let taken = |shots: &Vec<(&'static str, image::RgbImage)>, name: &str| shots.iter().any(|s| s.0 == name);
+    let (dt, mut t) = (1.0 / 60.0, 0.0f32);
+    while t < duration {
+        t += dt;
+        let target = match ride.holding {
+            Some(hd) => lane_xf(ride.map.notes[hd.i].lane_at(t + 0.08)),
+            None => ride.map.notes[ride.next_note()..].iter().find(|n| matches!(n.kind, NoteKind::Colour(_))).map_or(0.0, |n| lane_x(n.lane)),
+        };
+        ride.update(t, Input { pointer: Some(target / 2.4 + 0.5), ..Default::default() }, dt);
+        let s0 = ((t * RATE as f32) as usize).min(samples.len());
+        vis.frame(Some((&samples[s0.saturating_sub(2048)..s0], RATE)), true, dt, w as f32 / h as f32);
+        if t < 8.0 {
+            continue;
+        }
+        let intensity = ride.map.road_at(t).intensity;
+        let next = &ride.map.notes[ride.next_note()..];
+        let wants: Vec<&'static str> = [
+            ("curved-hold", next.iter().take(6).any(|n| n.bends.len() >= 2 && (0.42..0.46).contains(&(n.t - t)))),
+            ("holding", ride.holding.is_some_and(|hd| (0.35..0.4).contains(&(t - ride.map.notes[hd.i].t)))),
+            ("catch", ride.events.iter().any(|e| matches!(e, Event::Caught { t: te, .. } if (0.1..0.12).contains(&(t - te)))) && intensity > 0.6),
+            ("calm", intensity < 0.25 && next.first().is_some_and(|n| (0.3..1.2).contains(&(n.t - t)))),
+            ("loud", intensity > 0.93 && next.first().is_some_and(|n| (0.2..0.6).contains(&(n.t - t)))),
+        ]
+        .into_iter()
+        .filter(|(name, want)| *want && !taken(&shots, name))
+        .map(|(name, _)| name)
+        .collect();
+        for name in wants {
+            draw(&mut out, vis.canvas(), &ride, &geom, t, Craft::Ship);
+            grab(&out, name, &mut shots);
+            if name == "loud" {
+                for (craft, cname) in [(Craft::Ship, "craft-ship"), (Craft::Car, "craft-car"), (Craft::Plane, "craft-plane")] {
+                    draw(&mut out, vis.canvas(), &ride, &geom, t, craft);
+                    grab(&out, cname, &mut shots);
+                }
+            }
+        }
+    }
+    shots
 }
