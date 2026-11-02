@@ -28,13 +28,10 @@ Sound Scope:
 
 ![The nine visualiser looks: Scope, Rings, Dashboard, Ambient, Kaleido, Polygon, Terrain, Tunnel and Cloud](docs/visualiser-looks.png)
 
-**Ride**, an Audiosurf-style game on the song that is playing (`G` on the Now playing page):
+**Ride**, an Audiosurf-style game on the song that is playing (`G` on the Now playing page; see
+[Ride](#ride-the-game)):
 
-![Riding a song: the road, coloured notes to catch and the hover ship over the Tunnel visualiser](docs/ride.png)
-
-Ride in a hover ship, a car or a plane:
-
-![The hover ship, the car and the plane](docs/ride-craft.png)
+![Riding a song: the road, notes to catch and a catch burst over the Rings visualiser](docs/ride.png)
 
 ## What it does
 
@@ -113,32 +110,8 @@ Ride in a hover ship, a car or a plane:
   Settings → Now playing visualiser picks the look, change interval, resolution, sharp or smooth pixels,
   dithering and frame rate. The picture is scaled straight into the window, so full screen costs
   about a quarter of one CPU core.
-- **Ride**: an Audiosurf-style game on the song that is playing, over the visualiser. Press `G`
-  (or the Ride button) on the Now playing page at any point in a song; the music never stops.
-  - The song is analysed in the background (about a second): onsets in three bands, sustained
-    sounds, a steady beat grid, loudness and sections. The **Beat This!** AI model (ISMIR 2024, built into the exe,
-    runs on the CPU) then refines the beats in a few more seconds.
-  - The analysis becomes a road that climbs through calm parts and drops fast through loud ones,
-    turning at section changes, with notes on the beats in five lanes. Bass, mids and highs each
-    get a home lane per section and walk around it, and every other phrase mirrors the layout.
-    Notes are coloured cool to hot by intensity; grey blocks are to be avoided. **Hold notes** come
-    from sustained sounds (held chords, synths, sung notes): a glowing ribbon down the lane. Catch
-    its head and stay on it to earn points as you go, plus a bonus for riding it to the end;
-    steering off early breaks it, but not your combo. Where the music moves on over the held
-    sound, the ribbon slides into the neighbouring lanes and you follow it (more bends on harder
-    levels).
-  - Steer with the mouse (its position across the view) or `←`/`→`. Catch notes, avoid greys and
-    build a combo for a ×2–×4 multiplier. A catch flashes, throws sparks and a shockwave ring and
-    pops up its points; a grey flashes red and shakes the camera; missed notes fly past. You can't
-    fail: every ride goes to the end of the song.
-  - The ride starts wherever the song is (with a 2 s run-up) and carries on into the next song,
-    whose track is built while you ride. Each song ends with a results card (score, accuracy,
-    best combo, personal best).
-  - Restarting the song (Previous, or seeking to the start) rides it again. `Esc` stops.
-  - Tracks and scores are kept in the library database. Settings → Storage shows the saved tracks
-    and can clear them; your scores stay.
-  - Settings → Ride: difficulty (Casual, Pro, Elite; scores per level), hover ship, car or plane,
-    30 or 60 fps, an audio delay for wireless headphones, and the AI on or off.
+- **Ride**: an Audiosurf-style game on the song that is playing, built from the song itself and
+  played over the visualiser. See [Ride](#ride-the-game).
 - **Zoom**: 80–150 % (`Ctrl+=`, `Ctrl+−`, `Ctrl+0`, or Settings), remembered.
 - **Windows integration**: a themed title bar (drag, double-click to maximise, resize from any
   edge, live redraw while resizing), tray icon with menu, minimise/close to tray, media keys
@@ -199,6 +172,56 @@ Discord desktop app over its local IPC pipe, retries every 15 s while Discord is
 stays within Discord's rate limit (5 updates per 20 s). For a build with a built-in ID, put
 it into `CLIENT_ID` in `crates/plexdio/src/discord.rs`; `PLEXDIO_DISCORD_CLIENT_ID` also
 works for testing. An ID entered in Settings always wins.
+
+## Ride (the game)
+
+Ride turns the song that is playing into a road, in the spirit of Audiosurf. Press `G` (or the
+**Ride** button) on the Now playing page at any point in a song: the music never stops, the road
+is ready in about a second, and the ride carries on from song to song until you stop it.
+
+![Four moments of a ride: a curved hold ahead, riding a hold, catching notes, and a loud part with a wide view and streaks](docs/ride-moments.png)
+
+### How to play
+
+- **Steer** with the mouse (its position across the view) or `←`/`→`. The cursor hides over the
+  game only.
+- **Catch** the coloured blocks in the five lanes. Hot colours (red, yellow) are worth more than
+  cool ones (blue, violet). A run of catches builds a **combo**: ×2 at 10, ×3 at 25, ×4 at 50.
+- **Avoid** the grey blocks: they cost points and break the combo.
+- **Hold notes** are glowing ribbons. Catch the head and stay on the ribbon to earn points as you
+  go, plus a bonus at the end. Some ribbons **curve** into the next lanes, following the music;
+  follow them. Leaving a hold early breaks it but keeps your combo.
+- You can't fail: every ride goes to the end of the song. Each song ends with a results card
+  (score, accuracy, best combo, and your personal best for that song and level).
+- `Esc` stops riding. Restarting the song (Previous, or seeking to the start) rides it again.
+
+### How the road is made
+
+- **Analysis** (about a second, in the background, while the music plays): note starts in three
+  bands (bass, mids, highs), sustained sounds, loudness and the song's sections. A steady beat
+  grid comes from a classic beat tracker, refined a few seconds later by the **Beat This!** AI
+  model (ISMIR 2024), which is built into the exe and runs on the CPU at low priority.
+- **The road** climbs slowly through calm parts and drops fast through loud ones, turning at
+  section changes. Its speed follows the music: from 0.6× in calm parts to 1.5× in the loudest,
+  where the view widens, the camera drops and streaks rush past.
+- **Notes** sit on beats (and half- or quarter-beats on harder levels) where the song has a note
+  start. Each band gets a home lane per section and walks around it, and every four bars the
+  layout mirrors. Sustained sounds become holds; notes played over them become a hold's curves.
+- Tracks and scores are kept in the library database, so a song you've ridden loads instantly.
+  The next song in the queue is prepared while you ride.
+
+### Settings
+
+Settings → **Ride**: difficulty (Casual, Pro, Elite: more notes, more curves and a faster road;
+scores are kept per level), what you ride in, 30 or 60 fps, an audio delay for wireless
+headphones, and the AI beat model on or off. Settings → Storage → **Ride tracks** shows the saved
+tracks and clears them (your scores stay).
+
+![The Ride settings card](docs/ride-settings.png)
+
+Ride in a hover ship, a car or a plane:
+
+![The hover ship, the car and the plane on a loud stretch](docs/ride-craft.png)
 
 ## Status
 
@@ -389,11 +412,11 @@ memory under Wine.
 ## Testing
 
 ```sh
-cargo test --workspace                                  # 185 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, Ride, ...
+cargo test --workspace                                  # 191 tests: parsing, sync, audio, EQ, queue, playlists, downloads, cast, Ride, ...
 cargo test --workspace --target x86_64-pc-windows-gnu   # same suite under Wine
 semgrep scan --config p/default --metrics off crates     # 0 findings
 cargo run --release -p plexdio --example retrovis_preview # renders every Now playing look to target/retrovis/*.png
-cargo run --release -p plexdio --example ride_preview -- --ai --frames --clicks SONG...  # Ride analysis timelines, ride shots, beat-click WAVs
+cargo run --release -p plexdio --example ride_preview -- --ai --frames --gallery --clicks SONG...  # Ride timelines, ride shots, README shots, beat-click WAVs
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
