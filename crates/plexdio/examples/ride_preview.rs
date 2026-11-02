@@ -91,12 +91,14 @@ fn main() {
         for m in &maps {
             let greys = m.notes.len() - m.colour_notes();
             let holds: Vec<f32> = m.notes.iter().filter(|n| n.is_hold()).map(|n| n.len).collect();
+            let curved = m.notes.iter().filter(|n| !n.bends.is_empty()).count();
             println!(
-                "    {:6}: {} notes ({:.1}/s), {} holds ({:.1} s held in all), {} greys, {:.0} m",
+                "    {:6}: {} notes ({:.1}/s), {} holds ({} curved, {:.1} s held in all), {} greys, {:.0} m",
                 m.difficulty.label(),
                 m.colour_notes(),
                 m.colour_notes() as f32 / a.duration.max(1.0),
                 holds.len(),
+                curved,
                 holds.iter().sum::<f32>(),
                 greys,
                 m.distance_at(a.duration)
@@ -177,8 +179,16 @@ fn timeline(a: &Analysis, maps: &[Map]) -> image::RgbImage {
                 NoteKind::Colour(c) => PALETTE[c as usize],
                 NoteKind::Grey => [120, 120, 120],
             };
-            let len = (n.len * PX_PER_S) as i32;
-            rect(&mut img, x - 1, y0 + top + n.lane as i32 * (18 / LANES as i32), 3 + len, 3, c);
+            if n.is_hold() {
+                // Follow the hold's path, lane by lane.
+                for k in 0..=(n.len * PX_PER_S) as i32 {
+                    let tt = n.t + k as f32 / PX_PER_S;
+                    let (xx, yy) = at(tt);
+                    rect(&mut img, xx, yy + top + (n.lane_at(tt) * (18 / LANES as i32) as f32) as i32, 1, 3, c);
+                }
+            } else {
+                rect(&mut img, x - 1, y0 + top + n.lane as i32 * (18 / LANES as i32), 3, 3, c);
+            }
         }
     }
     img
@@ -276,7 +286,7 @@ fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
         // Autopilot: head for the next coloured note's lane.
         // (Ride a hold out before heading for the next note.)
         let target = match ride.holding {
-            Some(h) => lane_x(ride.map.notes[h.i].lane),
+            Some(h) => plexdio::game::play::lane_xf(ride.map.notes[h.i].lane_at(t + 0.08)),
             None => ride.map.notes[ride.next_note()..].iter().find(|n| matches!(n.kind, NoteKind::Colour(_))).map_or(0.0, |n| lane_x(n.lane)),
         };
         ride.update(t, Input { pointer: Some(target / 2.4 + 0.5), ..Default::default() }, dt);
@@ -286,8 +296,9 @@ fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
         // Grab each shot just after a catch, so the hit effects show.
         let just_caught = ride.events.iter().any(|e| matches!(e, plexdio::game::play::Event::Caught { t: te, .. } if (0.08..0.2).contains(&(t - te))));
         // Every other shot is taken mid-hold, to show the ribbons.
-        let mid_hold = ride.holding.is_some_and(|h| t - ride.map.notes[h.i].t > 0.2);
-        let want = if shot % 2 == 1 && t < shots[shot] + 4.0 { mid_hold } else { just_caught };
+        // The other shots show a curved hold about to arrive, its whole path ahead on the road.
+        let mid_hold = ride.map.notes[ride.next_note()..].iter().take(6).any(|n| !n.bends.is_empty() && (0.55..0.65).contains(&(n.t - t)));
+        let want = if shot % 2 == 1 && t < shots[shot] + 12.0 { mid_hold } else { just_caught };
         if t >= shots[shot] && want {
             let clock = Instant::now();
             let craft = Craft::ALL[shot % Craft::ALL.len()];
@@ -308,6 +319,9 @@ fn ride_frames(samples: &[f32], map: Map) -> (image::RgbImage, String) {
         draw(&mut out, vis.canvas(), &ride, &geom, t, Craft::Ship);
     }
     let per = clock.elapsed().as_secs_f64() * 1000.0 / 60.0;
-    let stats = format!("score {}, caught {}, missed {}, greys {}, best combo {}; draw {:.2} ms/frame ({:.2} for the shots)", ride.score, ride.caught, ride.missed, ride.greys, ride.best_combo, per, render_ms / frames.max(1) as f64);
+    use plexdio::game::play::NoteState;
+    let count = |st: NoteState| (0..ride.map.notes.len()).filter(|&i| ride.state(i) == st).count();
+    let (held, broken) = (count(NoteState::Held), count(NoteState::Broken));
+    let stats = format!("holds held {held}, broken {broken}; score {}, caught {}, missed {}, greys {}, best combo {}; draw {:.2} ms/frame ({:.2} for the shots)", ride.score, ride.caught, ride.missed, ride.greys, ride.best_combo, per, render_ms / frames.max(1) as f64);
     (sheet, stats)
 }

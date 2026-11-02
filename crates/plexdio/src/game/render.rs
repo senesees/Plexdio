@@ -2,8 +2,8 @@
 //! road in 3D with a chase camera, the notes as glowing blocks, the craft and hit bursts. Flat
 //! shading and painter's order, PS1 style, all on the CPU.
 
-use super::mapgen::{Map, NoteKind, COLOURS, HOLD_MAX, LANES, ROAD_HZ};
-use super::play::{lane_x, Event, NoteState, Ride};
+use super::mapgen::{Map, Note, NoteKind, COLOURS, HOLD_MAX, LANES, ROAD_HZ};
+use super::play::{lane_x, lane_xf, Event, NoteState, Ride};
 use crate::ui::retrovis::canvas::{Canvas, Rgb};
 use crate::ui::retrovis::math3d::{v3, Camera, V3};
 use serde::{Deserialize, Serialize};
@@ -205,7 +205,7 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
             NoteState::Broken => (ride.consumed(i), 0.35),
             _ => continue,
         };
-        ribbon(out, &view, geom, map.distance_at(from_t).max(near), map.distance_at(n.end()), lane_x(n.lane) * STEER_M, PALETTE[c as usize], light, d_ship);
+        ribbon(out, &view, geom, map, &n, from_t, near, PALETTE[c as usize], light, d_ship);
     }
     for &i in visible.iter().rev() {
         let n = map.notes[i];
@@ -229,7 +229,7 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
             let d = map.distance_at(n.end());
             if d >= near && d < d_ship + AHEAD {
                 let f = geom.at(d);
-                let centre = f.pos.add(f.right().mul(lane_x(n.lane) * STEER_M));
+                let centre = f.pos.add(f.right().mul(lane_x(n.end_lane()) * STEER_M));
                 let light = if matches!(state, NoteState::Missed | NoteState::Broken) { 0.4 } else { 1.0 - ((d - d_ship) / AHEAD).clamp(0.0, 1.0) * 0.6 };
                 draw_block(out, &view, centre, f, c, light, false, 0.45);
             }
@@ -351,30 +351,44 @@ fn posts_and_streaks(out: &mut Canvas, view: &View, geom: &RoadGeom, d_ship: f32
     }
 }
 
-/// A hold's ribbon from `d0` to `d1` metres, `off` metres across the road: a glowing strip in
-/// its note's colour, far parts first.
+/// A hold's ribbon from song time `from` to its end, following its bends: a glowing strip in its
+/// note's colour, far parts first. Nothing nearer than `near` metres is drawn.
 #[allow(clippy::too_many_arguments)]
-fn ribbon(out: &mut Canvas, view: &View, geom: &RoadGeom, d0: f32, d1: f32, off: f32, c: Rgb, light: f32, d_ship: f32) {
-    if d1 <= d0 {
+fn ribbon(out: &mut Canvas, view: &View, geom: &RoadGeom, map: &Map, n: &Note, from: f32, near: f32, c: Rgb, light: f32, d_ship: f32) {
+    let (t0, t1) = (from, n.end());
+    if t1 <= t0 {
         return;
     }
-    let steps = ((d1 - d0) / SEG).ceil().max(1.0) as usize;
+    // Sample by time, finely enough for road segments and for the slides between lanes.
+    let span = map.distance_at(t1) - map.distance_at(t0);
+    let steps = ((span / SEG).ceil() as usize).max(((t1 - t0) / 0.04).ceil() as usize).clamp(1, 400);
+    let pts: Vec<(f32, f32)> = (0..=steps)
+        .map(|k| {
+            let t = t0 + (t1 - t0) * k as f32 / steps as f32;
+            (map.distance_at(t), lane_xf(n.lane_at(t)) * STEER_M)
+        })
+        .collect();
     let half = 0.55;
     let lift = v3(0.0, 0.06, 0.0);
-    let edge = |d: f32, side: f32| {
+    let edge = |d: f32, off: f32| {
         let f = geom.at(d);
-        view.project(f.pos.add(f.right().mul(off + side)).add(lift))
+        view.project(f.pos.add(f.right().mul(off)).add(lift))
     };
-    for k in (0..steps).rev() {
-        let (a, b) = (d0 + (d1 - d0) * k as f32 / steps as f32, d0 + (d1 - d0) * (k + 1) as f32 / steps as f32);
-        let (Some(p0), Some(p1), Some(p2), Some(p3)) = (edge(a, -half), edge(a, half), edge(b, half), edge(b, -half)) else { continue };
+    for w in pts.windows(2).rev() {
+        let ((a, oa), (b, ob)) = (w[0], w[1]);
+        let a = a.max(near);
+        if b <= a {
+            continue;
+        }
+        let (Some(p0), Some(p1), Some(p2), Some(p3)) = (edge(a, oa - half), edge(a, oa + half), edge(b, ob + half), edge(b, ob - half)) else { continue };
         let fog = 1.0 - (((a - d_ship) / AHEAD).clamp(0.0, 1.0)).powi(2);
         let k = light * fog;
-        let fill = [c[0] * 0.55 * k, c[1] * 0.55 * k, c[2] * 0.55 * k];
+        // Bright enough to read the path (and its bends) well ahead.
+        let fill = [c[0] * 0.75 * k, c[1] * 0.75 * k, c[2] * 0.75 * k];
         out.tri_flat([(p0.0, p0.1), (p1.0, p1.1), (p2.0, p2.1)], fill, 0.9);
         out.tri_flat([(p0.0, p0.1), (p2.0, p2.1), (p3.0, p3.1)], fill, 0.9);
-        out.line(p0.0, p0.1, p3.0, p3.1, c, 0.9 * k, 1.0);
-        out.line(p1.0, p1.1, p2.0, p2.1, c, 0.9 * k, 1.0);
+        out.line(p0.0, p0.1, p3.0, p3.1, c, 1.2 * k, 1.0);
+        out.line(p1.0, p1.1, p2.0, p2.1, c, 1.2 * k, 1.0);
     }
 }
 

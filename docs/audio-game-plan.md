@@ -38,6 +38,21 @@ Track-start lag and desync (2026-11-02):
 - **FOV:** focal 1.25 calm → 0.82 at full rush (about 77° → 100° vertically), with a little
   widening from medium intensity.
 
+Curved holds (2026-11-02):
+- The notes a hold drops (music played over the held sound) become its bends: up to 1, 2 or 4
+  (Casual, Pro, Elite) in `Note.bends`, a fixed-size `Bends` so `Note` stays `Copy`.
+- Each bend is one lane, arriving at the dropped note's time after a 0.25 s smooth slide
+  (`BEND_TIME`), at least 0.35 s apart (`BEND_GAP`), and not in the last 0.15 s.
+- `Note::lane_at(t)` gives the path, `end_lane()` the lane after it, and `lanes()` every lane on
+  the way.
+- Lane-jump rules count from the end lane (`Bends::reclamp` when a start lane moves); greys avoid
+  every lane on the path.
+- While holding, the craft must stay within `HOLD_STAY` of `lane_xf(lane_at(t))`.
+- The ribbon samples the path by time (≤ 0.04 s steps). It is brighter now (fill 0.75, edges
+  1.2), and the tail cap sits in the end lane.
+- Real songs: about half the holds curve (Pro: 2 of 8, 11 of 18, 18 of 31). The autopilot held
+  all 48, curved ones included.
+
 Hold notes:
 - Analysis (VERSION 2) finds `sustains`.
   - A clear onset (strength ≥ 0.25, peak ≥ 35 % of the band's range) whose band energy stays

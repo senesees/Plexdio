@@ -6,8 +6,13 @@ use super::mapgen::{Map, NoteKind, COLOURS, LANES};
 
 /// Where the lanes are, across the road (-1 left edge … 1 right edge of the steerable range).
 pub fn lane_x(lane: u8) -> f32 {
+    lane_xf(lane as f32)
+}
+
+/// [`lane_x`] for a fractional lane (a curved hold between two lanes).
+pub fn lane_xf(lane: f32) -> f32 {
     let mid = (LANES - 1) as f32 / 2.0;
-    (lane as f32 - mid) / mid * 0.8
+    (lane - mid) / mid * 0.8
 }
 
 /// How close (in steering units; 1 = 5 m) the craft must be to a lane to catch its note: 1.3 m,
@@ -191,10 +196,12 @@ impl Ride {
             return;
         };
         let upto = t.min(n.end());
-        if (self.x - lane_x(n.lane)).abs() > HOLD_STAY {
+        // A curved hold must be followed where it is now.
+        let along = n.lane_at(upto);
+        if (self.x - lane_xf(along)).abs() > HOLD_STAY {
             self.states[h.i] = NoteState::Broken;
             self.consumed[h.i] = upto;
-            self.events.push(Event::HoldBroken { t: upto, lane: n.lane });
+            self.events.push(Event::HoldBroken { t: upto, lane: along.round() as u8 });
             self.holding = None;
             return;
         }
@@ -212,7 +219,7 @@ impl Ride {
             self.combo += 1;
             self.best_combo = self.best_combo.max(self.combo);
             self.states[h.i] = NoteState::Held;
-            self.events.push(Event::HoldDone { t: n.end(), lane: n.lane, colour: c, points: h.earned });
+            self.events.push(Event::HoldDone { t: n.end(), lane: n.end_lane(), colour: c, points: h.earned });
             self.holding = None;
         } else {
             self.holding = Some(h);
@@ -322,7 +329,7 @@ mod tests {
     }
 
     fn note(t: f32, lane: u8, kind: NoteKind) -> Note {
-        Note { t, lane, kind, len: 0.0 }
+        Note::tap(t, lane, kind)
     }
 
     /// Ride from 0 to `until` at 60 fps, pointing at `lane` the whole time.
@@ -375,7 +382,7 @@ mod tests {
     }
 
     fn hold(t: f32, lane: u8, len: f32) -> Note {
-        Note { t, lane, kind: NoteKind::Colour(4), len }
+        Note { len, ..Note::tap(t, lane, NoteKind::Colour(4)) }
     }
 
     #[test]
@@ -393,6 +400,37 @@ mod tests {
         assert_eq!(r.score, 300);
         assert_eq!((r.caught, r.combo), (1, 2), "the head and the finished hold both count for the combo");
         assert!(r.events.iter().any(|e| matches!(e, Event::HoldDone { points: 300, .. })));
+    }
+
+    /// Ride at 60 fps from `from` to `until`, steering wherever `lane(t)` says.
+    fn ride_along(r: &mut Ride, from: f32, until: f32, lane: impl Fn(f32) -> f32) {
+        let mut t = from;
+        while t < until {
+            t += 1.0 / 60.0;
+            // Aim a little ahead, as a player would.
+            let p = Some(lane_xf(lane(t + 0.08)) / 2.4 + 0.5);
+            r.update(t, Input { pointer: p, ..Default::default() }, 1.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn a_curved_hold_is_held_by_following_it() {
+        let curved = || {
+            let mut n = hold(3.0, 1, 2.0);
+            let m = crate::game::mapgen::generate_bends_for_test(&[(3.8, 2), (4.5, 3)]);
+            n.bends = m;
+            n
+        };
+        let mut r = Ride::new(map(vec![curved()]), 0.0);
+        let path = curved();
+        ride_along(&mut r, 0.0, 5.5, |t| path.lane_at(t));
+        assert_eq!(r.state(0), NoteState::Held, "followed the curve to the end");
+        assert!(r.events.iter().any(|e| matches!(e, Event::HoldDone { lane: 3, .. })), "it ends in the last lane");
+        // Staying in the starting lane breaks it at the first bend.
+        let mut s = Ride::new(map(vec![curved()]), 0.0);
+        ride_on_lane(&mut s, 0.0, 5.5, 1);
+        assert_eq!(s.state(0), NoteState::Broken);
+        assert!(s.consumed(0) > 3.5 && s.consumed(0) < 3.85, "broken where the slide starts: {}", s.consumed(0));
     }
 
     #[test]

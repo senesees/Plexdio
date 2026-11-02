@@ -36,14 +36,16 @@ impl Difficulty {
 
     fn params(self) -> Params {
         match self {
-            Difficulty::Casual => Params { threshold: 0.55, min_gap: 0.36, subdivisions: 1, grey_rate: 0.06, speed: 30.0 },
-            Difficulty::Pro => Params { threshold: 0.42, min_gap: 0.24, subdivisions: 2, grey_rate: 0.12, speed: 36.0 },
-            Difficulty::Elite => Params { threshold: 0.30, min_gap: 0.16, subdivisions: 4, grey_rate: 0.18, speed: 42.0 },
+            Difficulty::Casual => Params { bends: 1, threshold: 0.55, min_gap: 0.36, subdivisions: 1, grey_rate: 0.06, speed: 30.0 },
+            Difficulty::Pro => Params { bends: 2, threshold: 0.42, min_gap: 0.24, subdivisions: 2, grey_rate: 0.12, speed: 36.0 },
+            Difficulty::Elite => Params { bends: MAX_BENDS, threshold: 0.30, min_gap: 0.16, subdivisions: 4, grey_rate: 0.18, speed: 42.0 },
         }
     }
 }
 
 struct Params {
+    /// Most bends per hold.
+    bends: usize,
     /// Minimum onset strength for a note (lowered in intense parts).
     threshold: f32,
     /// Seconds between notes at least.
@@ -75,9 +77,86 @@ pub struct Note {
     /// Seconds to hold after catching it (0 for an ordinary note).
     #[serde(default)]
     pub len: f32,
+    /// Where a hold slides into other lanes along the way (empty: straight).
+    #[serde(default)]
+    pub bends: Bends,
+}
+
+/// Most bends a hold can have.
+pub const MAX_BENDS: usize = 4;
+/// A bend slides one lane over this long, arriving at its time.
+pub const BEND_TIME: f32 = 0.25;
+/// Bends are at least this far apart (and from the hold's start).
+const BEND_GAP: f32 = 0.35;
+
+/// A hold's bends: (song time it arrives, lane), in order, each one lane from the last.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Bends {
+    n: u8,
+    at: [(f32, u8); MAX_BENDS],
+}
+
+impl Bends {
+    pub fn as_slice(&self) -> &[(f32, u8)] {
+        &self.at[..self.n as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.n as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    fn push(&mut self, t: f32, lane: u8) {
+        if (self.n as usize) < MAX_BENDS {
+            self.at[self.n as usize] = (t, lane);
+            self.n += 1;
+        }
+    }
+
+    /// Keep every bend one lane from the one before, starting from `start` (after the start
+    /// lane moved); bends left with nowhere to go are dropped.
+    fn reclamp(&mut self, start: u8) {
+        let old = *self;
+        *self = Bends::default();
+        let mut prev = start;
+        for &(t, lane) in old.as_slice() {
+            let to = step_towards(prev, lane);
+            if to != prev {
+                self.push(t, to);
+                prev = to;
+            }
+        }
+    }
+}
+
+/// Bends from a list of (time, lane), for tests elsewhere.
+#[cfg(test)]
+pub(crate) fn generate_bends_for_test(at: &[(f32, u8)]) -> Bends {
+    let mut b = Bends::default();
+    for &(t, lane) in at {
+        b.push(t, lane);
+    }
+    b
+}
+
+/// One lane from `from` towards `to`.
+fn step_towards(from: u8, to: u8) -> u8 {
+    match to.cmp(&from) {
+        std::cmp::Ordering::Greater => from + 1,
+        std::cmp::Ordering::Less => from - 1,
+        std::cmp::Ordering::Equal => from,
+    }
 }
 
 impl Note {
+    /// An ordinary note (or grey).
+    pub fn tap(t: f32, lane: u8, kind: NoteKind) -> Self {
+        Note { t, lane, kind, len: 0.0, bends: Bends::default() }
+    }
+
     /// When the note is over: its time, or the end of its hold.
     pub fn end(&self) -> f32 {
         self.t + self.len
@@ -85,6 +164,31 @@ impl Note {
 
     pub fn is_hold(&self) -> bool {
         self.len > 0.0
+    }
+
+    /// Where a hold is across the road at song time `t`, in lanes (fractional while sliding).
+    pub fn lane_at(&self, t: f32) -> f32 {
+        let mut lane = self.lane as f32;
+        for &(at, to) in self.bends.as_slice() {
+            if t >= at {
+                lane = to as f32;
+                continue;
+            }
+            let k = ((t - (at - BEND_TIME)) / BEND_TIME).clamp(0.0, 1.0);
+            lane += (to as f32 - lane) * k * k * (3.0 - 2.0 * k);
+            break;
+        }
+        lane
+    }
+
+    /// The lane a hold ends in (its own lane if straight).
+    pub fn end_lane(&self) -> u8 {
+        self.bends.as_slice().last().map_or(self.lane, |b| b.1)
+    }
+
+    /// Every lane the note covers (a curved hold covers each lane on its way).
+    pub fn lanes(&self) -> impl Iterator<Item = u8> + '_ {
+        std::iter::once(self.lane).chain(self.bends.as_slice().iter().map(|b| b.1))
     }
 }
 
@@ -171,7 +275,11 @@ impl Rng {
 /// Turn hold candidates into holds: the end goes on the half-beat grid (at least [`HOLD_MIN`],
 /// at most [`HOLD_MAX`]); notes inside a hold are dropped, unless clearly stronger, which cut
 /// the hold short instead. A hold too short to keep becomes an ordinary note.
-fn settle_holds(mut kept: Vec<(Note, f32)>, a: &Analysis, min_gap: f32) -> Vec<Note> {
+///
+/// The notes a hold drops become its bends: the ribbon slides towards each one's lane (one lane
+/// at a time, [`BEND_GAP`] apart, at most `max_bends`), so a curved hold follows the music
+/// played over the held sound.
+fn settle_holds(mut kept: Vec<(Note, f32)>, a: &Analysis, min_gap: f32, max_bends: usize) -> Vec<Note> {
     let mut grid: Vec<f32> = a.beats.clone();
     grid.extend(a.beats.windows(2).map(|w| (w[0] + w[1]) / 2.0));
     grid.sort_by(f32::total_cmp);
@@ -197,6 +305,19 @@ fn settle_holds(mut kept: Vec<(Note, f32)>, a: &Analysis, min_gap: f32) -> Vec<N
         kept[i].0.len = end - h.t;
         let inside = kept[i + 1..].iter().take_while(|n| n.0.t < end + gap).count();
         drop[i + 1..i + 1 + inside].iter_mut().for_each(|d| *d = true);
+        let (mut prev, mut last) = (h.lane, h.t);
+        let mut bends = Bends::default();
+        for (n, _) in &kept[i + 1..i + 1 + inside] {
+            if bends.len() >= max_bends || n.t > end - 0.15 {
+                break;
+            }
+            let to = step_towards(prev, n.lane);
+            if to != prev && n.t - last >= BEND_GAP {
+                bends.push(n.t, to);
+                (prev, last) = (to, n.t);
+            }
+        }
+        kept[i].0.bends = bends;
     }
     kept.into_iter().zip(drop).filter(|(_, d)| !d).map(|((n, _), _)| n).collect()
 }
@@ -337,7 +458,7 @@ fn place_notes(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<Note> {
         let phrase = a.downbeats.partition_point(|&d| d <= t + 1e-3) / 4;
         let lane = if phrase % 2 == 1 { LANES - 1 - lane } else { lane };
         let colour = ((0.7 * intensity + 0.3 * strength) * COLOURS as f32).clamp(0.0, (COLOURS - 1) as f32) as u8;
-        scored.push((Note { t, lane, kind: NoteKind::Colour(colour), len }, score));
+        scored.push((Note { len, ..Note::tap(t, lane, NoteKind::Colour(colour)) }, score));
     }
     // Strongest first, skipping any candidate too close to one already taken.
     scored.sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.t.total_cmp(&y.0.t)));
@@ -350,14 +471,16 @@ fn place_notes(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<Note> {
             kept.insert(i, (note, score));
         }
     }
-    let mut notes = settle_holds(kept, a, p.min_gap);
+    let mut notes = settle_holds(kept, a, p.min_gap, p.bends);
     // Quick successions move at most two lanes (one when very quick), towards where they were
     // going.
     for i in 1..notes.len() {
         let (prev, cur) = (notes[i - 1], notes[i]);
-        let max = max_jump(cur.t - prev.end());
-        if cur.lane.abs_diff(prev.lane) > max {
-            notes[i].lane = if cur.lane > prev.lane { prev.lane + max } else { prev.lane - max };
+        let (from, max) = (prev.end_lane(), max_jump(cur.t - prev.end()));
+        if cur.lane.abs_diff(from) > max {
+            notes[i].lane = if cur.lane > from { from + max } else { from - max };
+            let start = notes[i].lane;
+            notes[i].bends.reclamp(start);
         }
     }
 
@@ -372,13 +495,13 @@ fn place_notes(a: &Analysis, p: &Params, rng: &mut Rng) -> Vec<Note> {
             continue;
         }
         // Lanes in use around then, including the whole length of a hold.
-        let near: Vec<u8> = notes.iter().filter(|n| n.t - 0.5 < t && t < n.end() + 0.5).map(|n| n.lane).collect();
+        let near: Vec<u8> = notes.iter().filter(|n| n.t - 0.5 < t && t < n.end() + 0.5).flat_map(|n| n.lanes()).collect();
         let free: Vec<u8> = (0..LANES).filter(|l| !near.contains(l)).collect();
         if free.is_empty() {
             continue;
         }
         let lane = free[rng.below(free.len() as u32) as usize];
-        greys.push(Note { t, lane, kind: NoteKind::Grey, len: 0.0 });
+        greys.push(Note::tap(t, lane, NoteKind::Grey));
     }
     notes.extend(greys);
     notes.sort_by(|x, y| x.t.total_cmp(&y.t));
@@ -414,7 +537,7 @@ mod tests {
             assert!(!colour.is_empty(), "{d:?} has notes");
             for w in colour.windows(2) {
                 assert!(w[1].t - w[0].t >= gap - 1e-4, "{d:?}: notes {:.3}s apart", w[1].t - w[0].t);
-                assert!(w[1].lane.abs_diff(w[0].lane) <= max_jump(w[1].t - w[0].t), "{d:?}: lane jump at {}", w[1].t);
+                assert!(w[1].lane.abs_diff(w[0].end_lane()) <= max_jump(w[1].t - w[0].end()), "{d:?}: lane jump at {}", w[1].t);
             }
             for n in &m.notes {
                 assert!(n.lane < LANES && n.t >= 0.0 && n.t <= m.duration);
@@ -453,14 +576,46 @@ mod tests {
                 assert!(held.iter().any(|&(s, e)| h.t >= s - 0.1 && h.end() <= e + 0.3), "{diff:?}: hold {}–{} is not on a held chord", h.t, h.end());
                 for n in &m.notes {
                     if n.t > h.t && n.t < h.end() {
-                        assert!(n.kind == NoteKind::Grey && n.lane != h.lane, "{diff:?}: {n:?} inside the hold at {}", h.t);
+                        assert!(n.kind == NoteKind::Grey && !h.lanes().any(|l| l == n.lane), "{diff:?}: {n:?} inside the hold at {}", h.t);
                     }
                 }
+                // Bends: inside the hold, in order, one lane each, apart, within the limit.
+                let mut prev = (h.t, h.lane);
+                for &(t, lane) in h.bends.as_slice() {
+                    assert!(t > h.t && t <= h.end(), "{diff:?}: bend at {t} outside {}–{}", h.t, h.end());
+                    assert!(t - prev.0 >= BEND_GAP - 1e-4 && lane.abs_diff(prev.1) == 1, "{diff:?}: bend {prev:?} → {:?}", (t, lane));
+                    prev = (t, lane);
+                }
+                assert!(h.bends.len() <= diff.params().bends);
             }
         }
+        // Some holds curve (the music goes on over the held chords), some stay straight.
+        let m = generate(&a, Difficulty::Elite, 11);
+        assert!(m.notes.iter().any(|n| !n.bends.is_empty()), "curved holds");
         // Pure drums: no holds.
         let plain = generate(&analyse(&d, None), Difficulty::Elite, 11);
         assert!(plain.notes.iter().all(|n| !n.is_hold()));
+    }
+
+    #[test]
+    fn a_curved_hold_slides_smoothly_between_its_lanes() {
+        let mut bends = Bends::default();
+        bends.push(2.0, 3);
+        bends.push(3.0, 4);
+        let h = Note { len: 2.0, bends, ..Note::tap(1.0, 2, NoteKind::Colour(1)) };
+        assert_eq!(h.lane_at(1.0), 2.0);
+        assert_eq!(h.lane_at(1.7), 2.0, "still straight before the slide");
+        let mid = h.lane_at(2.0 - BEND_TIME / 2.0);
+        assert!((mid - 2.5).abs() < 0.01, "halfway through the slide: {mid}");
+        assert_eq!(h.lane_at(2.0), 3.0);
+        assert_eq!(h.lane_at(3.0), 4.0);
+        assert_eq!(h.end_lane(), 4);
+        assert_eq!(h.lanes().collect::<Vec<_>>(), vec![2, 3, 4]);
+        // Moving the start re-clamps the bends to one lane at a time.
+        let mut moved = h;
+        moved.lane = 0;
+        moved.bends.reclamp(0);
+        assert_eq!(moved.bends.as_slice(), &[(2.0, 1), (3.0, 2)]);
     }
 
     #[test]

@@ -123,8 +123,10 @@ Ride in a hover ship, a car or a plane:
     get a home lane per section and walk around it, and every other phrase mirrors the layout.
     Notes are coloured cool to hot by intensity; grey blocks are to be avoided. **Hold notes** come
     from sustained sounds (held chords, synths, sung notes): a glowing ribbon down the lane. Catch
-    its head and stay in the lane to earn points as you go, plus a bonus for riding it to the end;
-    steering off early breaks it, but not your combo.
+    its head and stay on it to earn points as you go, plus a bonus for riding it to the end;
+    steering off early breaks it, but not your combo. Where the music moves on over the held
+    sound, the ribbon slides into the neighbouring lanes and you follow it (more bends on harder
+    levels).
   - Steer with the mouse (its position across the view) or `←`/`→`. Catch notes, avoid greys and
     build a combo for a ×2–×4 multiplier. A catch flashes, throws sparks and a shockwave ring and
     pops up its points; a grey flashes red and shakes the camera; missed notes fly past. You can't
