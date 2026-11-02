@@ -22,6 +22,22 @@ didn't count and then dimmed like misses. The run-up is now only for rides start
 1.5 s into a song. Notes left out (before the start, in the run-up, or jumped over by a seek)
 are `NoteState::Skipped` and not drawn.
 
+Track-start lag and desync (2026-11-02):
+- **Desync:** a new song reports position 0 until the previous song's tail in the output buffer
+  has played (and while its stream starts). The clock ran ahead during that time, then needed
+  seconds at its 10 % slew to fall back in line. `SongClock` now holds until the reported
+  position first moves, and freezes when reports stop for 0.1 s (a stall).
+- **Lag:**
+  - The beat model's runtime (rten/rayon) used a pool of one thread per core at normal
+    priority. It now runs in its own one-thread pool at below-normal priority (`ai::pool`).
+  - Ride keeps one database connection (`RideState.db`); opening one re-runs the schema.
+  - The next song's build starts 4 s into the current song (`PREFETCH_AFTER`).
+  - VM check: across song changes the longest frame gap is 22–28 ms at 60 fps, and 60 fps
+    holds while the model refines a 2:35 song (3.7 s).
+  - The ride log line now reports the longest frame gap.
+- **FOV:** focal 1.25 calm → 0.82 at full rush (about 77° → 100° vertically), with a little
+  widening from medium intensity.
+
 Hold notes:
 - Analysis (VERSION 2) finds `sustains`.
   - A clear onset (strength ≥ 0.25, peak ≥ 35 % of the band's range) whose band energy stays

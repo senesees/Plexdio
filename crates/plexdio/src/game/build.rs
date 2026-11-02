@@ -119,7 +119,7 @@ impl Drop for Build {
 }
 
 /// Keep the analysis out of the way of the UI and audio threads.
-fn below_normal_priority() {
+pub(crate) fn below_normal_priority() {
     #[cfg(windows)]
     // SAFETY: changes only the calling thread's priority, through its pseudo-handle.
     unsafe {

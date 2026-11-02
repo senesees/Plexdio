@@ -9,6 +9,7 @@ use super::analysis::{AiBeats, RATE};
 use beat_this::{BeatThis, RtenRuntime};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 static MEL: &[u8] = include_bytes!("../../../../assets/models/mel_spectrogram.onnx");
 static BEAT: &[u8] = include_bytes!("../../../../assets/models/beat_this_small.onnx");
@@ -29,9 +30,33 @@ fn unpack(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// The runtime's work goes to one thread of its own at below-normal priority. Its default is a
+/// pool with a thread per core at normal priority, which made the UI stutter while a song was
+/// being analysed (the model is effectively single-threaded anyway).
+fn pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "ride-ai".into())
+            .start_handler(|_| super::build::below_normal_priority())
+            .build()
+            .map_err(|e| log::warn!("ride: no thread pool for the beat model ({e}); using the default"))
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Beats and downbeats of a whole song (mono at [`RATE`]) from the model. `models` is the folder
 /// the embedded models are unpacked into.
 pub fn beats(samples: &[f32], models: &Path, cancel: &AtomicBool) -> Result<AiBeats, String> {
+    match pool() {
+        Some(p) => p.install(|| run(samples, models, cancel)),
+        None => run(samples, models, cancel),
+    }
+}
+
+fn run(samples: &[f32], models: &Path, cancel: &AtomicBool) -> Result<AiBeats, String> {
     let mel = unpack(models, "mel_spectrogram.onnx", MEL)?;
     let beat = unpack(models, "beat_this_small.onnx", BEAT)?;
     let mut bt = BeatThis::new(&RtenRuntime, &mel, &beat).map_err(|e| format!("load the beat model: {e}"))?;

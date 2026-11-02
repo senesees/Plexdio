@@ -29,6 +29,9 @@ const KEEP: usize = 8;
 const RESULT_SECS: f64 = 6.0;
 /// Saved analyses kept in the library database (about 125 KB for a 4-minute song).
 const SAVED: usize = 300;
+/// The next song's track is built this far into the current one, not right at the song change
+/// (which already has a ride to start).
+const PREFETCH_AFTER: f32 = 4.0;
 /// Rides shorter than this many notes reached aren't saved as scores.
 const MIN_NOTES: u32 = 5;
 
@@ -56,8 +59,12 @@ pub struct RideState {
     refined: HashSet<i64>,
     /// Game frames and drawing time since the last log line (every 10 s).
     stats: (u32, f64, Option<std::time::Instant>),
+    /// The longest gap between game frames since the last log line, in seconds (hitches).
+    worst_dt: f32,
     /// Fine timer resolution while a ride is on screen (60 fps frame timing on Windows).
     timer: Option<FineTimer>,
+    /// Ride's connection to the library database, and which file it is.
+    db: Option<(std::path::PathBuf, LibraryDb)>,
 }
 
 /// Raises the system timer resolution to 1 ms while it lives. Windows otherwise wakes the event
@@ -163,13 +170,22 @@ impl RideState {
         let clock = std::time::Instant::now();
         draw(canvas, background, &s.ride, &s.geom, t, prefs.craft);
         canvas.to_rgb_u32(&mut video.pixels, dither);
+        self.worst_dt = self.worst_dt.max(dt);
         let (frames, ms, since) = &mut self.stats;
         *frames += 1;
         *ms += clock.elapsed().as_secs_f64() * 1000.0;
         let since = since.get_or_insert_with(std::time::Instant::now);
         if since.elapsed().as_secs() >= 10 {
-            log::info!("ride: {:.1} fps, {:.2} ms per frame for the game at {}×{}", *frames as f64 / since.elapsed().as_secs_f64(), *ms / *frames as f64, canvas.w, canvas.h);
+            log::info!(
+                "ride: {:.1} fps, {:.2} ms per frame for the game at {}×{}, longest frame gap {:.0} ms",
+                *frames as f64 / since.elapsed().as_secs_f64(),
+                *ms / *frames as f64,
+                canvas.w,
+                canvas.h,
+                self.worst_dt * 1000.0
+            );
             self.stats = (0, 0.0, Some(std::time::Instant::now()));
+            self.worst_dt = 0.0;
         }
         video.w = canvas.w;
         video.h = canvas.h;
@@ -191,9 +207,16 @@ impl PlexdioApp {
         }
     }
 
-    /// The open library's database (where analyses and scores are kept).
-    fn ride_db(&self) -> Option<LibraryDb> {
-        self.db_path.as_ref().and_then(|p| LibraryDb::open(p).map_err(|e| log::warn!("ride: database: {e}")).ok())
+    /// The open library's database (where analyses and scores are kept). One connection is kept
+    /// for Ride: opening one runs the schema setup, and a song change used to open several in a
+    /// single frame.
+    fn ride_db(&mut self) -> Option<&LibraryDb> {
+        let path = self.db_path.clone()?;
+        let cached = &mut self.np.ride.db;
+        if cached.as_ref().is_none_or(|(p, _)| *p != path) {
+            *cached = LibraryDb::open(&path).map_err(|e| log::warn!("ride: database: {e}")).ok().map(|db| (path, db));
+        }
+        cached.as_ref().map(|(_, db)| db)
     }
 
     /// A song's analysis from memory or the database (None: it has to be built).
@@ -376,7 +399,7 @@ impl PlexdioApp {
         }
         // While riding, get the next song's track ready so the ride carries straight on; with
         // spare time, let the beat model refine tracks that only have the classic analysis.
-        if self.np.ride.session.is_some() && self.np.ride.build.is_none() {
+        if self.np.ride.session.is_some() && self.np.ride.build.is_none() && position >= PREFETCH_AFTER {
             let ai = self.config.ride.ai;
             for id in self.next_in_queue().into_iter().chain([track]) {
                 if self.np.ride.failed.contains(&id) {

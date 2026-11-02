@@ -36,6 +36,8 @@ rubato = "0.16"
 rtrb = "0.3"
 # Beat This! (ISMIR 2024) beat and downbeat tracking on the pure-Rust rten runtime, for Ride.
 beat-this = { version = "1.1", default-features = false }
+# The beat model's runtime parallelises with rayon; Ride runs it in its own low-priority pool.
+rayon = "1"
 
 [target.'cfg(not(windows))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }

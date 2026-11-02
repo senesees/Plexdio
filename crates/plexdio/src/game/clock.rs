@@ -5,7 +5,12 @@
 //! arrives. The clock estimates the position now (the last report plus the time since it came)
 //! and follows that by running slightly fast or slow, at most [`SLEW`]. It never steps
 //! backwards while playing: stepping towards each report made the road judder back and forth. A
-//! big difference (a seek, a stall) still snaps.
+//! big difference (a seek) still snaps.
+//!
+//! It also never runs ahead of the music on its own. A new song reports 0 until the end of the
+//! previous one, still in the output buffer, has played (and while its stream starts), so the
+//! clock waits for the position to start moving. When reports stop (a stall) it stops too,
+//! instead of running on and then needing seconds to fall back in line.
 
 /// Larger differences than this (seconds) are a jump, not drift.
 const SNAP: f64 = 0.25;
@@ -23,6 +28,8 @@ pub struct SongClock {
     last_report: u64,
     /// Time since `last_report` changed.
     report_age: f64,
+    /// The reported position has moved since the clock started (the song is really playing).
+    moving: bool,
 }
 
 impl SongClock {
@@ -35,11 +42,13 @@ impl SongClock {
             self.t = reported;
             self.last_report = report_ms;
             self.report_age = 0.0;
+            self.moving = false;
             return self.t;
         }
         if report_ms != self.last_report {
             self.last_report = report_ms;
             self.report_age = 0.0;
+            self.moving = true;
         } else if playing {
             self.report_age = (self.report_age + dt).min(MAX_AGE);
         }
@@ -49,8 +58,15 @@ impl SongClock {
             self.t = if err.abs() > SNAP { reported } else { self.t + err * 0.3 };
             return self.t;
         }
+        if !self.moving {
+            // Not started yet (the previous song's tail is still being heard): hold.
+            self.t = reported;
+            return self.t;
+        }
         let estimate = reported + self.report_age;
-        let predicted = self.t + dt;
+        // Reports have stopped (a stall): stop too, rather than run ahead of the music.
+        let stalled = self.report_age >= MAX_AGE;
+        let predicted = if stalled { self.t.max(estimate) } else { self.t + dt };
         let err = estimate - predicted;
         self.t = if err.abs() > SNAP { estimate } else { predicted + (err * FOLLOW).clamp(-SLEW * dt, SLEW * dt) };
         self.t
@@ -75,8 +91,11 @@ mod tests {
             let wall = f as f64 / 60.0;
             let report = 10_000 + ((wall * 1000.0) as u64 / 20) * 20;
             let t = c.update(report, true, 1.0 / 60.0);
-            assert!(t > prev, "time must keep moving");
-            assert!((t - (10.0 + wall)).abs() < 0.03, "frame {f}: {t} vs {}", 10.0 + wall);
+            // (It waits for the first report that moves: at most one report interval.)
+            if report > 10_000 {
+                assert!(t > prev, "time must keep moving");
+                assert!((t - (10.0 + wall)).abs() < 0.03, "frame {f}: {t} vs {}", 10.0 + wall);
+            }
             prev = t;
         }
     }
@@ -107,6 +126,44 @@ mod tests {
         // Each frame advances close to a frame's worth (no judder).
         assert!(steps[60..].iter().all(|s| (0.012..0.025).contains(s)), "{:?}", &steps[60..80]);
         assert!((prev - 10.0).abs() < 0.06, "drifted: {prev}");
+    }
+
+    #[test]
+    fn waits_for_a_new_song_to_start_and_stops_when_the_music_stalls() {
+        let mut c = SongClock::default();
+        // A new song reports 0 for 0.3 s (the previous song's tail), then plays from 0.
+        let mut wall = 0.0;
+        c.update(0, true, 0.0);
+        for _ in 0..18 {
+            wall += 1.0 / 60.0;
+            assert_eq!(c.update(0, true, 1.0 / 60.0), 0.0, "holds while the position doesn't move");
+        }
+        let start = wall;
+        let mut worst: f64 = 0.0;
+        for _ in 0..120 {
+            wall += 1.0 / 60.0;
+            let heard = wall - start;
+            let report = ((heard * 1000.0) as u64 / 10) * 10;
+            let t = c.update(report, true, 1.0 / 60.0);
+            worst = worst.max((t - heard).abs());
+        }
+        assert!(worst < 0.03, "in step with the music from the start (off by {worst:.3} s)");
+        // A stall: the position stops for half a second, then carries on.
+        let stalled_at = wall - start;
+        for _ in 0..30 {
+            wall += 1.0 / 60.0;
+            let t = c.update(((stalled_at * 1000.0) as u64 / 10) * 10, true, 1.0 / 60.0);
+            assert!(t - stalled_at < 0.12, "ran ahead of a stalled song: {t} vs {stalled_at}");
+        }
+        let resume = wall;
+        let mut worst: f64 = 0.0;
+        for _ in 0..60 {
+            wall += 1.0 / 60.0;
+            let heard = stalled_at + (wall - resume);
+            let t = c.update(((heard * 1000.0) as u64 / 10) * 10, true, 1.0 / 60.0);
+            worst = worst.max((t - heard).abs());
+        }
+        assert!(worst < 0.13, "back in step after the stall (off by {worst:.3} s)");
     }
 
     #[test]

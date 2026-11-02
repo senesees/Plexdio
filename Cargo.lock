@@ -1957,6 +1957,7 @@ dependencies = [
  "log",
  "mockplex",
  "raw-window-handle",
+ "rayon",
  "rtrb",
  "rubato 0.16.2",
  "rusqlite",

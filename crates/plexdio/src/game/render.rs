@@ -125,7 +125,9 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
         .sum::<f32>();
     let buzz = rush * rush * 0.035 * ((t * 53.0).sin() + 0.6 * (t * 37.0).sin());
     let cam_pos = behind.pos.add(v3(0.0, CAM_UP - 0.6 * rush + shake * 0.5 + buzz, 0.0)).add(behind.right().mul(lat * 0.55 + shake));
-    let focal = 1.25 - 0.32 * rush;
+    // The view widens with the music: a little from medium intensity, a lot when it rushes
+    // (focal 1.25 → 0.82: about 77° → 100° vertically).
+    let focal = 1.25 - 0.1 * smoothstep(0.3, 0.6, road.intensity) - 0.33 * rush;
     let view = View { cam: Camera { focal, ..Camera::new(out.w, out.h) }, pos: cam_pos, yaw: ship.heading, pitch: ship.pitch - CAM_TILT + 0.03 * rush };
 
     let tint = intensity_colour(road.intensity);
