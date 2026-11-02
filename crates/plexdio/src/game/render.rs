@@ -113,7 +113,10 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
     // Loud, fast parts rush: a wider view from lower and closer, a fine shake, streaks.
     let rush = smoothstep(0.5, 0.95, road.intensity);
     // The camera sits behind the craft, follows its steering a little and looks along the road.
-    let behind = geom.at(d_ship - CAM_BACK + 1.2 * rush);
+    let d_cam = d_ship - CAM_BACK + 1.2 * rush;
+    let behind = geom.at(d_cam);
+    // Nothing nearer than this along the road is drawn: it would be behind the camera.
+    let near = d_cam + 0.5;
     let lat = ride.x * STEER_M;
     // Hitting a grey shakes the camera for a moment.
     let shake = ride
@@ -143,7 +146,12 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
     let mut edges_l: Vec<(f32, f32)> = Vec::new();
     let mut edges_r: Vec<(f32, f32)> = Vec::new();
     for k in (first..last).rev() {
-        let (d0, d1) = (k as f32 * SEG, (k + 1) as f32 * SEG);
+        // The segment the camera is over is clipped at the camera, not dropped: dropping it left
+        // a gap at the bottom of the picture when the view is low and wide at speed.
+        let (d0, d1) = ((k as f32 * SEG).max(near), (k + 1) as f32 * SEG);
+        if d1 <= d0 {
+            continue;
+        }
         let (f0, f1) = (geom.at(d0), geom.at(d1));
         let corners = [
             f0.pos.add(f0.right().mul(-HALF_WIDTH)),
@@ -178,7 +186,6 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
 
     // Notes, far to near: everything ahead, plus missed notes until they are behind the camera
     // (caught ones are gone). A hold whose head has passed still shows while its tail is ahead.
-    let near = d_ship - CAM_BACK + 1.0;
     let from = ride.next_note().min(map.notes.partition_point(|n| n.t < t - HOLD_MAX - 1.0));
     let visible: Vec<usize> = (from..map.notes.len())
         .take_while(|&i| map.distance_at(map.notes[i].t) < d_ship + AHEAD)
@@ -609,6 +616,30 @@ mod tests {
         assert!((g.dist.last().copied().unwrap() - end).abs() < 1.0);
         // The calm intro climbs.
         assert!(g.at(map.distance_at(5.0)).pitch > 0.0);
+    }
+
+    #[test]
+    fn the_road_reaches_the_bottom_of_the_picture_at_full_speed() {
+        // Loud all the way: full rush (lowest, widest view), over a bright background.
+        let (s, _) = drums(140.0, 40.0, 0.0);
+        let map = generate(&analyse(&s, None), Difficulty::Elite, 5);
+        let g = RoadGeom::new(&map);
+        let ride = Ride::new(map, 0.0);
+        let mut bg = Canvas::new(320, 180);
+        bg.wash([1.0, 1.0, 1.0], 1.0);
+        for craft in Craft::ALL {
+            for t in [10.0, 20.3, 31.7] {
+                let mut out = Canvas::new(480, 270);
+                draw(&mut out, &bg, &ride, &g, t, craft);
+                for y in [out.h - 1, out.h - 3] {
+                    let row = &out.px[y * out.w..(y + 1) * out.w];
+                    // The dimmed white background is a neutral grey of 0.45 (lines on the road are
+                    // tinted, the road itself is dark).
+                    let holes = row[out.w / 5..out.w * 4 / 5].iter().filter(|p| p.iter().all(|c| (c - 0.45).abs() < 0.08)).count();
+                    assert_eq!(holes, 0, "{craft:?} at {t} s: the background shows through the road at row {y}");
+                }
+            }
+        }
     }
 
     #[test]
