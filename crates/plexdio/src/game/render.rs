@@ -216,7 +216,7 @@ pub fn draw(out: &mut Canvas, background: &Canvas, ride: &Ride, geom: &RoadGeom,
             draw_block(out, &view, centre, f, c, light, grey, 1.0);
         }
         // A hold's tail: a low cap where it ends.
-        if n.is_hold() && !matches!(state, NoteState::Held) {
+        if n.is_hold() && matches!(state, NoteState::Pending | NoteState::Holding | NoteState::Missed | NoteState::Broken) {
             let d = map.distance_at(n.end());
             if d >= near && d < d_ship + AHEAD {
                 let f = geom.at(d);

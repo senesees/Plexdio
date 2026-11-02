@@ -19,8 +19,11 @@ const GREY_CATCH: f32 = 0.18;
 /// meets a block before the block's centre reaches the craft.
 const EARLY: f32 = 0.07;
 const LATE: f32 = 0.05;
-/// Notes this soon after the ride starts are left out: a run-up to get the feel.
+/// When riding starts mid-song, notes this soon after are left out: a run-up to get the feel.
 pub const RUN_UP: f32 = 2.0;
+/// A ride starting this early in the song (carrying on into the next song, or a restart) is at
+/// the song's start: no run-up, every note counts.
+const SONG_START: f32 = 1.5;
 /// Points per colour, cool to hot.
 const POINTS: [u32; COLOURS as usize] = [10, 20, 40, 70, 100];
 /// Points lost on a grey block (never below zero).
@@ -46,6 +49,9 @@ pub enum NoteState {
     Held,
     /// A hold left early.
     Broken,
+    /// Left out (before the ride started, in its run-up, or jumped over by a seek): not judged,
+    /// not drawn.
+    Skipped,
 }
 
 /// Steering input for one frame.
@@ -110,8 +116,11 @@ pub struct Ride {
 impl Ride {
     /// Start riding `map` at song time `t` (mid-song is fine).
     pub fn new(map: Map, t: f32) -> Self {
-        let next = map.notes.partition_point(|n| n.t < t + RUN_UP);
+        let run_up = if t < SONG_START { 0.0 } else { RUN_UP };
+        let next = map.notes.partition_point(|n| n.t < t + run_up);
         let n = map.notes.len();
+        let mut states = vec![NoteState::Pending; n];
+        states[..next].iter_mut().for_each(|s| *s = NoteState::Skipped);
         let consumed = map.notes.iter().map(|n| n.t).collect();
         Ride {
             map,
@@ -128,7 +137,7 @@ impl Ride {
             start: t,
             last_t: t,
             events: Vec::new(),
-            states: vec![NoteState::Pending; n],
+            states,
             consumed,
             holding: None,
         }
@@ -227,7 +236,13 @@ impl Ride {
         // A seek or a long stall: skip what was jumped over without judging it (a hold being
         // ridden ends there, unpaid).
         if t < self.last_t - 0.3 || t > self.last_t + 1.0 {
-            self.next = self.map.notes.partition_point(|n| n.t < t + 0.5);
+            let to = self.map.notes.partition_point(|n| n.t < t + 0.5);
+            for i in self.next.min(to)..to {
+                if self.states[i] == NoteState::Pending {
+                    self.states[i] = NoteState::Skipped;
+                }
+            }
+            self.next = to;
             if let Some(h) = self.holding.take() {
                 self.states[h.i] = NoteState::Broken;
             }
@@ -396,6 +411,20 @@ mod tests {
         let mut m = Ride::new(map(vec![hold(3.0, 0, 1.0)]), 0.0);
         ride_on_lane(&mut m, 0.0, 4.5, 4);
         assert_eq!((m.state(0), m.score, m.missed), (NoteState::Missed, 0, 1));
+    }
+
+    #[test]
+    fn a_ride_from_the_start_of_a_song_judges_every_note() {
+        // Carrying on into the next song: the ride starts a fraction of a second in.
+        let notes = (0..8).map(|k| note(0.4 + k as f32 * 0.4, 2, NoteKind::Colour(1))).collect();
+        let mut r = Ride::new(map(notes), 0.15);
+        ride_on_lane(&mut r, 0.15, 3.6, 2);
+        assert_eq!((r.caught, r.missed), (8, 0), "no run-up at a song's start");
+        // Started mid-song, the run-up's notes are skipped: not judged and not drawn.
+        let notes = (0..40).map(|k| note(k as f32 * 0.5, 2, NoteKind::Colour(1))).collect();
+        let r = Ride::new(map(notes), 10.1);
+        assert!((0..25).all(|i| r.state(i) == NoteState::Skipped), "before the start and in the run-up");
+        assert_eq!(r.state(25), NoteState::Pending);
     }
 
     #[test]

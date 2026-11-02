@@ -16,6 +16,12 @@ Hit registration and speed (2026-11-02):
   - streaks rushing past beside the road (world-fixed, hashed per 3 m).
 - Light posts every 12 m on both edges, always shown, pulse on the beat.
 
+Song-start fix (2026-11-02): the 2 s run-up applied to every ride, including those carrying on
+into the next song. Its notes were drawn but never judged, so you flew through blocks that
+didn't count and then dimmed like misses. The run-up is now only for rides started more than
+1.5 s into a song. Notes left out (before the start, in the run-up, or jumped over by a seek)
+are `NoteState::Skipped` and not drawn.
+
 Hold notes:
 - Analysis (VERSION 2) finds `sustains`.
   - A clear onset (strength ≥ 0.25, peak ≥ 35 % of the band's range) whose band energy stays
