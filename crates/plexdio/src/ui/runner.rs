@@ -191,11 +191,16 @@ struct Runner<A: UiApp> {
     profile: Option<Profile>,
     /// When the window was last checked to still be on a monitor.
     last_screen_check: Instant,
+    /// The window's current logical minimum client size (main window or mini-player).
+    min_size: Option<(f64, f64)>,
 }
 
 /// How often the window is checked to still be reachable on a monitor. Windows does not
 /// always send an event when a display changes resolution, is unplugged, or wakes from sleep.
 const SCREEN_CHECK: Duration = Duration::from_secs(3);
+
+/// How long after a resize the window is checked.
+const SETTLE: Duration = Duration::from_millis(500);
 
 /// A screen rectangle in physical pixels: x, y, width, height.
 pub type ScreenRect = (i32, i32, i32, i32);
@@ -207,8 +212,8 @@ pub type Rescue = (i32, i32, Option<(i32, i32)>);
 /// it by) is reachable again. `None` when it already is: at least a 120×16 px piece of the
 /// strip lies on one of the `monitors`. Otherwise the window moves onto monitor `nearest`
 /// (clamped inside it); `resizable` windows larger than that monitor are also shrunk to fit,
-/// returned as the new size.
-pub fn rescue_position(win: ScreenRect, grab_h: i32, monitors: &[ScreenRect], nearest: usize, resizable: bool) -> Option<Rescue> {
+/// returned as the new size, but never below `min` (the window's minimum size, physical pixels).
+pub fn rescue_position(win: ScreenRect, grab_h: i32, monitors: &[ScreenRect], nearest: usize, resizable: bool, min: (i32, i32)) -> Option<Rescue> {
     let (x, y, w, h) = win;
     if monitors.is_empty() || w <= 0 || h <= 0 {
         return None;
@@ -229,9 +234,11 @@ pub fn rescue_position(win: ScreenRect, grab_h: i32, monitors: &[ScreenRect], ne
     let mut size = None;
     if resizable && (w > mw || h > mh) {
         // Leave a margin so the edges can be grabbed too.
-        nw = w.min((mw - 40).max(200));
-        nh = h.min((mh - 80).max(150));
-        size = Some((nw, nh));
+        nw = w.min((mw - 40).max(200)).max(min.0);
+        nh = h.min((mh - 80).max(150)).max(min.1);
+        if (nw, nh) != (w, h) {
+            size = Some((nw, nh));
+        }
     }
     let nx = if nw >= mw { mx } else { x.clamp(mx, mx + mw - nw) };
     let ny = if nh >= mh { my } else { y.clamp(my, my + mh - nh) };
@@ -282,7 +289,9 @@ pub fn run<A: UiApp + 'static>(
         exiting: false,
         profile: std::env::var_os("PLEXDIO_PROFILE").map(|_| Profile::default()),
         last_screen_check: Instant::now(),
+        min_size: None,
     };
+    runner.min_size = runner.options.viewport.min_inner_size.map(|v| (v.x as f64, v.y as f64));
     event_loop
         .run_app(&mut runner)
         .map_err(|e| format!("event loop error: {e}"))?;
@@ -290,15 +299,42 @@ pub fn run<A: UiApp + 'static>(
 }
 
 /// Bring the window back onto a monitor if a display change (resolution, unplugged screen,
-/// sleep) left its title bar out of reach. Minimized, hidden and maximized windows are left to
-/// Windows.
-fn ensure_on_screen(window: &Window) {
-    if window.is_minimized() == Some(true) || !window.is_visible().unwrap_or(true) || window.is_maximized() {
+/// sleep) left its title bar out of reach, and back to its minimum size if something (a display
+/// change, a restore from the taskbar) left it smaller. `min` is the logical minimum client size.
+/// Minimized, hidden, maximized and full-screen windows are left to Windows.
+fn ensure_on_screen(window: &Window, min: Option<(f64, f64)>) {
+    if window.is_minimized() == Some(true)
+        || !window.is_visible().unwrap_or(true)
+        || window.is_maximized()
+        || window.fullscreen().is_some()
+    {
         return;
     }
     let Ok(pos) = window.outer_position() else { return };
-    let size = window.outer_size();
+    // Windows parks minimized windows at -32000; winit's minimized flag can lag behind a restore.
+    if pos.x <= -30000 || pos.y <= -30000 {
+        return;
+    }
+    let sf = window.scale_factor();
+    let min_px = min.map_or((0, 0), |(w, h)| ((w * sf).round() as i32, (h * sf).round() as i32));
+    let mut size = window.outer_size();
+    let inner = window.inner_size();
+    if (inner.width as i32) < min_px.0 - 1 || (inner.height as i32) < min_px.1 - 1 {
+        let (w, h) = ((inner.width as i32).max(min_px.0), (inner.height as i32).max(min_px.1));
+        log::info!("window was {}x{}, below its minimum {min_px:?}; resizing it to {w}x{h}", inner.width, inner.height);
+        if let Some((mw, mh)) = min {
+            // Windows may have dropped the limit along with the size.
+            window.set_min_inner_size(Some(winit::dpi::LogicalSize::new(mw, mh)));
+        }
+        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w as u32, h as u32));
+        size = winit::dpi::PhysicalSize::new(w as u32, h as u32);
+    }
     let monitors: Vec<winit::monitor::MonitorHandle> = window.available_monitors().collect();
+    // While a GPU switches modes, monitors can briefly report no or a tiny size; fitting the
+    // window to one of those would shrink it to nothing, so wait for the next check.
+    if monitors.iter().any(|m| m.size().width < 320 || m.size().height < 240) {
+        return;
+    }
     let rects: Vec<ScreenRect> = monitors
         .iter()
         .map(|m| (m.position().x, m.position().y, m.size().width as i32, m.size().height as i32))
@@ -306,9 +342,9 @@ fn ensure_on_screen(window: &Window) {
     // The monitor Windows considers nearest, else the primary one, else the first.
     let pick = window.current_monitor().or_else(|| window.primary_monitor());
     let nearest = pick.and_then(|p| monitors.iter().position(|m| *m == p)).unwrap_or(0);
-    let grab_h = (crate::ui::titlebar::HEIGHT as f64 * window.scale_factor()).round() as i32;
+    let grab_h = (crate::ui::titlebar::HEIGHT as f64 * sf).round() as i32;
     let win = (pos.x, pos.y, size.width as i32, size.height as i32);
-    if let Some((x, y, new_size)) = rescue_position(win, grab_h, &rects, nearest, window.is_resizable()) {
+    if let Some((x, y, new_size)) = rescue_position(win, grab_h, &rects, nearest, window.is_resizable(), min_px) {
         log::info!("window was off screen at {win:?}; moving it to {x},{y} (monitors {rects:?})");
         if let Some((w, h)) = new_size {
             // Outer size minus the (frameless) window's borders is close enough to the inner size.
@@ -429,6 +465,7 @@ impl<A: UiApp> Runner<A> {
                 WindowCmd::Resizable(on) => gfx.window.set_resizable(on),
                 WindowCmd::MinSize(w, h) => {
                     gfx.window.set_min_inner_size(Some(winit::dpi::LogicalSize::new(w as f64, h as f64)));
+                    self.min_size = Some((w as f64, h as f64));
                 }
                 WindowCmd::Size(w, h) => {
                     let _ = gfx.window.request_inner_size(winit::dpi::LogicalSize::new(w as f64, h as f64));
@@ -442,7 +479,7 @@ impl<A: UiApp> Runner<A> {
                 WindowCmd::Show => {
                     gfx.window.set_minimized(false);
                     gfx.window.set_visible(true);
-                    ensure_on_screen(&gfx.window);
+                    ensure_on_screen(&gfx.window, self.min_size);
                     gfx.window.focus_window();
                 }
             }
@@ -582,6 +619,12 @@ impl<A: UiApp> ApplicationHandler<RunnerEvent> for Runner<A> {
             }
             WindowEvent::Resized(_) => {
                 self.needs_paint = true;
+                // Restores from the taskbar and display changes arrive as resizes: check size and
+                // position shortly after (not right away, in case more changes follow).
+                let soon = Instant::now() + SETTLE - SCREEN_CHECK;
+                if self.last_screen_check > soon {
+                    self.last_screen_check = soon;
+                }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 // Usually a display change: check the window is still reachable.
@@ -617,7 +660,7 @@ impl<A: UiApp> ApplicationHandler<RunnerEvent> for Runner<A> {
         if self.last_screen_check.elapsed() >= SCREEN_CHECK {
             self.last_screen_check = Instant::now();
             if let Some(gfx) = &self.gfx {
-                ensure_on_screen(&gfx.window);
+                ensure_on_screen(&gfx.window, self.min_size);
             }
         }
         let deadline = self.next_repaint.lock().ok().and_then(|g| *g);
@@ -682,35 +725,42 @@ mod tests {
 
     #[test]
     fn a_window_on_screen_stays_put() {
-        assert_eq!(rescue_position((100, 100, 1180, 760), 32, &[FHD], 0, true), None);
+        assert_eq!(rescue_position((100, 100, 1180, 760), 32, &[FHD], 0, true, (0, 0)), None);
         // Mostly off the right edge, but enough title bar to grab.
-        assert_eq!(rescue_position((1700, 100, 1180, 760), 32, &[FHD], 0, true), None);
+        assert_eq!(rescue_position((1700, 100, 1180, 760), 32, &[FHD], 0, true, (0, 0)), None);
         // Partly on a second monitor.
-        assert_eq!(rescue_position((1850, 100, 800, 600), 32, &[FHD, (1920, 0, 1920, 1080)], 0, true), None);
+        assert_eq!(rescue_position((1850, 100, 800, 600), 32, &[FHD, (1920, 0, 1920, 1080)], 0, true, (0, 0)), None);
     }
 
     #[test]
     fn a_window_left_on_a_removed_monitor_comes_back() {
         // It was on a second screen at x = 2500 that is gone.
-        assert_eq!(rescue_position((2500, 200, 1180, 760), 32, &[FHD], 0, true), Some((740, 200, None)));
+        assert_eq!(rescue_position((2500, 200, 1180, 760), 32, &[FHD], 0, true, (0, 0)), Some((740, 200, None)));
         // Title bar above the top edge (only the bottom of the window is visible).
-        assert_eq!(rescue_position((300, -700, 1180, 760), 32, &[FHD], 0, true), Some((300, 0, None)));
+        assert_eq!(rescue_position((300, -700, 1180, 760), 32, &[FHD], 0, true, (0, 0)), Some((300, 0, None)));
     }
 
     #[test]
     fn a_too_big_window_shrinks_after_a_resolution_drop() {
         // 1180×760 on a 1024×768 screen, title bar off to the left.
-        let r = rescue_position((-1100, 10, 1180, 760), 32, &[(0, 0, 1024, 768)], 0, true);
+        let r = rescue_position((-1100, 10, 1180, 760), 32, &[(0, 0, 1024, 768)], 0, true, (0, 0));
         assert_eq!(r, Some((0, 10, Some((984, 688)))));
         // The mini-player is not resizable: only moved.
-        assert_eq!(rescue_position((5000, 5000, 520, 84), 32, &[FHD], 0, false), Some((1400, 996, None)));
+        assert_eq!(rescue_position((5000, 5000, 520, 84), 32, &[FHD], 0, false, (0, 0)), Some((1400, 996, None)));
+    }
+
+    #[test]
+    fn shrinking_never_goes_below_the_minimum_size() {
+        // A monitor briefly reported at 640×480 during a mode switch.
+        let r = rescue_position((-1100, 10, 1180, 760), 32, &[(0, 0, 640, 480)], 0, true, (760, 480));
+        assert_eq!(r, Some((0, 0, Some((760, 480)))));
     }
 
     #[test]
     fn monitors_left_of_and_above_the_primary() {
         let left = (-1280, 0, 1280, 1024);
-        assert_eq!(rescue_position((-1200, 50, 800, 600), 32, &[FHD, left], 0, true), None);
+        assert_eq!(rescue_position((-1200, 50, 800, 600), 32, &[FHD, left], 0, true, (0, 0)), None);
         // Unplugged left screen: back onto the primary.
-        assert_eq!(rescue_position((-1200, 50, 800, 600), 32, &[FHD], 0, true), Some((0, 50, None)));
+        assert_eq!(rescue_position((-1200, 50, 800, 600), 32, &[FHD], 0, true, (0, 0)), Some((0, 50, None)));
     }
 }
